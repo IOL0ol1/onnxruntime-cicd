@@ -1,0 +1,10 @@
+# Outputs of the download and packaging scripts
+/packages/
+/dist/
+
+# Local tool state
+.omc/
+/.remember/
+
+__pycache__/
+*.pyc
