@@ -75,6 +75,7 @@ APPLE_FRAMEWORKS = {
     "aarch64-apple-visionos": ("xros", "arm64", "default_vision_os_framework_build_settings.json"),
     "aarch64-apple-visionos-sim": ("xrsimulator", "arm64", "default_vision_os_framework_build_settings.json"),
 }
+DEFAULT_CUDA_ARCHS = "80-real;80-virtual"  # ORT drops a list that has only -virtual entries
 # ROCm version used for the Windows MIGraphX source build (same as the AMDMIGraphX windows.yaml CI)
 WINDOWS_ROCM_VERSION = "7.13.0"
 DEFAULT_MIGRAPHX_GPU_TARGETS = "gfx1100;gfx1101;gfx1102;gfx1200;gfx1201"
@@ -100,13 +101,16 @@ class Job:
     def __post_init__(self) -> None:
         self.platform, self.os = TRIPLES[self.triple]
 
-    def need(self, *names: str, platform: str | None = None, pins: dict[str, str] | None = None) -> None:
-        self.needed.update((n, platform or self.platform, (pins or {}).get(n, "")) for n in names)
+    def need(self, *names: str, pins: dict[str, str] | None = None) -> None:
+        names = tuple(n for n in names if n not in self.sdks)  # each SDK is prepared once per job
+        if not names:
+            return
+        self.needed.update((n, self.platform, (pins or {}).get(n, "")) for n in names)
         if self.dry_run:
             self.sdks.update({n: self.sdk_root / n for n in names})
-            print(f"[dry-run] prepare SDKs: {', '.join(names)} (platform {platform or self.platform})")
+            print(f"[dry-run] prepare SDKs: {', '.join(names)} (platform {self.platform})")
             return
-        self.sdks.update(sdk.prepare(list(names), platform or self.platform, self.sdk_root, self.cuda_major, pins=pins))
+        self.sdks.update(sdk.prepare(list(names), self.platform, self.sdk_root, self.cuda_major, pins=pins))
 
 
 # ---------------------------------------------------------------------------
@@ -185,24 +189,30 @@ ORT_SOURCES = {
 
 
 def cuda_flags(job: Job) -> list[str]:
-    flags = ["--use_cuda", "--cuda_home", job.sdks["cuda"], "--nvcc_threads", "1",
+    job.need("cuda", "cudnn")
+    flags = ["--use_cuda", "--cuda_home", job.sdks["cuda"], "--cudnn_home", job.sdks["cudnn"], "--nvcc_threads", "1",
              "--cmake_extra_defines", f"CMAKE_CUDA_ARCHITECTURES={job.cuda_archs}"]
-    if "cudnn" in job.sdks:
-        flags += ["--cudnn_home", job.sdks["cudnn"]]
+    if job.os == "windows":
+        # ORT's build.py passes <cuda_home>/bin/nvcc without the .exe suffix, which CMake rejects as "not a full path
+        # to an existing compiler tool"; extra defines come later on the command line and override it
+        flags += ["--cmake_extra_defines", f"CMAKE_CUDA_COMPILER={job.sdks['cuda'] / 'bin' / 'nvcc.exe'}"]
     return flags
 
 
-def nv_tensorrt_rtx_flags(job: Job) -> list[str]:
-    # onnxruntime_providers_nv.cmake runs find_package(CUDAToolkit), which does not see --cuda_home
-    return ["--use_nv_tensorrt_rtx", "--tensorrt_rtx_home", job.sdks["tensorrt-rtx"],
-            "--cuda_home", job.sdks["cuda"], "--cmake_extra_defines", f"CUDAToolkit_ROOT={job.sdks['cuda']}"]
+def tensorrt_flags(job: Job) -> list[str]:
+    """TensorRT EP; ORT's build.py always builds the CUDA EP with it."""
+    flags = cuda_flags(job)
+    job.need("tensorrt")
+    return flags + ["--use_tensorrt", "--tensorrt_home", job.sdks["tensorrt"]]
 
 
-def openvino_flags(job: Job) -> list[str]:
-    if not job.dry_run:
-        os.environ.setdefault("OpenVINO_DIR", str(job.sdks["openvino"] / "runtime" / "cmake"))
-        os.environ.setdefault("INTEL_OPENVINO_DIR", str(job.sdks["openvino"]))
-    return ["--use_openvino", "CPU"]
+def cann_flags(job: Job) -> list[str]:
+    job.need("cann")
+    return ["--use_cann", "--cann_home", job.sdks["cann"]]
+
+
+def macos_flags(job: Job) -> list[str]:
+    return ["--use_coreml"] + (["--osx_arch", "x86_64"] if job.triple == "x86_64-apple-darwin" else [])
 
 
 def dawn_backends(job: Job) -> list[str]:
@@ -211,17 +221,16 @@ def dawn_backends(job: Job) -> list[str]:
 
 
 def all_builtin_flags(job: Job) -> list[str]:
-    """Every built-in EP the target supports: EPs compiled into onnxruntime and shared providers loaded through
-    onnxruntime_providers_shared. Plugin EPs (EP ABI, loaded with RegisterExecutionProviderLibrary) are not included.
+    """Every built-in EP the target supports.
 
-    Not included either: MIGraphX (built in the ROCm container), and EPs that link vendor libraries into
-    onnxruntime itself (VSINPU, ACL, ArmNN, RKNPU).
+    Built-in means linked into the onnxruntime library itself (XNNPACK, WebGPU as static_lib, DirectML, CoreML) or
+    a shared provider that exports only the legacy bridge entry point GetProvider (oneDNN, TensorRT, CANN).
+    Providers that also export CreateEpFactories (CUDA, OpenVINO, QNN, Vitis AI, NV TensorRT RTX, MIGraphX) and
+    plugin EPs are left out. The one exception is the CUDA EP shipped as a dependency of TensorRT.
     """
-    # The SDKs are only available for the build host platform; x86_64-apple-darwin is cross-compiled on arm64
-    native = job.triple != "x86_64-apple-darwin"
-
     def has(*names: str) -> bool:
-        return native and all(job.platform in sdk.dl.component(n).platforms for n in names)
+        # the SDKs are only available for the build host platform; x86_64-apple-darwin is cross-compiled on arm64
+        return job.triple != "x86_64-apple-darwin" and all(job.platform in sdk.dl.component(n).platforms for n in names)
 
     flags = ["--use_xnnpack", "--use_webgpu"]  # static_lib: WebGPU as an internal EP
     if backends := dawn_backends(job):
@@ -229,73 +238,55 @@ def all_builtin_flags(job: Job) -> list[str]:
     if job.os == "windows":
         flags += ["--use_dml"]
     if job.os == "macos":
-        flags += ["--use_coreml"] + (["--osx_arch", "x86_64"] if job.triple == "x86_64-apple-darwin" else [])
+        flags += macos_flags(job)
     if job.triple.startswith("x86_64") and job.os in ("linux", "windows"):
-        flags += ["--use_dnnl", "--use_vitisai"]
-    if job.os in ("linux", "windows"):
-        if has("cuda", "cudnn"):
-            job.need("cuda", "cudnn")
-            flags += cuda_flags(job)
-            if has("tensorrt"):
-                job.need("tensorrt")
-                flags += ["--use_tensorrt", "--tensorrt_home", job.sdks["tensorrt"]]
-            if has("tensorrt-rtx"):
-                job.need("tensorrt-rtx")
-                flags += nv_tensorrt_rtx_flags(job)
-        if has("qairt"):
-            job.need("qairt")
-            flags += ["--use_qnn", "--qnn_home", job.sdks["qairt"]]
-        if has("cann"):
-            job.need("cann")
-            flags += ["--use_cann", "--cann_home", job.sdks["cann"]]
-    if has("openvino"):
-        job.need("openvino")
-        flags += openvino_flags(job)
+        flags += ["--use_dnnl"]
+    if job.os in ("linux", "windows") and has("cuda", "cudnn", "tensorrt"):
+        flags += tensorrt_flags(job)
+    if job.os == "linux" and has("cann"):
+        flags += cann_flags(job)
     return flags
 
 
 def ort_variant(job: Job, src: Path) -> tuple[list[str], Callable[[Job, Path], None] | None]:
     """Return (extra build.py arguments, custom staging function). A None staging function means cmake --install."""
-    v, x64 = job.variant, job.triple.startswith("x86_64")
+    v = job.variant
     if v in ("default", "arm64x"):
         flags = ["--use_xnnpack"] if v == "default" else []
-        if x64 and job.os in ("linux", "windows"):
+        if job.triple.startswith("x86_64") and job.os in ("linux", "windows"):
             flags += ["--use_dnnl", "--use_vitisai"]
         if job.os == "macos":
-            flags += ["--use_coreml"]
-            if job.triple == "x86_64-apple-darwin":
-                flags += ["--osx_arch", "x86_64"]
+            flags += macos_flags(job)
         return flags, None
+    if v == "all":
+        return all_builtin_flags(job), None
     if v == "directml":
         return ["--use_dml"], None
     if v == "qnn":
         job.need("qairt")
         return ["--use_qnn", "--qnn_home", job.sdks["qairt"]], None
     if v == "cuda":
-        job.need("cuda", "cudnn", "tensorrt")
-        return cuda_flags(job) + ["--use_tensorrt", "--tensorrt_home", job.sdks["tensorrt"]], None
+        return tensorrt_flags(job), None
     if v == "cuda-plugin":
-        job.need("cuda", "cudnn")
         return cuda_flags(job) + ["--cmake_extra_defines", "onnxruntime_BUILD_CUDA_EP_AS_PLUGIN=ON"], \
             lambda j, b: stage_shared_libs(j, b, ["onnxruntime_providers_cuda"])
     if v == "nv-tensorrt-rtx":
         job.need("cuda", "tensorrt-rtx")
-        return nv_tensorrt_rtx_flags(job), None
+        # onnxruntime_providers_nv.cmake runs find_package(CUDAToolkit), which does not see --cuda_home
+        return ["--use_nv_tensorrt_rtx", "--tensorrt_rtx_home", job.sdks["tensorrt-rtx"], "--cuda_home", job.sdks["cuda"],
+                "--cmake_extra_defines", f"CUDAToolkit_ROOT={job.sdks['cuda']}"], None
     if v == "webgpu-plugin":
         names = ["onnxruntime_providers_webgpu"] + (["dxcompiler"] if job.os == "windows" else [])  # same as the official package
         return ["--use_webgpu", "shared_lib", "--wgsl_template", "static",
                 "--cmake_extra_defines", "onnxruntime_BUILD_UNIT_TESTS=OFF", *dawn_backends(job)], \
             lambda j, b: stage_shared_libs(j, b, names)
-    if v == "openvino":
+    if v == "openvino":  # OpenVINO_DIR / INTEL_OPENVINO_DIR are set by ci/sdk.py
         job.need("openvino")
-        return openvino_flags(job), None
-    if v == "all":
-        return all_builtin_flags(job), None
+        return ["--use_openvino", "CPU"], None
     if v == "migraphx":  # built inside the rocm/dev-ubuntu container; ROCm and MIGraphX live in /opt/rocm
         return ["--use_migraphx", "--migraphx_home", os.environ.get("ROCM_PATH", "/opt/rocm")], None
     if v == "cann":
-        job.need("cann")
-        return ["--use_cann", "--cann_home", job.sdks["cann"]], None
+        return cann_flags(job), None
     if v == "vsinpu":
         tim_vx = build_tim_vx(job)
         if not job.dry_run:
@@ -307,7 +298,9 @@ def ort_variant(job: Job, src: Path) -> tuple[list[str], Callable[[Job, Path], N
         return ["--android", "--android_sdk_path", sdk_path, "--android_ndk_path", job.sdks["android-ndk"],
                 "--android_abi", ANDROID_ABI[job.triple], "--use_nnapi", "--use_xnnpack", "--use_webgpu"], None
     if v == "wasm-static":
-        return ["--build_wasm_static_lib", "--enable_wasm_simd", "--disable_rtti"], \
+        # the unit tests are not packaged, and onnxruntime_provider_test does not compile in this configuration
+        return ["--build_wasm_static_lib", "--enable_wasm_simd", "--disable_rtti",
+                "--cmake_extra_defines", "onnxruntime_BUILD_UNIT_TESTS=OFF"], \
             lambda j, b: (copy_files(j, ["**/libonnxruntime_webassembly.a"], b, j.stage / "lib"), stage_ort_headers(j, src))
     if v.startswith("wasm"):
         extra = {"wasm": ["--enable_wasm_api_exception_catching"],
@@ -616,7 +609,7 @@ def required_sdks(recipe: str, variant: str, triple: str, cuda_major: str = "13"
     """Walk through a recipe in dry-run mode and return the required (component, platform, pinned version) tuples."""
     import contextlib
     import io
-    job = Job(recipe, variant, triple, Path("work"), Path("stage"), Path("sdk"), cuda_major, "80-real;80-virtual", True)
+    job = Job(recipe, variant, triple, Path("work"), Path("stage"), Path("sdk"), cuda_major, DEFAULT_CUDA_ARCHS, True)
     with contextlib.redirect_stdout(io.StringIO()):
         try:
             RECIPES[recipe](job)
@@ -634,7 +627,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--stage", type=Path, required=True, help="staging directory (input of ci/package.py)")
     ap.add_argument("--sdk-root", type=Path, required=True, help="directory where third-party SDKs are extracted")
     ap.add_argument("--cuda-major", default="13", choices=("12", "13"))
-    ap.add_argument("--cuda-archs", default=os.environ.get("CUDA_ARCHITECTURES", "80-real;80-virtual"),
+    ap.add_argument("--cuda-archs", default=os.environ.get("CUDA_ARCHITECTURES", DEFAULT_CUDA_ARCHS),
                     help="CMAKE_CUDA_ARCHITECTURES (defaults to the CUDA_ARCHITECTURES environment variable)")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)

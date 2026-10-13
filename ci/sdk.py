@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""CI helper: download and extract the third-party SDKs a build needs, and export environment variables.
+"""CI helper: download and extract the third-party SDKs a build needs, and set their environment variables.
 
 Reuses the download logic of scripts/download_ep_packages.py. Each component is extracted into
-<root>/<component>/ (without the archive's top-level directory), then variables such as CUDA_HOME and
-TENSORRT_HOME are written to $GITHUB_ENV (and printed when running locally).
+<root>/<component>/ (without the archive's top-level directory). Variables such as CUDA_HOME and OpenVINO_DIR
+(and PATH) are set in the current process, so ci/build.py and the build tools it runs see them, and printed as
+export lines for local use.
 
     python ci/sdk.py --root $RUNNER_TEMP/sdk --platform linux-x86_64 --cuda-major 12 cuda cudnn tensorrt
 
@@ -151,25 +152,18 @@ def setup(name: str, ctx, root: Path, download_dir: Path) -> dict:
 
 
 def export(results: list[dict]) -> None:
-    env_lines, path_lines = [], []
     for r in results:
         base = Path(r["path"])
         for var, sub in ENV_VARS.get(r["component"], {}).items():
-            env_lines.append(f"{var}={base / sub if sub else base}")
+            os.environ[var] = str(base / sub if sub else base)
+            print(f"  export {var}={os.environ[var]}")
         if r["component"] in PATH_DIRS:
-            path_lines.append(str(base / PATH_DIRS[r["component"]]))
-    if gh_env := os.environ.get("GITHUB_ENV"):
-        with open(gh_env, "a", encoding="utf-8") as f:
-            f.write("\n".join(env_lines) + "\n")
-    if (gh_path := os.environ.get("GITHUB_PATH")) and path_lines:
-        with open(gh_path, "a", encoding="utf-8") as f:
-            f.write("\n".join(path_lines) + "\n")
-    for line in env_lines:
-        print(f"  export {line}")
+            os.environ["PATH"] = os.pathsep.join([str(base / PATH_DIRS[r["component"]]), os.environ.get("PATH", "")])
+            print(f"  export PATH={base / PATH_DIRS[r['component']]}{os.pathsep}$PATH")
 
 
 def prepare(names: list[str], platform: str, root: Path, cuda_major: str = "13", openvino_distro: str = "ubuntu24",
-            pins: dict[str, str] | None = None, export_env: bool = True) -> dict[str, Path]:
+            pins: dict[str, str] | None = None) -> dict[str, Path]:
     """Called by ci/build.py: set up a list of SDKs, return {component: path} and update sdk-versions.json."""
     root = root.resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -182,8 +176,7 @@ def prepare(names: list[str], platform: str, root: Path, cuda_major: str = "13",
     versions = json.loads(versions_file.read_text(encoding="utf-8")) if versions_file.exists() else {}
     versions.update({r["component"]: r["version"] for r in results})
     versions_file.write_text(json.dumps(versions, indent=2), encoding="utf-8")
-    if export_env:
-        export(results)
+    export(results)
     return {r["component"]: Path(r["path"]) for r in results}
 
 

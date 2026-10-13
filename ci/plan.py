@@ -20,10 +20,6 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-_spec = importlib.util.spec_from_file_location("dl", ROOT / "scripts" / "download_ep_packages.py")
-dl = importlib.util.module_from_spec(_spec)
-sys.modules["dl"] = dl
-_spec.loader.exec_module(dl)
 _bspec = importlib.util.spec_from_file_location("ci_build", ROOT / "ci" / "build.py")
 build = importlib.util.module_from_spec(_bspec)
 sys.modules["ci_build"] = build

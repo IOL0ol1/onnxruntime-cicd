@@ -103,6 +103,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.build_matrix) }}
+    env:
+      GITHUB_TOKEN: ${{ github.token }}  # authenticated GitHub API requests (the anonymous rate limit is easily hit)
     defaults:
       run:
         shell: bash
@@ -137,12 +139,6 @@ jobs:
       - name: Install build tools
         run: python -m pip install --upgrade "cmake==${CMAKE_VERSION}" ninja
 
-      # The WebAssembly build needs Node.js with npm next to it; the runner image's /usr/local/bin/node has no npm
-      - uses: actions/setup-node@v5
-        if: matrix.triple == 'wasm32-unknown-emscripten'
-        with:
-          node-version: "22"
-
       - name: Install system packages (Linux)
         if: runner.os == 'Linux' && matrix.apt != ''
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ${{ matrix.apt }}
@@ -164,23 +160,20 @@ jobs:
             echo "STAGE_DIR=${RUNNER_TEMP}/stage"
             echo "SDK_ROOT=${RUNNER_TEMP}/sdk"
             echo "DIST_DIR=${RUNNER_TEMP}/dist"
-            # A bare `cmake --build --parallel` (used by some EP build scripts) means `make -j` without a limit,
-            # which exhausts the runner memory and gets the runner shut down
-            echo "CMAKE_BUILD_PARALLEL_LEVEL=$(python -c 'import os; print(os.cpu_count())')"
+            # On Linux a bare `cmake --build --parallel` (used by some EP build scripts) means `make -j` without a
+            # limit, which exhausts the runner memory. Not set elsewhere: with the Xcode generator it adds a second
+            # -jobs option, which xcodebuild rejects.
+            if [ "$RUNNER_OS" = "Linux" ]; then echo "CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)"; fi
           } >> "$GITHUB_ENV"
 
       - name: Build
         if: matrix.docker == ''
-        env:
-          GITHUB_TOKEN: ${{ github.token }}  # authenticated GitHub API requests (the anonymous rate limit is easily hit)
         run: >-
           python ci/build.py --recipe "${{ matrix.recipe }}" --variant "${{ matrix.variant }}" --triple "${{ matrix.triple }}"
           --cuda-major "${{ matrix.cuda_major }}" --work "$WORK_DIR" --stage "$STAGE_DIR" --sdk-root "$SDK_ROOT"
 
       - name: Build (container ${{ matrix.docker }})
         if: matrix.docker != ''
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
         run: |
           docker run --rm \
             -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" -v "$RUNNER_TEMP:$RUNNER_TEMP" -w "$GITHUB_WORKSPACE" \
@@ -224,12 +217,12 @@ jobs:
       fail-fast: false
       max-parallel: 8
       matrix: ${{ fromJSON(needs.plan.outputs.sdk_matrix) }}
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
     steps:
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/lib/android /opt/hostedtoolcache/CodeQL || true
-          df -h /
       - uses: actions/checkout@v7
+      - name: Free disk space
+        run: bash ci/free_disk.sh
       - name: Check out onnxruntime-qnn (the QAIRT version and checksum come from its packages.yml)
         if: matrix.component == 'qairt' || matrix.component == 'hexagon-sdk'
         run: git submodule update --init --depth 1 eps/official/onnxruntime-qnn
@@ -237,8 +230,6 @@ jobs:
         with:
           python-version: "3.12"
       - name: Download
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
         run: >-
           python scripts/download_ep_packages.py --only "${{ matrix.component }}" --platform "${{ matrix.platform }}"
           --cuda-major "${{ matrix.cuda_major }}" ${{ matrix.pin && format('--pin {0}', matrix.pin) || '' }}
