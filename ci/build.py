@@ -168,6 +168,12 @@ def python() -> str:
     return sys.executable
 
 
+def vs_generator() -> str:
+    """CMake Visual Studio generator of the MSVC environment set up by msvc-dev-cmd (hosted runners ship VS 2026)."""
+    major = os.environ.get("VisualStudioVersion", "18.0").split(".")[0]
+    return {"17": "Visual Studio 17 2022"}.get(major, "Visual Studio 18 2026")
+
+
 # ---------------------------------------------------------------------------
 # ONNX Runtime main repository and forks (tools/ci_build/build.py)
 # ---------------------------------------------------------------------------
@@ -183,6 +189,68 @@ def cuda_flags(job: Job) -> list[str]:
              "--cmake_extra_defines", f"CMAKE_CUDA_ARCHITECTURES={job.cuda_archs}"]
     if "cudnn" in job.sdks:
         flags += ["--cudnn_home", job.sdks["cudnn"]]
+    return flags
+
+
+def nv_tensorrt_rtx_flags(job: Job) -> list[str]:
+    # onnxruntime_providers_nv.cmake runs find_package(CUDAToolkit), which does not see --cuda_home
+    return ["--use_nv_tensorrt_rtx", "--tensorrt_rtx_home", job.sdks["tensorrt-rtx"],
+            "--cuda_home", job.sdks["cuda"], "--cmake_extra_defines", f"CUDAToolkit_ROOT={job.sdks['cuda']}"]
+
+
+def openvino_flags(job: Job) -> list[str]:
+    if not job.dry_run:
+        os.environ.setdefault("OpenVINO_DIR", str(job.sdks["openvino"] / "runtime" / "cmake"))
+        os.environ.setdefault("INTEL_OPENVINO_DIR", str(job.sdks["openvino"]))
+    return ["--use_openvino", "CPU"]
+
+
+def dawn_backends(job: Job) -> list[str]:
+    return {"windows": ["onnxruntime_ENABLE_DAWN_BACKEND_D3D12=1", "onnxruntime_ENABLE_DAWN_BACKEND_VULKAN=1"],
+            "linux": ["onnxruntime_ENABLE_DAWN_BACKEND_VULKAN=1"]}.get(job.os, [])
+
+
+def all_builtin_flags(job: Job) -> list[str]:
+    """Every built-in EP the target supports: EPs compiled into onnxruntime and shared providers loaded through
+    onnxruntime_providers_shared. Plugin EPs (EP ABI, loaded with RegisterExecutionProviderLibrary) are not included.
+
+    Not included either: MIGraphX (built in the ROCm container), and EPs that link vendor libraries into
+    onnxruntime itself (VSINPU, ACL, ArmNN, RKNPU).
+    """
+    # The SDKs are only available for the build host platform; x86_64-apple-darwin is cross-compiled on arm64
+    native = job.triple != "x86_64-apple-darwin"
+
+    def has(*names: str) -> bool:
+        return native and all(job.platform in sdk.dl.component(n).platforms for n in names)
+
+    flags = ["--use_xnnpack", "--use_webgpu"]  # static_lib: WebGPU as an internal EP
+    if backends := dawn_backends(job):
+        flags += ["--cmake_extra_defines", *backends]
+    if job.os == "windows":
+        flags += ["--use_dml"]
+    if job.os == "macos":
+        flags += ["--use_coreml"] + (["--osx_arch", "x86_64"] if job.triple == "x86_64-apple-darwin" else [])
+    if job.triple.startswith("x86_64") and job.os in ("linux", "windows"):
+        flags += ["--use_dnnl", "--use_vitisai"]
+    if job.os in ("linux", "windows"):
+        if has("cuda", "cudnn"):
+            job.need("cuda", "cudnn")
+            flags += cuda_flags(job)
+            if has("tensorrt"):
+                job.need("tensorrt")
+                flags += ["--use_tensorrt", "--tensorrt_home", job.sdks["tensorrt"]]
+            if has("tensorrt-rtx"):
+                job.need("tensorrt-rtx")
+                flags += nv_tensorrt_rtx_flags(job)
+        if has("qairt"):
+            job.need("qairt")
+            flags += ["--use_qnn", "--qnn_home", job.sdks["qairt"]]
+        if has("cann"):
+            job.need("cann")
+            flags += ["--use_cann", "--cann_home", job.sdks["cann"]]
+    if has("openvino"):
+        job.need("openvino")
+        flags += openvino_flags(job)
     return flags
 
 
@@ -212,21 +280,17 @@ def ort_variant(job: Job, src: Path) -> tuple[list[str], Callable[[Job, Path], N
             lambda j, b: stage_shared_libs(j, b, ["onnxruntime_providers_cuda"])
     if v == "nv-tensorrt-rtx":
         job.need("cuda", "tensorrt-rtx")
-        return ["--use_nv_tensorrt_rtx", "--tensorrt_rtx_home", job.sdks["tensorrt-rtx"],
-                "--cuda_home", job.sdks["cuda"]], None
+        return nv_tensorrt_rtx_flags(job), None
     if v == "webgpu-plugin":
-        backends = {"windows": ["onnxruntime_ENABLE_DAWN_BACKEND_D3D12=1", "onnxruntime_ENABLE_DAWN_BACKEND_VULKAN=1"],
-                    "linux": ["onnxruntime_ENABLE_DAWN_BACKEND_VULKAN=1"]}.get(job.os, [])
         names = ["onnxruntime_providers_webgpu"] + (["dxcompiler"] if job.os == "windows" else [])  # same as the official package
         return ["--use_webgpu", "shared_lib", "--wgsl_template", "static",
-                "--cmake_extra_defines", "onnxruntime_BUILD_UNIT_TESTS=OFF", *backends], \
+                "--cmake_extra_defines", "onnxruntime_BUILD_UNIT_TESTS=OFF", *dawn_backends(job)], \
             lambda j, b: stage_shared_libs(j, b, names)
     if v == "openvino":
         job.need("openvino")
-        if not job.dry_run:
-            os.environ.setdefault("OpenVINO_DIR", str(job.sdks["openvino"] / "runtime" / "cmake"))
-            os.environ.setdefault("INTEL_OPENVINO_DIR", str(job.sdks["openvino"]))
-        return ["--use_openvino", "CPU"], None
+        return openvino_flags(job), None
+    if v == "all":
+        return all_builtin_flags(job), None
     if v == "migraphx":  # built inside the rocm/dev-ubuntu container; ROCm and MIGraphX live in /opt/rocm
         return ["--use_migraphx", "--migraphx_home", os.environ.get("ROCM_PATH", "/opt/rocm")], None
     if v == "cann":
@@ -265,10 +329,15 @@ def build_ort(job: Job) -> None:
             "--skip_tests", "--skip_submodule_sync", "--compile_no_warning_as_error"]
     if not job.variant.startswith("wasm"):
         base.append("--build_shared_lib")
+    if job.os == "windows" and not job.triple.startswith("x86_64"):
+        # The MSVC 14.5x armasm64 rejects the /arch:armv8.2 flag KleidiAI passes to its .S kernels
+        base.append("--no_kleidiai")
+    if hasattr(os, "geteuid") and os.geteuid() == 0:  # the rocm/dev-ubuntu container runs as root
+        base.append("--allow_running_as_root")
     if job.variant == "arm64x":
         # Same two-pass build as the official win-arm64x package (templates/build-win-arm64x-steps.yml):
         # an ARM64 pass generates the .def/.lib, then the ARM64EC pass produces the real ARM64X binaries.
-        vs = ["--cmake_generator", "Visual Studio 17 2022"]
+        vs = ["--cmake_generator", vs_generator()]
         run(job, base + vs + ["--arm64", "--buildasx", "--build_dir", build_dir / "arm64"] + flags, cwd=src)
         run(job, base + vs + ["--arm64ec", "--buildasx", "--build_dir", build_dir] + flags, cwd=src)
     else:
@@ -407,8 +476,14 @@ def build_ep_nv_tensorrt_rtx(job: Job) -> None:
     args = ["--cuda_home", job.sdks["cuda"], "--onnxruntime_home", ort_home(job),
             "--trt_rtx_home", job.sdks["tensorrt-rtx"], "--build_dir", b, "--config", "Release"]
     if job.os == "windows":
+        # build.bat hard-codes the VS 2022 generator; run a copy (next to it, since it uses %~dp0) with the
+        # generator of the installed Visual Studio
+        script = src / "build.ci.bat"
+        if not job.dry_run:
+            text = (src / "build.bat").read_text(encoding="utf-8")
+            script.write_text(text.replace('"Visual Studio 17 2022"', f'"{vs_generator()}"'), encoding="utf-8")
         # Windows ARM64 is cross-compiled on an x64 host, as documented in docs/build-guide.md
-        run(job, ["cmd", "/c", src / "build.bat", *args, *(["--arm64"] if job.triple.startswith("aarch64") else [])], cwd=src)
+        run(job, ["cmd", "/c", script, *args, *(["--arm64"] if job.triple.startswith("aarch64") else [])], cwd=src)
     else:
         run(job, ["bash", src / "build.sh", *args], cwd=src)
     stage_shared_libs(job, b, ["onnxruntime_providers_nv_tensorrt_rtx"])
@@ -433,6 +508,10 @@ def build_ep_amdgpu(job: Job) -> None:
         else:
             cmd += ["--use_migraphx"]
             names = ["migraphx-ep"]
+    if job.os == "windows":
+        # With VSINSTALLDIR set, the script's _build_environment() replaces the whole environment with an empty one
+        # (no PATH, no compiler); without it, the script loads vcvars64.bat of the latest Visual Studio itself.
+        os.environ.pop("VSINSTALLDIR", None)
     run(job, cmd, cwd=src)
     stage_shared_libs(job, b / "Release", names)
 
@@ -454,9 +533,18 @@ def build_ep_qnn(job: Job) -> None:
     cmd = [python(), "qcom/build_and_test.py", "--config", "Release", "--qairt-sdk", job.sdks["qairt"]]
     if job.os != "android":  # Android needs ORT as an AAR, so the repository script builds it from source
         job.need("onnxruntime-sdk")
-        archive = next(iter(sorted((job.sdk_root / "_downloads" / "onnxruntime-sdk").rglob("onnxruntime-*.*z*"))), None) \
-            if not job.dry_run else job.sdk_root / "onnxruntime.zip"
-        cmd += ["--ort-prebuilt", archive]
+        # the extracted package root: onnxruntime_prebuilt.cmake copies files from <root>/lib
+        cmd += ["--ort-prebuilt", job.sdks["onnxruntime-sdk"]]
+    if job.os == "linux" and not job.dry_run:
+        # The Linux builds run qcom/scripts/linux/build.sh in a container that mounts only this repository and calls
+        # `git rev-parse --show-toplevel`; a submodule's .git file points outside of it, so give it its own git dir
+        # (the original stays in place for the nested submodules).
+        gitfile = src / ".git"
+        if gitfile.is_file():
+            gitdir = (src / gitfile.read_text(encoding="utf-8").split(":", 1)[1].strip()).resolve()
+            gitfile.unlink()
+            shutil.copytree(gitdir, gitfile, symlinks=True)
+            subprocess.run(["git", "config", "--file", str(gitfile / "config"), "--unset", "core.worktree"], check=False)
     run(job, cmd + [QNN_TASKS[job.triple]], cwd=src)
     stage_shared_libs(job, src / "build", ["onnxruntime_providers_qnn"])
     try:
@@ -479,6 +567,14 @@ def build_ep_mlx(job: Job) -> None:
 
 def build_ep_iree(job: Job) -> None:
     src = ROOT / "eps/community/onnxruntime-ep-iree"
+    if job.os == "windows":
+        # The build tree lives in <source>/build/cmake/default and some IREE object paths exceed MAX_PATH (cl.exe
+        # fails with C1083), so build from a copy in a short directory
+        short = Path(job.work.anchor) / "iree"
+        if not job.dry_run:
+            top_level = lambda d, names: [n for n in names if n in (".git", "build")] if Path(d) == src else []
+            shutil.copytree(src, short, ignore=top_level, dirs_exist_ok=True)
+        src = short
     run(job, [python(), "-m", "pip", "install", "-r", "requirements-dev.txt"], cwd=src)
     run(job, [python(), "-m", "pip", "wheel", "./python", "--no-deps", "-w", job.stage / "python"], cwd=src)
     install = src / "build" / "cmake" / "default" / "python-install"
@@ -520,7 +616,7 @@ def required_sdks(recipe: str, variant: str, triple: str, cuda_major: str = "13"
     """Walk through a recipe in dry-run mode and return the required (component, platform, pinned version) tuples."""
     import contextlib
     import io
-    job = Job(recipe, variant, triple, Path("work"), Path("stage"), Path("sdk"), cuda_major, "80-virtual", True)
+    job = Job(recipe, variant, triple, Path("work"), Path("stage"), Path("sdk"), cuda_major, "80-real;80-virtual", True)
     with contextlib.redirect_stdout(io.StringIO()):
         try:
             RECIPES[recipe](job)
@@ -538,7 +634,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--stage", type=Path, required=True, help="staging directory (input of ci/package.py)")
     ap.add_argument("--sdk-root", type=Path, required=True, help="directory where third-party SDKs are extracted")
     ap.add_argument("--cuda-major", default="13", choices=("12", "13"))
-    ap.add_argument("--cuda-archs", default=os.environ.get("CUDA_ARCHITECTURES", "80-virtual"),
+    ap.add_argument("--cuda-archs", default=os.environ.get("CUDA_ARCHITECTURES", "80-real;80-virtual"),
                     help="CMAKE_CUDA_ARCHITECTURES (defaults to the CUDA_ARCHITECTURES environment variable)")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)

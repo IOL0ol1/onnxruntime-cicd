@@ -101,6 +101,21 @@ def install_vulkan_sdk(installer: Path, target: Path) -> None:
                     "--confirm-command", "install"], check=True)
 
 
+def add_cuda_target_layout(target: Path, platform: str) -> None:
+    """Give the merged redist components the layout of a full toolkit install.
+
+    nvcc.profile and FindCUDAToolkit look for headers and libraries under targets/<arch>-linux/, which the
+    redist archives do not have (they ship plain include/ and lib/).
+    """
+    links = {target / "lib64": "lib"}
+    arch_dir = target / "targets" / ("sbsa-linux" if platform == "linux-aarch64" else "x86_64-linux")
+    links.update({arch_dir / "include": "../../include", arch_dir / "lib": "../../lib"})
+    arch_dir.mkdir(parents=True, exist_ok=True)
+    for link, dest in links.items():
+        if not link.exists() and not link.is_symlink():
+            link.symlink_to(dest, target_is_directory=True)
+
+
 def setup(name: str, ctx, root: Path, download_dir: Path) -> dict:
     comp = dl.component(name)
     if ctx.platform not in comp.platforms:
@@ -126,6 +141,8 @@ def setup(name: str, ctx, root: Path, download_dir: Path) -> dict:
             else:
                 extract(path, target)
         marker.write_text(resolved.version)
+    if name == "cuda" and ctx.platform.startswith("linux"):
+        add_cuda_target_layout(target, ctx.platform)
     if name == "cann":  # CANN 9.x installs into <path>/cann, 8.x into <path>/ascend-toolkit/latest
         target = next((c for c in (target / "cann", target / "ascend-toolkit" / "latest") if c.is_dir()), target)
     if name == "vulkan-sdk" and (target / "x86_64").is_dir():

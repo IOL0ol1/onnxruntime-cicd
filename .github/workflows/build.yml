@@ -36,7 +36,7 @@ on:
         type: string
         default: ""
       cuda_archs:
-        description: "CMAKE_CUDA_ARCHITECTURES (default 80-virtual: a single PTX, JIT-compiled on Ampere and newer GPUs)"
+        description: "CMAKE_CUDA_ARCHITECTURES (default 80-real;80-virtual: SM 8.0 SASS plus a compute_80 PTX, JIT-compiled on newer GPUs)"
         type: string
         default: ""
       publish:
@@ -62,10 +62,14 @@ concurrency:
 env:
   PYTHONUTF8: "1"
   PYTHONIOENCODING: utf-8
-  CUDA_ARCHITECTURES: ${{ inputs.cuda_archs || vars.CUDA_ARCHITECTURES || '80-virtual' }}
+  # ORT drops a list that has only -virtual entries, so keep at least one real architecture
+  CUDA_ARCHITECTURES: ${{ inputs.cuda_archs || vars.CUDA_ARCHITECTURES || '80-real;80-virtual' }}
   # GPU targets of the Windows MIGraphX source build (empty = ci/build.py default: RDNA3 / RDNA4)
   MIGRAPHX_GPU_TARGETS: ${{ vars.MIGRAPHX_GPU_TARGETS }}
   CMAKE_VERSION: "4.2.3"
+  # CMake 4 removed compatibility with cmake_minimum_required(VERSION < 3.5), still used by some ORT dependencies
+  # (psimd, oneDNN)
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
 jobs:
   plan:
@@ -120,12 +124,24 @@ jobs:
             git -C "$path" submodule update --init --recursive --depth 1
           done
 
+      # qcom/build_and_test.py of onnxruntime-qnn creates its venv with python3.10 on Linux hosts
+      - uses: actions/setup-python@v7
+        if: matrix.recipe == 'ep-qnn' && runner.os == 'Linux'
+        with:
+          python-version: "3.10"
+
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
       - name: Install build tools
         run: python -m pip install --upgrade "cmake==${CMAKE_VERSION}" ninja
+
+      # The WebAssembly build needs Node.js with npm next to it; the runner image's /usr/local/bin/node has no npm
+      - uses: actions/setup-node@v5
+        if: matrix.triple == 'wasm32-unknown-emscripten'
+        with:
+          node-version: "22"
 
       - name: Install system packages (Linux)
         if: runner.os == 'Linux' && matrix.apt != ''
@@ -148,23 +164,32 @@ jobs:
             echo "STAGE_DIR=${RUNNER_TEMP}/stage"
             echo "SDK_ROOT=${RUNNER_TEMP}/sdk"
             echo "DIST_DIR=${RUNNER_TEMP}/dist"
+            # A bare `cmake --build --parallel` (used by some EP build scripts) means `make -j` without a limit,
+            # which exhausts the runner memory and gets the runner shut down
+            echo "CMAKE_BUILD_PARALLEL_LEVEL=$(python -c 'import os; print(os.cpu_count())')"
           } >> "$GITHUB_ENV"
 
       - name: Build
         if: matrix.docker == ''
+        env:
+          GITHUB_TOKEN: ${{ github.token }}  # authenticated GitHub API requests (the anonymous rate limit is easily hit)
         run: >-
           python ci/build.py --recipe "${{ matrix.recipe }}" --variant "${{ matrix.variant }}" --triple "${{ matrix.triple }}"
           --cuda-major "${{ matrix.cuda_major }}" --work "$WORK_DIR" --stage "$STAGE_DIR" --sdk-root "$SDK_ROOT"
 
       - name: Build (container ${{ matrix.docker }})
         if: matrix.docker != ''
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           docker run --rm \
             -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" -v "$RUNNER_TEMP:$RUNNER_TEMP" -w "$GITHUB_WORKSPACE" \
-            -e CUDA_ARCHITECTURES -e PYTHONUTF8 -e PYTHONIOENCODING -e CMAKE_VERSION \
+            -e CUDA_ARCHITECTURES -e PYTHONUTF8 -e PYTHONIOENCODING -e CMAKE_VERSION -e CMAKE_POLICY_VERSION_MINIMUM \
+            -e CMAKE_BUILD_PARALLEL_LEVEL -e GITHUB_TOKEN \
             "${{ matrix.docker }}" bash -c '
               set -euo pipefail
-              apt-get update && apt-get install -y --no-install-recommends python3-pip python3-venv git patch
+              # the -complete image has ROCm but not MIGraphX
+              apt-get update && apt-get install -y --no-install-recommends python3-pip python3-venv git patch migraphx-dev
               git config --global --add safe.directory "*"
               python3 -m pip install --break-system-packages "cmake==${CMAKE_VERSION}" ninja
               python3 ci/build.py --recipe "${{ matrix.recipe }}" --variant "${{ matrix.variant }}" \
@@ -212,6 +237,8 @@ jobs:
         with:
           python-version: "3.12"
       - name: Download
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: >-
           python scripts/download_ep_packages.py --only "${{ matrix.component }}" --platform "${{ matrix.platform }}"
           --cuda-major "${{ matrix.cuda_major }}" ${{ matrix.pin && format('--pin {0}', matrix.pin) || '' }}
