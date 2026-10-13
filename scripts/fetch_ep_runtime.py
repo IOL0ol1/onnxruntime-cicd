@@ -9,7 +9,7 @@ next to the ONNX Runtime binaries.
 Typical use: point it at an extracted release package. The EPs, target triple, CUDA major version and the exact
 SDK versions used for the build are read from the package's BUILD_INFO.json:
 
-    python scripts/fetch_ep_runtime.py --package-dir onnxruntime-cuda13-1.31.0-x86_64-pc-windows-msvc
+    python scripts/fetch_ep_runtime.py --package-dir onnxruntime-all-1.31.0-x86_64-pc-windows-msvc
 
 Or select EPs and a target explicitly:
 
@@ -131,7 +131,7 @@ EPS = {
 # (recipe, variant) in BUILD_INFO.json -> EPs that need closed-source runtime files
 PACKAGE_EPS = {
     ("ort", "cuda"): ["cuda", "tensorrt"], ("ort", "cuda-plugin"): ["cuda"],
-    ("ort", "nv-tensorrt-rtx"): ["nv-tensorrt-rtx"], ("ort", "qnn"): ["qnn"], ("ort", "cann"): ["cann"],
+    ("ort", "nv-tensorrt-rtx"): ["nv-tensorrt-rtx"], ("ort", "qnn"): ["qnn"],
     ("ep-tensorrt", "default"): ["tensorrt"], ("ep-nv-tensorrt-rtx", "default"): ["nv-tensorrt-rtx"],
     ("ep-qnn", "default"): ["qnn"],
 }
@@ -268,6 +268,8 @@ def main(argv: list[str]) -> int:
         eps = PACKAGE_EPS.get((recipe, variant or "default"), [])
         if (recipe, variant) == ("ort", "default") and target == "x86_64-pc-windows-msvc":
             eps = ["vitisai"]  # the default Windows x64 package includes the Vitis AI bridge
+        if (recipe, variant) == ("ort", "all"):  # the EP set depends on the target; follow the SDKs it was built with
+            eps = [ep for ep in ("cuda", "tensorrt", "cann") if ep in info.get("third_party_sdks", {})]
         if not eps:
             print("nothing to do: this package does not use a closed-source SDK at runtime")
             return 0

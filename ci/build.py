@@ -18,10 +18,13 @@ import glob
 import importlib.util
 import json
 import os
+import platform
 import shlex
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -76,7 +79,7 @@ APPLE_FRAMEWORKS = {
     "aarch64-apple-visionos-sim": ("xrsimulator", "arm64", "default_vision_os_framework_build_settings.json"),
 }
 DEFAULT_CUDA_ARCHS = "80-real;80-virtual"  # ORT drops a list that has only -virtual entries
-# ROCm version used for the Windows MIGraphX source build (same as the AMDMIGraphX windows.yaml CI)
+# ROCm (TheRock wheels) used for the Windows MIGraphX source build (same as the AMDMIGraphX windows.yaml CI)
 WINDOWS_ROCM_VERSION = "7.13.0"
 DEFAULT_MIGRAPHX_GPU_TARGETS = "gfx1100;gfx1101;gfx1102;gfx1200;gfx1201"
 
@@ -206,11 +209,6 @@ def tensorrt_flags(job: Job) -> list[str]:
     return flags + ["--use_tensorrt", "--tensorrt_home", job.sdks["tensorrt"]]
 
 
-def cann_flags(job: Job) -> list[str]:
-    job.need("cann")
-    return ["--use_cann", "--cann_home", job.sdks["cann"]]
-
-
 def macos_flags(job: Job) -> list[str]:
     return ["--use_coreml"] + (["--osx_arch", "x86_64"] if job.triple == "x86_64-apple-darwin" else [])
 
@@ -244,8 +242,25 @@ def all_builtin_flags(job: Job) -> list[str]:
     if job.os in ("linux", "windows") and has("cuda", "cudnn", "tensorrt"):
         flags += tensorrt_flags(job)
     if job.os == "linux" and has("cann"):
-        flags += cann_flags(job)
+        job.need("cann")
+        flags += ["--use_cann", "--cann_home", job.sdks["cann"]]
+        if "--use_cuda" in flags and not job.dry_run:
+            allow_cann_with_cuda(ROOT / "onnxruntime")
     return flags
+
+
+def allow_cann_with_cuda(src: Path) -> None:
+    """The provider bridge defines AllocateBufferWithOptions in both its CUDA and its CANN section, so a build with
+    both providers fails with a redefinition; keep only the CUDA copy (both forward to the same host function)."""
+    path = src / "onnxruntime/core/providers/shared_library/provider_bridge_provider.cc"
+    text = path.read_text(encoding="utf-8")
+    cann = text.index("#if defined(USE_CANN)\n")
+    start = text.index("void* AllocateBufferWithOptions(", cann)
+    if text.rfind("#if !defined(USE_CUDA)", cann, start) != -1:
+        return  # already patched
+    end = text.index("\n}\n", start) + 3
+    path.write_text(text[:start] + "#if !defined(USE_CUDA) && !defined(USE_CUDA_PROVIDER_INTERFACE)\n" + text[start:end]
+                    + "#endif\n" + text[end:], encoding="utf-8", newline="")
 
 
 def ort_variant(job: Job, src: Path) -> tuple[list[str], Callable[[Job, Path], None] | None]:
@@ -260,8 +275,6 @@ def ort_variant(job: Job, src: Path) -> tuple[list[str], Callable[[Job, Path], N
         return flags, None
     if v == "all":
         return all_builtin_flags(job), None
-    if v == "directml":
-        return ["--use_dml"], None
     if v == "qnn":
         job.need("qairt")
         return ["--use_qnn", "--qnn_home", job.sdks["qairt"]], None
@@ -285,8 +298,6 @@ def ort_variant(job: Job, src: Path) -> tuple[list[str], Callable[[Job, Path], N
         return ["--use_openvino", "CPU"], None
     if v == "migraphx":  # built inside the rocm/dev-ubuntu container; ROCm and MIGraphX live in /opt/rocm
         return ["--use_migraphx", "--migraphx_home", os.environ.get("ROCM_PATH", "/opt/rocm")], None
-    if v == "cann":
-        return cann_flags(job), None
     if v == "vsinpu":
         tim_vx = build_tim_vx(job)
         if not job.dry_run:
@@ -333,6 +344,10 @@ def build_ort(job: Job) -> None:
         vs = ["--cmake_generator", vs_generator()]
         run(job, base + vs + ["--arm64", "--buildasx", "--build_dir", build_dir / "arm64"] + flags, cwd=src)
         run(job, base + vs + ["--arm64ec", "--buildasx", "--build_dir", build_dir] + flags, cwd=src)
+    elif job.os == "windows" and not job.triple.startswith("x86_64") and "--use_xnnpack" in flags:
+        # With Ninja on an ARM64 host CMAKE_SYSTEM_PROCESSOR is "ARM64", which ORT's and XNNPACK's CMake do not
+        # recognize, so no NEON kernels get built; the Visual Studio generator passes -A ARM64 instead
+        run(job, base + ["--cmake_generator", vs_generator(), "--build_dir", build_dir] + flags, cwd=src)
     else:
         # On Windows the workflow sets up the MSVC environment with msvc-dev-cmd first
         run(job, base + ["--cmake_generator", "Ninja", "--build_dir", build_dir] + flags, cwd=src)
@@ -347,9 +362,18 @@ def build_ort_apple(job: Job) -> None:
     """Apple mobile platforms: one sysroot/arch dynamic framework per job, built the same way as the official pods."""
     src = ROOT / "onnxruntime"
     sysroot, arch, settings = APPLE_FRAMEWORKS[job.triple]
+    settings = src / "tools/ci_build/github/apple" / settings
     build_dir = job.work / "build"
+    if sysroot == "macabi" and not job.dry_run:
+        # ORT's build.py turns warnings into errors for Catalyst (unlike iOS / tvOS / visionOS), and the CoreML EP uses
+        # APIs newer than the 14.0 deployment target without availability guards
+        data = json.loads(settings.read_text(encoding="utf-8"))
+        data["build_params"]["macabi"].append("--compile_no_warning_as_error")
+        settings = job.work / settings.name
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        settings.write_text(json.dumps(data, indent=2), encoding="utf-8")
     run(job, [python(), src / "tools/ci_build/github/apple/build_apple_framework.py",
-              src / "tools/ci_build/github/apple" / settings, "--build_dir", build_dir, "--config", "Release",
+              settings, "--build_dir", build_dir, "--config", "Release",
               "--build_dynamic_framework", "--only_build_single_sysroot_arch_framework", sysroot, arch], cwd=src)
     framework = build_dir / "intermediates" / f"{sysroot}_{arch}" / "Release" / f"Release-{sysroot}" / "onnxruntime.framework"
     print(f"stage {framework}", flush=True)
@@ -378,16 +402,51 @@ def build_tim_vx(job: Job) -> Path:
     return install
 
 
+def migraphx_gpu_targets() -> str:
+    return os.environ.get("MIGRAPHX_GPU_TARGETS") or DEFAULT_MIGRAPHX_GPU_TARGETS
+
+
+def build_migraphx_linux(job: Job) -> tuple[Path, Path]:
+    """Build MIGraphX (develop, which the AMD EPs follow) with its GPU backend, the same way AMDMIGraphX's ci.yaml does:
+    inside its rocm/migraphx-ci-ubuntu image, which has ROCm in /opt/rocm and the dependencies in /usr/local.
+    Returns (MIGraphX install prefix, ROCm root)."""
+    job.need("amdmigraphx")
+    src, b, install = job.sdks["amdmigraphx"], job.work / "migraphx-build", job.work / "migraphx-install"
+    rocm = Path(os.environ.get("ROCM_PATH", "/opt/rocm"))
+    run(job, ["cmake", "-S", src, "-B", b, "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release",
+              f"-DCMAKE_C_COMPILER={rocm / 'llvm/bin/clang'}", f"-DCMAKE_CXX_COMPILER={rocm / 'llvm/bin/clang++'}",
+              "-DMIGRAPHX_ENABLE_GPU=On", "-DMIGRAPHX_ENABLE_PYTHON=Off", "-DBUILD_TESTING=Off",
+              f"-DGPU_TARGETS={migraphx_gpu_targets()}", f"-DCMAKE_INSTALL_PREFIX={install}"])
+    run(job, ["cmake", "--build", b, "--config", "Release"])
+    run(job, ["cmake", "--install", b])
+    return install, rocm
+
+
+def install_rocm_wheels(job: Job) -> tuple[Path, Path]:
+    """Install ROCm from TheRock's Python wheels, as AMDMIGraphX's windows.yaml does: unlike the multi-arch SDK tarball,
+    the device-<gfx> packages also bring the device libraries HIP code needs. Returns (ROCm root, CMake prefix)."""
+    targets = migraphx_gpu_targets().split(";")
+    extras = ",".join(["libraries", "devel", *(f"device-{t}" for t in targets)])
+    run(job, [python(), "-m", "pip", "install", "--index-url", "https://repo.amd.com/rocm/whl-multi-arch/",
+              f"rocm[{extras}]=={WINDOWS_ROCM_VERSION}"])
+    run(job, ["rocm-sdk", "init"])
+    if job.dry_run:
+        return job.sdk_root / "rocm", job.sdk_root / "rocm" / "lib" / "cmake"
+    path = lambda kind: Path(subprocess.run(["rocm-sdk", "path", kind], capture_output=True, text=True,
+                                            check=True).stdout.strip())
+    return path("--root"), path("--cmake")
+
+
 def build_migraphx_windows(job: Job) -> tuple[Path, Path]:
     """Build MIGraphX with its GPU backend on Windows, following AMDMIGraphX's .github/workflows/windows.yaml.
 
-    ROCm comes from the TheRock Windows SDK tarball; MIGraphX's own dependencies (including rocMLIR) are built
-    by rbuild. Returns (MIGraphX install prefix, ROCm root).
+    ROCm comes from TheRock's Python wheels; MIGraphX's own dependencies (including rocMLIR) are built by rbuild.
+    Returns (MIGraphX install prefix, ROCm root).
     """
-    job.need("rocm", "amdmigraphx", pins={"rocm": WINDOWS_ROCM_VERSION})
-    rocm, src = job.sdks["rocm"], job.sdks["amdmigraphx"]
+    job.need("amdmigraphx")
+    src = job.sdks["amdmigraphx"]
+    rocm, rocm_cmake = install_rocm_wheels(job)
     install, cget = job.work / "migraphx-install", job.work / "cget"
-    targets = os.environ.get("MIGRAPHX_GPU_TARGETS") or DEFAULT_MIGRAPHX_GPU_TARGETS
     path = os.pathsep.join([str(rocm / "lib" / "llvm" / "bin"), str(rocm / "bin"), os.environ.get("PATH", "")])
     # rocMLIR has long paths; build the dependencies in a short directory like the upstream CI does
     short = Path(job.work.anchor) / "b"
@@ -396,8 +455,8 @@ def build_migraphx_windows(job: Job) -> tuple[Path, Path]:
               "-DLLVM_DISABLE_ASSEMBLY_FILES=On", "-DLLVM_ENABLE_DIA_SDK=Off"], cwd=src,
         env={"PATH": path, "CC": "clang-cl", "CXX": "clang-cl", "CXXFLAGS": "/std:c++17", "CGET_BUILD_PATH": str(short)})
     run(job, ["rbuild", "build", "-d", cget, "-s", "gh-win-gpu", "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release",
-              f"-DGPU_TARGETS={targets}", f"-DCMAKE_INSTALL_PREFIX={install}"], cwd=src,
-        env={"PATH": path, "CC": "clang", "CXX": "clang++", "CMAKE_PREFIX_PATH": f"{rocm / 'lib' / 'cmake'};{cget}"})
+              f"-DGPU_TARGETS={migraphx_gpu_targets()}", f"-DCMAKE_INSTALL_PREFIX={install}"], cwd=src,
+        env={"PATH": path, "CC": "clang", "CXX": "clang++", "CMAKE_PREFIX_PATH": f"{rocm_cmake};{cget}"})
     run(job, ["cmake", "--install", src / "build", "--prefix", install])
     return install, rocm
 
@@ -476,9 +535,16 @@ def build_ep_nv_tensorrt_rtx(job: Job) -> None:
             text = (src / "build.bat").read_text(encoding="utf-8")
             script.write_text(text.replace('"Visual Studio 17 2022"', f'"{vs_generator()}"'), encoding="utf-8")
         # Windows ARM64 is cross-compiled on an x64 host, as documented in docs/build-guide.md
-        run(job, ["cmd", "/c", script, *args, *(["--arm64"] if job.triple.startswith("aarch64") else [])], cwd=src)
+        # --skip_tests: the unit test target runs its executable after linking (gtest_discover_tests), which fails
+        # on a runner without an NVIDIA GPU
+        arch = ["--arm64"] if job.triple.startswith("aarch64") else []
+        run(job, ["cmd", "/c", script, *args, "--skip_tests", *arch], cwd=src)
     else:
-        run(job, ["bash", src / "build.sh", *args], cwd=src)
+        # build.sh compiles with a bare `cmake --build --parallel`, i.e. `make -j` without a limit, which runs the
+        # runner out of memory; configure with it and build here, where CMAKE_BUILD_PARALLEL_LEVEL applies
+        run(job, ["bash", src / "build.sh", *args, "--update"], cwd=src)
+        run(job, ["cmake", "-DBUILD_TESTS=OFF", b])  # build.sh has no --skip_tests; see the Windows branch
+        run(job, ["cmake", "--build", b, "--config", "Release"])
     stage_shared_libs(job, b, ["onnxruntime_providers_nv_tensorrt_rtx"])
 
 
@@ -490,10 +556,7 @@ def build_ep_amdgpu(job: Job) -> None:
         cmd += ["--use_dml"]
         names = ["directx-ep"]
     else:
-        if job.os == "windows":
-            migraphx, rocm = build_migraphx_windows(job)
-        else:  # built inside the rocm/dev-ubuntu container
-            migraphx = rocm = Path(os.environ.get("ROCM_PATH", "/opt/rocm"))
+        migraphx, rocm = build_migraphx_windows(job) if job.os == "windows" else build_migraphx_linux(job)
         cmd += ["--migraphx_home", migraphx, "--hip_path", rocm]
         if job.variant == "amdgpu":  # AMDGPU EP; implies MIGraphX (and DirectML on Windows), renamed to *-backend
             cmd += ["--use_amdgpu"]
@@ -525,7 +588,14 @@ def build_ep_qnn(job: Job) -> None:
     job.need("qairt")
     cmd = [python(), "qcom/build_and_test.py", "--config", "Release", "--qairt-sdk", job.sdks["qairt"]]
     if job.os != "android":  # Android needs ORT as an AAR, so the repository script builds it from source
-        job.need("onnxruntime-sdk")
+        # Build against the ORT release the repository's own CI uses: its code follows that release's experimental
+        # API, which later releases changed. (Not known in the plan job, which has no submodules checked out.)
+        packages = src / "qcom/packages.yml"
+        if packages.exists():
+            ort = sdk.dl.yaml_block(packages.read_text(encoding="utf-8"), "ort_prebuilt_windows_x64")["version"]
+            job.need("onnxruntime-sdk", pins={"onnxruntime-sdk": ort})
+        else:
+            job.need("onnxruntime-sdk")
         # the extracted package root: onnxruntime_prebuilt.cmake copies files from <root>/lib
         cmd += ["--ort-prebuilt", job.sdks["onnxruntime-sdk"]]
     if job.os == "linux" and not job.dry_run:
@@ -538,6 +608,11 @@ def build_ep_qnn(job: Job) -> None:
             gitfile.unlink()
             shutil.copytree(gitdir, gitfile, symlinks=True)
             subprocess.run(["git", "config", "--file", str(gitfile / "config"), "--unset", "core.worktree"], check=False)
+        # The aarch64 build mounts the package cache into its container; create it first, or Docker creates it as root
+        # and the container user cannot write to it
+        (Path.home() / ".ort-package-cache").mkdir(exist_ok=True)
+    if job.triple == "aarch64-pc-windows-msvc" and platform.machine() == "AMD64":
+        cmd += ["--target-py-version", "None"]  # build.ps1 cannot build an ARM64 wheel on an x64 host
     run(job, cmd + [QNN_TASKS[job.triple]], cwd=src)
     stage_shared_libs(job, src / "build", ["onnxruntime_providers_qnn"])
     try:
@@ -618,6 +693,23 @@ def required_sdks(recipe: str, variant: str, triple: str, cuda_major: str = "13"
     return job.needed
 
 
+def watch_memory(interval: int = 30) -> None:
+    """Print memory and swap use while they are low, so a job killed for lack of memory shows it in its log."""
+    def info() -> dict[str, int]:
+        fields = (line.split() for line in Path("/proc/meminfo").read_text().splitlines())
+        return {f[0].rstrip(":"): int(f[1]) // 1024 for f in fields}
+
+    def loop() -> None:
+        while True:
+            time.sleep(interval)
+            m = info()
+            if m["MemAvailable"] < m["MemTotal"] // 4:
+                print(f"[memory] available {m['MemAvailable']} MiB of {m['MemTotal']} MiB, "
+                      f"swap free {m['SwapFree']} MiB of {m['SwapTotal']} MiB", flush=True)
+
+    threading.Thread(target=loop, daemon=True).start()
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description="Build ORT / EPs from a recipe and stage the outputs")
     ap.add_argument("--recipe", required=True, choices=sorted(RECIPES))
@@ -636,6 +728,8 @@ def main(argv: list[str]) -> int:
             stream.reconfigure(encoding="utf-8")
     job = Job(args.recipe, args.variant, args.triple, args.work.resolve(), args.stage.resolve(),
               args.sdk_root.resolve(), args.cuda_major, args.cuda_archs, args.dry_run)
+    if Path("/proc/meminfo").exists() and not args.dry_run:
+        watch_memory()
     RECIPES[args.recipe](job)
     return 0
 

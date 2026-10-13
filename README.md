@@ -141,7 +141,7 @@ python scripts/download_ep_packages.py --with-optional                          
 | `hexagon-sdk` (optional) | QNN (only needed for custom HTP ops) | 6.5.0.0 (same source) | Same as above | sha256 |
 | `openvino` | OpenVINO (in-tree + Intel fork) | 2026.2.1 (same as the Intel fork CI) | `storage.openvinotoolkit.org` | sha256 |
 | `cann` | Huawei CANN | Latest release (currently 9.1.1) | Huawei Cloud Ascend artifactory `ascend.devcloud.huaweicloud.com/artifactory/cann-run` (instead of the official site, which needs a Huawei account) | sha256 |
-| `rocm` | MIGraphX / AMDGPU (in-tree + `onnxruntime-ep-amdgpu`) | Latest TheRock multi-arch package (currently 7.14.1); the Windows MIGraphX CI build pins 7.13.0 | `repo.amd.com/rocm/tarball-multi-arch` | — |
+| `rocm` | MIGraphX / AMDGPU (in-tree + `onnxruntime-ep-amdgpu`) | Latest TheRock multi-arch package (currently 7.14.1); the Windows MIGraphX CI build installs TheRock's 7.13.0 Python wheels instead | `repo.amd.com/rocm/tarball-multi-arch` | — |
 | `amdmigraphx` | Build script of the MIGraphX EP in `onnxruntime-ep-amdgpu` (needs MIGraphX sources) | `develop` (same as the official build script) | git: `github.com/ROCm/AMDMIGraphX` | — |
 | `vitisai` | AMD Vitis AI (Ryzen AI NPU) | Latest version of each package | Public AMD PyPI index `pypi.amd.com/simple` | sha256 |
 | `android-ndk` | NNAPI, QNN / XNNPACK on Android | 28.0.13004108 (same as ORT `android.yml`) | `dl.google.com/android/repository` | sha1 |
@@ -188,7 +188,7 @@ The release packages contain only what this project builds. Providers / EPs that
 ```bash
 # Point it at an extracted release package: the EPs, target triple, CUDA major version and the exact SDK
 # versions used by the build are read from BUILD_INFO.json; files go into the package's bin/ (Windows) or lib/
-python scripts/fetch_ep_runtime.py --package-dir onnxruntime-cuda13-<version>-x86_64-pc-windows-msvc
+python scripts/fetch_ep_runtime.py --package-dir onnxruntime-all-<version>-x86_64-pc-windows-msvc
 
 # Or choose EPs and a target explicitly
 python scripts/fetch_ep_runtime.py --ep cuda tensorrt --target x86_64-unknown-linux-gnu --dest ./runtime
@@ -203,7 +203,7 @@ python scripts/fetch_ep_runtime.py --list
 | `nv-tensorrt-rtx` (in-tree and plugin) | TensorRT-RTX, CUDA | `tensorrt_rtx_*`, `tensorrt_onnxparser_rtx_*`, plus cudart |
 | `qnn` (in-tree QNN EP, `onnxruntime-ep-qnn`) | QAIRT | `Qnn*`, `Genie*` and `HtpPrepare` from the QAIRT directory of the target, plus the Hexagon `libQnnHtpV*Skel.so` / `.cat` files, following the same rules as onnxruntime-qnn's CMake |
 | `vitisai` (Vitis AI bridge in the Windows x64 `onnxruntime` package) | Vitis AI runtime (`voe` wheel) | `onnxruntime_vitisai_ep.dll`, `dyn_dispatch_core.dll`, `aiecompiler_client.dll`, `onnxruntime_vitis_ai_custom_ops.dll` |
-| `cann` (`onnxruntime-cann`) | CANN toolkit | Cannot be reduced to a few files; the vendor installer is run into `<dest>/cann` (source its `set_env.sh` before use) |
+| `cann` (`onnxruntime-all` on Linux) | CANN toolkit | Cannot be reduced to a few files; the vendor installer is run into `<dest>/cann` (source its `set_env.sh` before use) |
 
 Targets: `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`, `arm64ec-pc-windows-msvc`, `arm64x-pc-windows-msvc`, `aarch64-linux-android`. The script writes `THIRD_PARTY_RUNTIME.json` (versions, sources and extracted files) and copies the license texts into `third_party_licenses/`. Archives are only streamed, never fully unpacked; downloads are cached in `packages/` and verified when the upstream provides a checksum. The extracted files remain subject to their vendors' licenses: use them, but do not redistribute them.
 
@@ -224,7 +224,7 @@ Not covered, because they are open source or may be redistributed: OpenVINO (Apa
 
 ### Build matrix
 
-85 entries in total. The target platforms follow what each repository's own CI/CD publishes (the ORT v1.30.0 release assets, PyPI wheel tags, and the plugin repositories' workflows).
+84 entries in total. The target platforms follow what each repository's own CI/CD publishes (the ORT v1.30.0 release assets, PyPI wheel tags, and the plugin repositories' workflows).
 
 | Package | Contents | Target triples |
 |---|---|---|
@@ -235,10 +235,8 @@ Not covered, because they are open source or may be redistributed: OpenVINO (Apa
 | `onnxruntime-android` | NNAPI + XNNPACK + WebGPU (same EP set as the official AAR) | `aarch64-linux-android`, `armv7-linux-androideabi`, `i686-linux-android`, `x86_64-linux-android` |
 | `onnxruntime-wasm` / `-wasm-jsep` / `-wasm-webgpu` / `-wasm-webgpu-jspi` / `-wasm-webgpu-static-plugin` | WebAssembly outputs of onnxruntime-web (`.wasm` / `.mjs`), same variants as ORT's `web.yml` | `wasm32-unknown-emscripten` |
 | `onnxruntime-wasm-static` | WebAssembly static library `libonnxruntime_webassembly.a` plus the C/C++ API headers | `wasm32-unknown-emscripten` |
-| `onnxruntime-directml` | DirectML | `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc` |
 | `onnxruntime-qnn` | In-tree QNN EP (the official `win-arm64` package still ships it) | `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc` |
-| `onnxruntime-cuda12` | CUDA 12 + TensorRT | `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc` |
-| `onnxruntime-cuda13` | CUDA 13 + TensorRT | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-pc-windows-msvc` |
+| `onnxruntime-cuda12` | CUDA 12 + TensorRT (the CUDA 13 build is part of `onnxruntime-all`) | `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc` |
 | `onnxruntime-ep-cuda12` | CUDA plugin EP, CUDA 12 | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-pc-windows-msvc` |
 | `onnxruntime-ep-cuda13` | CUDA plugin EP, CUDA 13 | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc` |
 | `onnxruntime-nv-tensorrt-rtx` | TensorRT RTX (in-tree) | `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc` |
@@ -246,14 +244,13 @@ Not covered, because they are open source or may be redistributed: OpenVINO (Apa
 | `onnxruntime-openvino` | OpenVINO (main repository) | `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc` |
 | `onnxruntime-openvino-intel` | OpenVINO (Intel fork `ovep-develop`) | Same as above |
 | `onnxruntime-migraphx` | MIGraphX (built in the `rocm/dev-ubuntu-24.04:7.2.4-complete` container) | `x86_64-unknown-linux-gnu` |
-| `onnxruntime-cann` ⚠ | Huawei CANN | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` |
 | `onnxruntime-vsinpu` ⚠ | VeriSilicon VSINPU (TIM-VX with the x86 simulator driver) | `x86_64-unknown-linux-gnu` |
 | `onnxruntime-ep-tensorrt` | TensorRT plugin EP | `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc` |
 | `onnxruntime-ep-nv-tensorrt-rtx-cuda13` | TensorRT RTX plugin EP (NVIDIA), CUDA 13 | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc` ⚠ (cross-compiled on x64) |
 | `onnxruntime-ep-nv-tensorrt-rtx-cuda12` | TensorRT RTX plugin EP (NVIDIA), CUDA 12 | `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc` |
 | `onnxruntime-ep-directml-amd` | DirectML EP from the AMD plugin repository | `x86_64-pc-windows-msvc` |
-| `onnxruntime-ep-migraphx-amd` | MIGraphX EP from the AMD plugin repository | `x86_64-unknown-linux-gnu` (ROCm container), `x86_64-pc-windows-msvc` ⚠ (MIGraphX built from source, see below) |
-| `onnxruntime-ep-amdgpu` | AMDGPU EP (`--use_amdgpu`; includes the MIGraphX backend, plus the DirectML backend on Windows) | `x86_64-unknown-linux-gnu` (ROCm container), `x86_64-pc-windows-msvc` ⚠ |
+| `onnxruntime-ep-migraphx-amd` | MIGraphX EP from the AMD plugin repository | `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc` ⚠ (MIGraphX built from source on both, see below) |
+| `onnxruntime-ep-amdgpu` | AMDGPU EP (`--use_amdgpu`; includes the MIGraphX backend, plus the DirectML backend on Windows) | `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc` ⚠ |
 | `onnxruntime-ep-qnn` | Qualcomm QNN plugin EP | `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`, `arm64ec-pc-windows-msvc` ⚠, `arm64x-pc-windows-msvc` ⚠, `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` ⚠, `aarch64-linux-android` ⚠ |
 | `onnxruntime-ep-mlx` | MLX plugin EP (with the MIT-licensed libmlx) | `aarch64-apple-darwin` |
 | `onnxruntime-ep-iree` | IREE plugin EP (with a wheel) | `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`, `aarch64-apple-darwin` |
@@ -269,11 +266,14 @@ Not built in CI:
 - Obsolete or deprecated EPs.
 - Language bindings (Python wheels, NuGet, Maven, npm, CocoaPods): the packages contain binaries, libraries and headers only.
 
-### Windows MIGraphX
+### MIGraphX for the AMD plugin EPs
+
+The AMD plugin EPs follow AMDMIGraphX `develop`, whose API is newer than any ROCm release, so MIGraphX is built from source. On Linux this happens in AMDMIGraphX's own CI image `rocm/migraphx-ci-ubuntu` (ROCm in `/opt/rocm`, dependencies preinstalled), like its `ci.yaml`.
+
 
 There is no prebuilt MIGraphX for Windows: AMD's MIGraphX wheels (`stable.repo.amd.com/rocm/migraphx/whl-next`) are Linux-only, and on Windows the MIGraphX EP is otherwise only distributed through the Windows ML EP catalog. The Windows `onnxruntime-ep-migraphx-amd` and `onnxruntime-ep-amdgpu` jobs therefore follow AMDMIGraphX's own `windows.yaml` CI:
 
-1. ROCm comes from the TheRock Windows SDK tarball (`rocm` component, pinned to 7.13.0 like the upstream CI).
+1. ROCm comes from TheRock's Python wheels (`rocm[libraries,devel,device-<gfx>]==7.13.0`, like the upstream CI); unlike the SDK tarball, the device packages also contain the device libraries HIP code needs.
 2. The AMDMIGraphX sources (`amdmigraphx` component, `develop`) are built with `rbuild` (`gh-win-gpu` profile; `clang-cl` for the dependencies including rocMLIR, the ROCm `clang++` for MIGraphX itself).
 3. The AMD plugin EP is then built against that MIGraphX install.
 
@@ -282,7 +282,7 @@ These jobs are heavy (rocMLIR is an LLVM-based build) and may exceed the 6-hour 
 ### Usage
 
 - **Triggers**: pushing a `v*` tag builds and publishes a release; pushing to `main` with changes in `ci/`, `scripts/`, submodules or the workflow only builds; a manual run (`workflow_dispatch`) accepts:
-  - `filter`: only build entries matching this regex, e.g. `ep-qnn|wasm`, `onnxruntime-cuda13/x86_64` or `apple-ios`;
+  - `filter`: only build entries matching this regex, e.g. `ep-qnn|wasm`, `onnxruntime-all/x86_64` or `apple-ios`;
   - `cuda_archs`: CUDA architectures;
   - `publish`: publish a prerelease tagged `build-<version>`;
   - `sdk_archive` and `sdk_retention_days`: whether to create third-party SDK archives and for how many days to keep them.

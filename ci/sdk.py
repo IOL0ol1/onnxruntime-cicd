@@ -117,6 +117,26 @@ def add_cuda_target_layout(target: Path, platform: str) -> None:
             link.symlink_to(dest, target_is_directory=True)
 
 
+def add_cuda_windows_layout(target: Path) -> None:
+    """CUDA 13 Windows redist archives put the DLLs in bin/<arch> and the ARM64 import libraries in lib/arm64. Tools
+    that look in bin (the TensorRT RTX EP's CMake) or lib/x64 (FindCUDAToolkit on any 64-bit target) do not find
+    them, so link them into the places the CUDA 12 layout had them."""
+    def link_files(src: Path, dest: Path, pattern: str) -> None:
+        dest.mkdir(parents=True, exist_ok=True)
+        for f in src.glob(pattern):
+            if not (dest / f.name).exists():
+                try:
+                    os.link(f, dest / f.name)
+                except OSError:
+                    shutil.copy2(f, dest / f.name)
+
+    for arch in ("x64", "arm64"):
+        if (target / "bin" / arch).is_dir():
+            link_files(target / "bin" / arch, target / "bin", "*.dll")
+    if (target / "lib" / "arm64").is_dir():
+        link_files(target / "lib" / "arm64", target / "lib" / "x64", "*.lib")
+
+
 def setup(name: str, ctx, root: Path, download_dir: Path) -> dict:
     comp = dl.component(name)
     if ctx.platform not in comp.platforms:
@@ -144,6 +164,10 @@ def setup(name: str, ctx, root: Path, download_dir: Path) -> dict:
         marker.write_text(resolved.version)
     if name == "cuda" and ctx.platform.startswith("linux"):
         add_cuda_target_layout(target, ctx.platform)
+    if name == "cuda" and ctx.platform.startswith("windows"):
+        add_cuda_windows_layout(target)
+    if name == "qairt" and not (target / "sdk.yaml").exists():  # the zip holds qairt/<version>/
+        target = next((d for d in target.iterdir() if (d / "sdk.yaml").exists()), target)
     if name == "cann":  # CANN 9.x installs into <path>/cann, 8.x into <path>/ascend-toolkit/latest
         target = next((c for c in (target / "cann", target / "ascend-toolkit" / "latest") if c.is_dir()), target)
     if name == "vulkan-sdk" and (target / "x86_64").is_dir():

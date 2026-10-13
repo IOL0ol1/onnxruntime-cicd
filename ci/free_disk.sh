@@ -36,3 +36,7 @@ if [ ! -e /swapfile-ci ]; then
     && sudo swapon /swapfile-ci; } || echo "warning: could not add swap"
 fi
 swapon --show
+
+# Under sustained memory pressure systemd-oomd kills whole cgroups, which can take the runner service with it (the job
+# then ends with "The runner has received a shutdown signal"); leave out-of-memory handling to the kernel instead.
+sudo systemctl stop systemd-oomd.socket systemd-oomd.service > /dev/null 2>&1 || true
