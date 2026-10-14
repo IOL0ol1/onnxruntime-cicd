@@ -100,7 +100,7 @@ class Job:
     platform: str = ""
     os: str = ""
     sdks: dict[str, Path] = field(default_factory=dict)
-    # (component, platform, pinned version or ""), used by ci/plan.py for the SDK archive matrix
+    # (component, platform, pinned version or ""), used by ci/plan.py for the build inputs hash
     needed: set[tuple[str, str, str]] = field(default_factory=set)
 
     def __post_init__(self) -> None:
@@ -448,8 +448,9 @@ def build_ort(job: Job) -> None:
         stage_shared_libs(job, config_dir / "dnnl" / "install", ["dnnl"])
         stage_license(job, "oneDNN", config_dir / "dnnl" / "src" / "dnnl" / "src", ["LICENSE", "THIRD-PARTY-PROGRAMS"])
     if job.os == "windows" and "--use_webgpu" in flags and job.variant != "webgpu-plugin":
-        # Dawn loads the DXC shader compiler it builds (dxcompiler.dll) at run time, as in the WebGPU plugin package
-        copy_files(job, ["dxcompiler.dll"], config_dir, job.stage / "bin")
+        # Dawn loads the DXC shader compiler it builds (dxcompiler.dll) at run time, as in the WebGPU plugin package.
+        # Ninja puts it into the config directory, the Visual Studio generator (Windows ARM64) into Release/ below it.
+        copy_files(job, ["dxcompiler.dll", "Release/dxcompiler.dll"], config_dir, job.stage / "bin")
     if job.os == "windows" and ("--use_webgpu" in flags or job.variant == "webgpu-plugin"):
         stage_license(job, "DirectXShaderCompiler", build_dir, ["**/third_party/dxc/LICENSE.TXT"])
     if "--use_dml" in flags:
