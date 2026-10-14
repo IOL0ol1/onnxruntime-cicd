@@ -170,11 +170,42 @@ jobs:
             if [ "$RUNNER_OS" = "Linux" ]; then echo "CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)"; fi
           } >> "$GITHUB_ENV"
 
+      # Long-running, open-source build steps (see build_cache in ci/build.py) are reused across runs. The key hashes
+      # their inputs, so an update gets a new key; only complete results are saved.
+      - name: Build cache key
+        id: cache
+        if: matrix.docker == ''
+        run: >-
+          python ci/build.py --recipe "${{ matrix.recipe }}" --variant "${{ matrix.variant }}" --triple "${{ matrix.triple }}"
+          --cuda-major "${{ matrix.cuda_major }}" --work "$WORK_DIR" --stage "$STAGE_DIR" --sdk-root "$SDK_ROOT"
+          --cache-info "$GITHUB_OUTPUT"
+
+      - name: Restore build cache
+        id: restore
+        if: steps.cache.outputs.key != ''
+        uses: actions/cache/restore@v6
+        with:
+          key: ${{ steps.cache.outputs.key }}
+          path: ${{ steps.cache.outputs.path }}
+
       - name: Build
         if: matrix.docker == ''
         run: >-
           python ci/build.py --recipe "${{ matrix.recipe }}" --variant "${{ matrix.variant }}" --triple "${{ matrix.triple }}"
           --cuda-major "${{ matrix.cuda_major }}" --work "$WORK_DIR" --stage "$STAGE_DIR" --sdk-root "$SDK_ROOT"
+
+      # Saved even when a later build step fails, as long as the cached step itself finished
+      - name: Check build cache
+        id: cache-check
+        if: always() && steps.cache.outputs.key != '' && steps.restore.outputs.cache-hit != 'true'
+        run: if [ -f "${{ steps.cache.outputs.path }}/${{ steps.cache.outputs.marker }}" ]; then echo "save=true" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Save build cache
+        if: always() && steps.cache-check.outputs.save == 'true'
+        uses: actions/cache/save@v6
+        with:
+          key: ${{ steps.cache.outputs.key }}
+          path: ${{ steps.cache.outputs.path }}
 
       - name: Build (container ${{ matrix.docker }})
         if: matrix.docker != ''

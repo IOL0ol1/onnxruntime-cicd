@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
 import importlib.util
 import json
 import os
@@ -565,6 +566,14 @@ def build_migraphx_windows(job: Job) -> tuple[Path, Path]:
     # rocMLIR has long paths; build the dependencies in a short directory like the upstream CI does
     short = Path(job.work.anchor) / "b"
     run(job, [python(), "-m", "pip", "install", "https://github.com/RadeonOpenCompute/rbuild/archive/master.tar.gz"])
+    if not job.dry_run and (cget / "hash").exists():
+        # cget may come from the Actions cache (see build_cache). As in AMDMIGraphX's windows.yaml, compare the
+        # dependency hash ourselves: rbuild prepare on Windows keeps stale dependencies when it does not match.
+        expected = subprocess.run(["rbuild", "hash", "-s", "gh-win-gpu"], cwd=src, capture_output=True, text=True,
+                                  check=True).stdout.strip()
+        if (cget / "hash").read_text(encoding="utf-8").strip() != expected:
+            print(f"MIGraphX dependency hash changed ({expected}); rebuilding the dependencies", flush=True)
+            shutil.rmtree(cget)
     run(job, ["rbuild", "prepare", "-d", cget, "-s", "gh-win-gpu", "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release",
               "-DLLVM_DISABLE_ASSEMBLY_FILES=On", "-DLLVM_ENABLE_DIA_SDK=Off"], cwd=src,
         env={"PATH": path, "CC": "clang-cl", "CXX": "clang-cl", "CXXFLAGS": "/std:c++17", "CGET_BUILD_PATH": str(short)})
@@ -840,6 +849,26 @@ def watch_memory(interval: int = 30) -> None:
     threading.Thread(target=loop, daemon=True).start()
 
 
+def build_cache(job: Job) -> tuple[str, Path, str] | None:
+    """(key, path, marker) of the build state a recipe can reuse from the Actions cache, or None.
+
+    Only open-source build results are cached (the repository is public, and caches of a public repository can be
+    restored by pull-request workflows). The key hashes everything the cached files depend on, so a version update
+    produces a new key instead of reusing old files; the cache is saved only when the marker file exists, i.e. the
+    cached step finished.
+    """
+    if job.recipe == "ep-amdgpu" and job.os == "windows" and job.variant != "dml":
+        # MIGraphX's third-party dependencies (rocMLIR, ...) built by `rbuild prepare`: about 2.5 hours. They depend on
+        # the files rbuild hashes for them, the ROCm (clang) version and the MSVC toolset, as in AMDMIGraphX's own CI.
+        job.need("amdmigraphx")
+        src, digest = job.sdks["amdmigraphx"], hashlib.sha256()
+        for name in ("requirements.txt", "dev-requirements.txt", "rbuild.ini"):
+            digest.update(name.encode() + b"\0" + ((src / name).read_bytes() if (src / name).exists() else b""))
+        digest.update(f"{WINDOWS_ROCM_VERSION}|{os.environ.get('VCToolsVersion', '')}".encode())
+        return f"migraphx-deps-{job.triple}-{digest.hexdigest()[:20]}", job.work / "cget", "hash"
+    return None
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description="Build ORT / EPs from a recipe and stage the outputs")
     ap.add_argument("--recipe", required=True, choices=sorted(RECIPES))
@@ -852,12 +881,20 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--cuda-archs", default=os.environ.get("CUDA_ARCHITECTURES", DEFAULT_CUDA_ARCHS),
                     help="CMAKE_CUDA_ARCHITECTURES (defaults to the CUDA_ARCHITECTURES environment variable)")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--cache-info", type=Path, metavar="FILE",
+                    help="only append key=, path= and marker= of the recipe's reusable build state (see build_cache) "
+                         "to FILE, e.g. $GITHUB_OUTPUT; nothing for recipes without one")
     args = ap.parse_args(argv)
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8")
     job = Job(args.recipe, args.variant, args.triple, args.work.resolve(), args.stage.resolve(),
               args.sdk_root.resolve(), args.cuda_major, args.cuda_archs, args.dry_run)
+    if args.cache_info:
+        if cache := build_cache(job):
+            with args.cache_info.open("a", encoding="utf-8") as f:
+                f.write(f"key={cache[0]}\npath={cache[1]}\nmarker={cache[2]}\n")
+        return 0
     if Path("/proc/meminfo").exists() and not args.dry_run:
         watch_memory()
     RECIPES[args.recipe](job)
