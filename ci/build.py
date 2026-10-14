@@ -185,6 +185,7 @@ def bundle_vendor_runtime(job: Job, eps: list[str]) -> None:
         return
     spec = importlib.util.spec_from_file_location("fetch_ep_runtime", ROOT / "scripts" / "fetch_ep_runtime.py")
     fetch = importlib.util.module_from_spec(spec)
+    sys.modules["fetch_ep_runtime"] = fetch  # its dataclasses look their module up there
     spec.loader.exec_module(fetch)
     versions = json.loads((job.sdk_root / "sdk-versions.json").read_text(encoding="utf-8"))
     pins = [f"{k}={v}" for k, v in fetch.pins_from_build_info(versions).items()]
@@ -364,8 +365,9 @@ def ort_variant(job: Job, src: Path) -> tuple[list[str], Callable[[Job, Path], N
                 "--cmake_extra_defines", f"CUDAToolkit_ROOT={job.sdks['cuda']}"], None
     if v == "webgpu-plugin":
         names = ["onnxruntime_providers_webgpu"] + (["dxcompiler"] if job.os == "windows" else [])  # same as the official package
+        backends = dawn_backends(job)
         return ["--use_webgpu", "shared_lib", "--wgsl_template", "static",
-                *dawn_backends(job)], \
+                *(["--cmake_extra_defines", *backends] if backends else [])], \
             lambda j, b: stage_shared_libs(j, b, names)
     if v == "openvino":  # OpenVINO_DIR / INTEL_OPENVINO_DIR are set by ci/sdk.py
         job.need("openvino")
