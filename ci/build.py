@@ -23,6 +23,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import sysconfig
 import threading
 import time
 from dataclasses import dataclass, field
@@ -165,6 +166,74 @@ def stage_shared_libs(job: Job, base: Path, names: list[str]) -> None:
         copy_files(job, [f"**/*{n}{ext}*" for n in names], base, job.stage / "lib")
 
 
+def stage_license(job: Job, name: str, base: Path, patterns: list[str]) -> None:
+    """Copy the license texts of a bundled third-party component into third_party_licenses/<name>/."""
+    try:
+        copy_files(job, patterns, base, job.stage / "third_party_licenses" / name)
+    except SystemExit:
+        print(f"warning: no license text of {name} found in {base}", file=sys.stderr, flush=True)
+
+
+def bundle_vendor_runtime(job: Job, eps: list[str]) -> None:
+    """Bundle the runtime libraries of vendor SDKs whose licenses allow distributing them as part of an application
+    (QAIRT, TensorRT for RTX with the CUDA runtime), with the license texts. scripts/fetch_ep_runtime.py selects the
+    files; the archives are already in the SDK download cache. CUDA libraries beyond cudart, cuDNN and TensorRT are
+    redistributable too, but would push the packages past the 2 GiB release asset limit; users fetch them with the
+    script instead."""
+    if job.dry_run:
+        print(f"[dry-run] bundle vendor runtime for {', '.join(eps)}")
+        return
+    spec = importlib.util.spec_from_file_location("fetch_ep_runtime", ROOT / "scripts" / "fetch_ep_runtime.py")
+    fetch = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fetch)
+    versions = json.loads((job.sdk_root / "sdk-versions.json").read_text(encoding="utf-8"))
+    pins = [f"{k}={v}" for k, v in fetch.pins_from_build_info(versions).items()]
+    dest = job.stage / ("bin" if job.os == "windows" else "lib")
+    args = ["--ep", *eps, "--target", job.triple, "--cuda-major", job.cuda_major, "--dest", str(dest),
+            "--cache", str(job.sdk_root / "_downloads"), "--licenses-dir", str(job.stage / "third_party_licenses")]
+    if fetch.main(args + (["--pin", *pins] if pins else [])) != 0:
+        raise SystemExit(f"bundling the {', '.join(eps)} runtime failed")
+
+
+def set_origin_rpath(job: Job, lib_dir: Path, extra: str = "/opt/rocm/lib") -> None:
+    """Let the libraries built here find each other in the package directory: the build-tree run paths point into the
+    CI work directory. Only for libraries this project builds; vendor libraries are left unmodified."""
+    if job.dry_run:
+        return
+    # the PyPI package ships a patchelf binary; PIP_BREAK_SYSTEM_PACKAGES allows it in the Ubuntu container images
+    run(job, [python(), "-m", "pip", "install", "--quiet", "patchelf"], env={"PIP_BREAK_SYSTEM_PACKAGES": "1"})
+    candidates = [shutil.which("patchelf"), Path(sysconfig.get_path("scripts")) / "patchelf",
+                  Path(sysconfig.get_path("scripts", f"{os.name}_user")) / "patchelf"]
+    patchelf = next(str(c) for c in candidates if c and Path(c).exists())
+    for f in sorted(lib_dir.glob("*.so*")):
+        if f.is_file() and not f.is_symlink() and f.read_bytes()[:4] == b"\x7fELF":
+            run(job, [patchelf, "--set-rpath", f"$ORIGIN:{extra}", f])
+
+
+def bundle_openvino(job: Job) -> None:
+    """The OpenVINO runtime with its device plugins, next to the OpenVINO provider. The prebuilt runtime is under the
+    Intel OpenVINO Distribution License, which allows redistributing the files its docs/licensing/redist.txt lists
+    (Windows: runtime/bin/intel64/Release and oneTBB; Linux: runtime/lib/intel64, oneTBB comes from the system) together
+    with that license."""
+    ov = job.sdks["openvino"]
+    if job.os == "windows":
+        tbb = [f"runtime/3rdparty/tbb/bin/{n}.dll" for n in ("tbb12", "tbbmalloc", "tbbmalloc_proxy", "tbbbind_2_5")]
+        copy_files(job, ["runtime/bin/intel64/Release/*", *tbb], ov, job.stage / "bin")
+    else:
+        copy_files(job, ["runtime/lib/intel64/*"], ov, job.stage / "lib")
+    stage_license(job, "OpenVINO", ov, [f"docs/licensing/{n}" for n in (
+        "EULA.txt", "redist.txt", "readme.txt", "LICENSE", "Apache_license.txt", "runtime-third-party-programs.txt",
+        "onetbb_third-party-programs.txt", "onednn_third-party-programs.txt")] + ["runtime/3rdparty/tbb/TBB-LICENSE"])
+
+
+def bundle_directml(job: Job, build_dir: Path) -> None:
+    """DirectML.dll from the Microsoft.AI.DirectML NuGet package the build restored (redistributable with applications)."""
+    arch = {"x86_64": "x64", "aarch64": "arm64"}.get(job.triple.split("-")[0], "x64")
+    copy_files(job, [f"**/Microsoft.AI.DirectML*/bin/{arch}-win/DirectML.dll"], build_dir, job.stage / "bin")
+    stage_license(job, "DirectML", build_dir, ["**/Microsoft.AI.DirectML*/LICENSE.txt",
+                                               "**/Microsoft.AI.DirectML*/ThirdPartyNotices.txt"])
+
+
 def stage_ort_headers(job: Job, src: Path) -> None:
     """Copy the public ORT C/C++ API headers (for packages that are not produced by cmake --install)."""
     copy_files(job, ["include/onnxruntime/core/session/onnxruntime_*.h",
@@ -281,7 +350,12 @@ def ort_variant(job: Job, src: Path) -> tuple[list[str], Callable[[Job, Path], N
     if v == "cuda":
         return tensorrt_flags(job), None
     if v == "cuda-plugin":
-        return cuda_flags(job) + ["--cmake_extra_defines", "onnxruntime_BUILD_CUDA_EP_AS_PLUGIN=ON"], \
+        flags = cuda_flags(job) + ["--cmake_extra_defines", "onnxruntime_BUILD_CUDA_EP_AS_PLUGIN=ON"]
+        if job.os == "windows":
+            # The plugin target passes /bigobj only to the CUDA host compiler, but cudnn_flash_attention.cc needs it
+            # too (C1128); ORT's build.py sets CMAKE_CXX_FLAGS itself, so add it to the Release flags (MSVC defaults)
+            flags += ["--cmake_extra_defines", "CMAKE_CXX_FLAGS_RELEASE=/O2 /Ob2 /DNDEBUG /bigobj"]
+        return flags, \
             lambda j, b: stage_shared_libs(j, b, ["onnxruntime_providers_cuda"])
     if v == "nv-tensorrt-rtx":
         job.need("cuda", "tensorrt-rtx")
@@ -291,7 +365,7 @@ def ort_variant(job: Job, src: Path) -> tuple[list[str], Callable[[Job, Path], N
     if v == "webgpu-plugin":
         names = ["onnxruntime_providers_webgpu"] + (["dxcompiler"] if job.os == "windows" else [])  # same as the official package
         return ["--use_webgpu", "shared_lib", "--wgsl_template", "static",
-                "--cmake_extra_defines", "onnxruntime_BUILD_UNIT_TESTS=OFF", *dawn_backends(job)], \
+                *dawn_backends(job)], \
             lambda j, b: stage_shared_libs(j, b, names)
     if v == "openvino":  # OpenVINO_DIR / INTEL_OPENVINO_DIR are set by ci/sdk.py
         job.need("openvino")
@@ -302,23 +376,26 @@ def ort_variant(job: Job, src: Path) -> tuple[list[str], Callable[[Job, Path], N
         tim_vx = build_tim_vx(job)
         if not job.dry_run:
             os.environ["TIM_VX_INSTALL"] = str(tim_vx)
-        return ["--use_vsinpu"], None
+        return ["--use_vsinpu"], \
+            lambda j, b: (install_ort(j, b), copy_files(j, ["lib/libtim-vx.so*"], tim_vx, j.stage / "lib"),
+                          stage_license(j, "TIM-VX", j.sdks["tim-vx"], ["LICENSE"]))
     if v == "android":  # same EP set as the official Android AAR
         job.need("android-ndk")
         sdk_path = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT") or ""
         return ["--android", "--android_sdk_path", sdk_path, "--android_ndk_path", job.sdks["android-ndk"],
                 "--android_abi", ANDROID_ABI[job.triple], "--use_nnapi", "--use_xnnpack", "--use_webgpu"], None
     if v == "wasm-static":
-        # the unit tests are not packaged, and onnxruntime_provider_test does not compile in this configuration
-        return ["--build_wasm_static_lib", "--enable_wasm_simd", "--disable_rtti",
-                "--cmake_extra_defines", "onnxruntime_BUILD_UNIT_TESTS=OFF"], \
+        return ["--build_wasm_static_lib", "--enable_wasm_simd", "--disable_rtti"], \
             lambda j, b: (copy_files(j, ["**/libonnxruntime_webassembly.a"], b, j.stage / "lib"), stage_ort_headers(j, src))
     if v.startswith("wasm"):
-        extra = {"wasm": ["--enable_wasm_api_exception_catching"],
-                 "wasm-jsep": ["--use_jsep", "--use_webnn"],
-                 "wasm-webgpu": ["--use_webgpu", "--use_webnn"],
+        # Like the official Release builds, catch exceptions only at the API boundary (JSPI uses native wasm
+        # exceptions instead): catching them everywhere makes the LTO link need far more memory than the runners have
+        catch = ["--enable_wasm_api_exception_catching"]
+        extra = {"wasm": catch,
+                 "wasm-jsep": ["--use_jsep", "--use_webnn", *catch],
+                 "wasm-webgpu": ["--use_webgpu", "--use_webnn", *catch],
                  "wasm-webgpu-jspi": ["--use_webgpu", "--use_webnn", "--enable_wasm_jspi"],
-                 "wasm-webgpu-static-plugin": ["--use_webgpu", "static_plugin", "--use_webnn"]}[v]
+                 "wasm-webgpu-static-plugin": ["--use_webgpu", "static_plugin", "--use_webnn", *catch]}[v]
         return ["--build_wasm", "--enable_wasm_simd", "--enable_wasm_threads", "--target", "onnxruntime_webassembly",
                 "--disable_rtti", *extra], \
             lambda j, b: copy_files(j, ["ort-wasm-*.wasm", "ort-wasm-*.mjs"], b, j.stage / "lib")
@@ -330,9 +407,15 @@ def build_ort(job: Job) -> None:
     flags, stager = ort_variant(job, src)
     build_dir = job.work / "build"
     base = [python(), src / "tools/ci_build/build.py", "--config", "Release", "--update", "--build", "--parallel",
-            "--skip_tests", "--skip_submodule_sync", "--compile_no_warning_as_error"]
+            "--skip_tests", "--skip_submodule_sync", "--compile_no_warning_as_error",
+            # the tests are not run here, and cmake --install would package onnx_test_runner
+            "--cmake_extra_defines", "onnxruntime_BUILD_UNIT_TESTS=OFF"]
     if not job.variant.startswith("wasm"):
         base.append("--build_shared_lib")
+    if job.os == "linux":
+        # cmake --install drops the $ORIGIN run path the providers are linked with, so the oneDNN provider would not find
+        # the libdnnl.so.3 packaged next to it
+        base += ["--cmake_extra_defines", "CMAKE_INSTALL_RPATH=$ORIGIN"]
     if job.os == "windows" and not job.triple.startswith("x86_64"):
         # The MSVC 14.5x armasm64 rejects the /arch:armv8.2 flag KleidiAI passes to its .S kernels
         base.append("--no_kleidiai")
@@ -347,6 +430,8 @@ def build_ort(job: Job) -> None:
     elif job.os == "windows" and not job.triple.startswith("x86_64") and "--use_xnnpack" in flags:
         # With Ninja on an ARM64 host CMAKE_SYSTEM_PROCESSOR is "ARM64", which ORT's and XNNPACK's CMake do not
         # recognize, so no NEON kernels get built; the Visual Studio generator passes -A ARM64 instead
+        # MSVC has no arm_fp16.h, which XNNPACK's FP16 scalar kernels include
+        flags = flags + ["--cmake_extra_defines", "XNNPACK_ENABLE_ARM_FP16_SCALAR=OFF"]
         run(job, base + ["--cmake_generator", vs_generator(), "--build_dir", build_dir] + flags, cwd=src)
     else:
         # On Windows the workflow sets up the MSVC environment with msvc-dev-cmd first
@@ -355,7 +440,31 @@ def build_ort(job: Job) -> None:
     if stager:
         stager(job, config_dir)
     else:
-        run(job, ["cmake", "--install", config_dir, "--prefix", job.stage, "--config", "Release"])
+        install_ort(job, config_dir)
+    if "--use_dnnl" in flags:  # oneDNN (Apache-2.0) is built from source for its provider, but not installed with it
+        stage_shared_libs(job, config_dir / "dnnl" / "install", ["dnnl"])
+        stage_license(job, "oneDNN", config_dir / "dnnl" / "src" / "dnnl" / "src", ["LICENSE", "THIRD-PARTY-PROGRAMS"])
+    if job.os == "windows" and "--use_webgpu" in flags and job.variant != "webgpu-plugin":
+        # Dawn loads the DXC shader compiler it builds (dxcompiler.dll) at run time, as in the WebGPU plugin package
+        copy_files(job, ["dxcompiler.dll"], config_dir, job.stage / "bin")
+    if job.os == "windows" and ("--use_webgpu" in flags or job.variant == "webgpu-plugin"):
+        stage_license(job, "DirectXShaderCompiler", build_dir, ["**/third_party/dxc/LICENSE.TXT"])
+    if "--use_dml" in flags:
+        bundle_directml(job, build_dir)
+    if "--use_openvino" in flags:
+        bundle_openvino(job)
+    if "--use_qnn" in flags:
+        bundle_vendor_runtime(job, ["qnn"])
+    if "--use_nv_tensorrt_rtx" in flags:
+        bundle_vendor_runtime(job, ["nv-tensorrt-rtx"])
+
+
+def install_ort(job: Job, config_dir: Path) -> None:
+    run(job, ["cmake", "--install", config_dir, "--prefix", job.stage, "--config", "Release"])
+    if job.os == "windows" and not job.dry_run:
+        # The providers are MODULE libraries, which install() puts into lib/; they are loaded from next to onnxruntime.dll
+        for dll in (job.stage / "lib").glob("*.dll"):
+            shutil.move(dll, job.stage / "bin" / dll.name)
 
 
 def build_ort_apple(job: Job) -> None:
@@ -375,7 +484,10 @@ def build_ort_apple(job: Job) -> None:
     run(job, [python(), src / "tools/ci_build/github/apple/build_apple_framework.py",
               settings, "--build_dir", build_dir, "--config", "Release",
               "--build_dynamic_framework", "--only_build_single_sysroot_arch_framework", sysroot, arch], cwd=src)
-    framework = build_dir / "intermediates" / f"{sysroot}_{arch}" / "Release" / f"Release-{sysroot}" / "onnxruntime.framework"
+    config_dir = build_dir / "intermediates" / f"{sysroot}_{arch}" / "Release"
+    framework = config_dir / f"Release-{sysroot}" / "onnxruntime.framework"
+    if sysroot == "macabi" and not framework.exists():  # Catalyst builds use Makefiles, which add no -<sysroot> dir
+        framework = config_dir / "onnxruntime.framework"
     print(f"stage {framework}", flush=True)
     if job.dry_run:
         return
@@ -507,12 +619,8 @@ def build_ep_tensorrt(job: Job) -> None:
               f"-DCMAKE_CUDA_ARCHITECTURES={job.cuda_archs}", f"-DCMAKE_CUDA_COMPILER={nvcc}",
               f"-DTENSORRT_HOME={trt}", f"-DORT_HOME={ort_home(job)}", f"-DTRT_MAJOR_VERSION={trt_major(job)}"])
     run(job, ["cmake", "--build", b, "--parallel"])
-    run(job, ["cmake", "--install", b])
-    if not job.dry_run:  # the install rules copy TensorRT runtime DLLs into bin/; third-party libraries are not redistributed
-        for f in (job.stage / "bin").glob("nvinfer*"):
-            f.unlink()
-        for f in (job.stage / "bin").glob("nvonnxparser*"):
-            f.unlink()
+    # not cmake --install: it also installs the protobuf / ONNX / flatbuffers dependencies and the TensorRT DLLs
+    stage_shared_libs(job, b, ["onnxruntime_ep_tensorrt"])
 
 
 def trt_major(job: Job) -> str:
@@ -546,6 +654,7 @@ def build_ep_nv_tensorrt_rtx(job: Job) -> None:
         run(job, ["cmake", "-DBUILD_TESTS=OFF", b])  # build.sh has no --skip_tests; see the Windows branch
         run(job, ["cmake", "--build", b, "--config", "Release"])
     stage_shared_libs(job, b, ["onnxruntime_providers_nv_tensorrt_rtx"])
+    bundle_vendor_runtime(job, ["nv-tensorrt-rtx"])
 
 
 def build_ep_amdgpu(job: Job) -> None:
@@ -570,6 +679,15 @@ def build_ep_amdgpu(job: Job) -> None:
         os.environ.pop("VSINSTALLDIR", None)
     run(job, cmd, cwd=src)
     stage_shared_libs(job, b / "Release", names)
+    if job.os == "windows" and job.variant in ("dml", "amdgpu"):  # the DirectML EP / backend
+        bundle_directml(job, b)
+    if job.variant != "dml":  # MIGraphX (MIT) is built from its develop branch here, so bundle it with its license
+        if job.os == "windows":
+            copy_files(job, ["bin/migraphx*.dll"], migraphx, job.stage / "bin")
+        else:
+            copy_files(job, ["lib/libmigraphx*.so*", "lib/migraphx/lib/*.so*"], migraphx, job.stage / "lib")
+            set_origin_rpath(job, job.stage / "lib")
+        stage_license(job, "MIGraphX", job.sdks["amdmigraphx"], ["LICENSE*"])
 
 
 QNN_TASKS = {
@@ -599,15 +717,19 @@ def build_ep_qnn(job: Job) -> None:
         # the extracted package root: onnxruntime_prebuilt.cmake copies files from <root>/lib
         cmd += ["--ort-prebuilt", job.sdks["onnxruntime-sdk"]]
     if job.os == "linux" and not job.dry_run:
-        # The Linux builds run qcom/scripts/linux/build.sh in a container that mounts only this repository and calls
-        # `git rev-parse --show-toplevel`; a submodule's .git file points outside of it, so give it its own git dir
-        # (the original stays in place for the nested submodules).
-        gitfile = src / ".git"
-        if gitfile.is_file():
-            gitdir = (src / gitfile.read_text(encoding="utf-8").split(":", 1)[1].strip()).resolve()
-            gitfile.unlink()
-            shutil.copytree(gitdir, gitfile, symlinks=True)
-            subprocess.run(["git", "config", "--file", str(gitfile / "config"), "--unset", "core.worktree"], check=False)
+        # The Linux builds run qcom/scripts/linux/build.sh in a container that mounts only this repository, where git
+        # (`rev-parse --show-toplevel`, `submodule sync`) must work; the .git files of a submodule checkout point
+        # outside of it, so give this repository and its submodules their own git dirs
+        nested = subprocess.run(["git", "submodule", "foreach", "--recursive", "--quiet", 'echo "$displaypath"'],
+                                cwd=src, capture_output=True, text=True, check=True).stdout.splitlines()
+        for repo in [src, *(src / d for d in nested)]:  # outer first; the originals stay in place for the nested ones
+            gitfile = repo / ".git"
+            if gitfile.is_file():
+                gitdir = (repo / gitfile.read_text(encoding="utf-8").split(":", 1)[1].strip()).resolve()
+                gitfile.unlink()
+                shutil.copytree(gitdir, gitfile, symlinks=True)
+                subprocess.run(["git", "config", "--file", str(gitfile / "config"), "--unset", "core.worktree"],
+                               check=False)
         # The aarch64 build mounts the package cache into its container; create it first, or Docker creates it as root
         # and the container user cannot write to it
         (Path.home() / ".ort-package-cache").mkdir(exist_ok=True)
@@ -619,18 +741,24 @@ def build_ep_qnn(job: Job) -> None:
         copy_files(job, ["**/dist/*.whl"], src / "build", job.stage / "python")
     except SystemExit:
         pass
+    bundle_vendor_runtime(job, ["qnn"])
 
 
 def build_ep_mlx(job: Job) -> None:
     src = ROOT / "eps/official/onnxruntime-ep-mlx/rust"
     prefix = job.work / "mlx-prefix"
     include = ort_home(job) / "include"
-    run(job, ["bash", "scripts/setup_mlx.sh", prefix], cwd=src)
+    mlx_build = job.work / "mlx-build"
+    run(job, ["bash", "scripts/setup_mlx.sh", prefix], cwd=src, env={"MLX_BUILD_ROOT": str(mlx_build)})
     env = {"MLX_PREFIX": str(prefix), "MLXC_PREFIX": str(prefix), "ORT_INCLUDE_DIR": str(include),
            "MACOSX_DEPLOYMENT_TARGET": "14.0", "CARGO_TARGET_DIR": str(job.work / "target")}
     run(job, ["cargo", "build", "--release"], cwd=src, env=env)
     copy_files(job, ["release/libonnxruntime_mlx_ep.dylib"], job.work / "target", job.stage / "lib")
     copy_files(job, ["lib/libmlx*.dylib", "lib/mlx.metallib"], prefix, job.stage / "lib")  # MLX is MIT-licensed and may be redistributed
+    # libmlx statically links fmt, nlohmann/json and gguflib and is compiled with the metal-cpp headers
+    for name, sub in (("mlx", "mlx-source"), ("mlx-c", "source"), ("fmt", "fmt-source"), ("nlohmann-json", "json-source"),
+                      ("gguflib", "gguflib-source"), ("metal-cpp", "metal-cpp-source/metal-cpp")):
+        stage_license(job, name, mlx_build / sub, ["LICENSE*"])
 
 
 def build_ep_iree(job: Job) -> None:

@@ -76,10 +76,19 @@ def main(argv: list[str]) -> int:
         "note": "Third-party SDKs (CUDA, TensorRT, QAIRT, OpenVINO, ...) are not included; install the matching versions to run.",
     }
     info.update(dict(e.split("=", 1) for e in args.extra))
+    if "cuda" not in info["third_party_sdks"]:  # the workflow passes the CUDA settings for every build
+        info.pop("cuda_architectures", None)
+        info.pop("cuda_major", None)
     (stage / "BUILD_INFO.json").write_text(json.dumps(info, indent=2), encoding="utf-8")
-    license_file = ROOT / "onnxruntime" / "LICENSE"
-    if license_file.exists() and not (stage / "LICENSE").exists():
+    # the license of the packaged project: the first source that has one (an EP repository, or onnxruntime)
+    licenses = [ROOT / s / "LICENSE" for s in args.source] + [ROOT / "onnxruntime" / "LICENSE"]
+    license_file = next((f for f in licenses if f.exists()), None)
+    if license_file and not (stage / "LICENSE").exists():
         (stage / "LICENSE").write_bytes(license_file.read_bytes())
+    # the notices of the open-source code linked into the binaries (ONNX Runtime and some EP repositories keep one)
+    notices = next((f for f in (ROOT / s / "ThirdPartyNotices.txt" for s in args.source) if f.exists()), None)
+    if notices and not (stage / notices.name).exists():
+        (stage / notices.name).write_bytes(notices.read_bytes())
 
     top = f"{args.name}-{args.version}-{args.triple}"
     ext = ".zip" if "windows" in args.triple else ".tar.gz"
@@ -89,6 +98,8 @@ def main(argv: list[str]) -> int:
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     (args.out / f"{archive.name}.sha256").write_text(f"{digest}  {archive.name}\n", encoding="utf-8")
     print(f"{archive}  {archive.stat().st_size >> 20} MiB  sha256={digest}")
+    if archive.stat().st_size >= 2 << 30:  # GitHub rejects release assets of 2 GiB or more
+        print(f"::warning::{archive.name} is {archive.stat().st_size >> 20} MiB, too large for a GitHub release asset")
     return 0
 
 

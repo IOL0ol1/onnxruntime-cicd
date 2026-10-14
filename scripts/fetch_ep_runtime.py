@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Download the closed-source SDKs that some providers / EPs need at runtime, and extract only the runtime files.
 
-The release packages of this repository never contain third-party SDK files, because CUDA, cuDNN, TensorRT,
-TensorRT-RTX, QAIRT (QNN), CANN and the Vitis AI runtime cannot be redistributed. This script fetches them from
-the same no-account official sources as scripts/download_ep_packages.py and copies just the runtime libraries
-next to the ONNX Runtime binaries.
+The release packages bundle the vendor runtimes whose licenses allow distributing them with an application and
+that keep the packages under the 2 GiB release asset limit (QAIRT, TensorRT for RTX with the CUDA runtime; ci/build.py
+uses this script for that). The CUDA libraries, cuDNN and TensorRT are left out for their size, the CANN toolkit and
+the Vitis AI runtime for their licenses. This script fetches those from the same no-account official sources as
+scripts/download_ep_packages.py and copies just the runtime libraries next to the ONNX Runtime binaries.
 
 Typical use: point it at an extracted release package. The EPs, target triple, CUDA major version and the exact
 SDK versions used for the build are read from the package's BUILD_INFO.json:
@@ -128,12 +129,10 @@ EPS = {
     "vitisai": "AMD Vitis AI EP: closed-source backend DLLs from the voe wheel (Windows x64)",
     "cann": "Huawei CANN EP: installs the CANN toolkit (its libraries need the full install and set_env.sh)",
 }
-# (recipe, variant) in BUILD_INFO.json -> EPs that need closed-source runtime files
+# (recipe, variant) in BUILD_INFO.json -> EPs whose closed-source runtime files the package does not bundle
+# (the QNN and TensorRT RTX packages already contain theirs)
 PACKAGE_EPS = {
-    ("ort", "cuda"): ["cuda", "tensorrt"], ("ort", "cuda-plugin"): ["cuda"],
-    ("ort", "nv-tensorrt-rtx"): ["nv-tensorrt-rtx"], ("ort", "qnn"): ["qnn"],
-    ("ep-tensorrt", "default"): ["tensorrt"], ("ep-nv-tensorrt-rtx", "default"): ["nv-tensorrt-rtx"],
-    ("ep-qnn", "default"): ["qnn"],
+    ("ort", "cuda"): ["cuda", "tensorrt"], ("ort", "cuda-plugin"): ["cuda"], ("ep-tensorrt", "default"): ["tensorrt"],
 }
 
 
@@ -238,6 +237,8 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--dest", type=Path, help="output directory (default: the package's bin/ on Windows or lib/ elsewhere, "
                                               "otherwise ./ep-runtime/<target>)")
     ap.add_argument("--cache", type=Path, default=dl.DEFAULT_DEST, help=f"download cache (default: {dl.DEFAULT_DEST})")
+    ap.add_argument("--licenses-dir", type=Path, help="where the license texts go (default: <dest>/third_party_licenses); "
+                                                      "THIRD_PARTY_RUNTIME.json is written next to it")
     ap.add_argument("--dry-run", action="store_true", help="resolve the SDK files and show the extraction rules only")
     args = ap.parse_args(argv)
     for stream in (sys.stdout, sys.stderr):
@@ -284,7 +285,7 @@ def main(argv: list[str]) -> int:
     else:
         dest = Path("ep-runtime") / target
     dest = dest.resolve()
-    licenses = dest / "third_party_licenses"
+    licenses = args.licenses_dir.resolve() if args.licenses_dir else dest / "third_party_licenses"
 
     # Merge the selections of all requested EPs per component
     merged: dict[str, Selection] = {}
@@ -322,9 +323,9 @@ def main(argv: list[str]) -> int:
         report["components"][comp_name] = entry
 
     if not args.dry_run:
-        report["note"] = ("These files are third-party software under their vendors' licenses (see third_party_licenses/). "
-                          "Do not redistribute them.")
-        (dest / "THIRD_PARTY_RUNTIME.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+        report["note"] = ("These files are third-party software under their vendors' licenses (see third_party_licenses/), "
+                          "not under the license of the ONNX Runtime binaries next to them.")
+        (licenses.parent / "THIRD_PARTY_RUNTIME.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
         print(f"done: runtime files in {dest}, license texts in {licenses}")
     return 0
 

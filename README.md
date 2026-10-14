@@ -181,9 +181,30 @@ Notes:
 | CANN (in-tree) | `onnxruntime-cann` | — |
 | DirectML (in-tree, sustained engineering) | `onnxruntime-directml` | `Microsoft.ML.OnnxRuntime.DirectML` |
 
-## Runtime files of closed-source SDKs
+## Third-party runtime files
 
-The release packages contain only what this project builds. Providers / EPs that depend on a closed-source SDK whose license does not allow redistribution need that SDK's runtime libraries next to the ONNX Runtime binaries. [`scripts/fetch_ep_runtime.py`](scripts/fetch_ep_runtime.py) downloads those SDKs from the same no-account sources as the download script, extracts **only the runtime files**, and copies them into place together with the vendors' license texts.
+The release packages bundle the third-party runtime libraries whose licenses allow distributing them with an application, each with its license texts in `third_party_licenses/<component>/` (bundled vendor runtimes are also listed in `THIRD_PARTY_RUNTIME.json`). These files stay under their own licenses, not under the license of the ONNX Runtime binaries. `ThirdPartyNotices.txt` covers the open-source code linked into the binaries.
+
+| Bundled in | Component | License |
+|---|---|---|
+| x86_64 `onnxruntime`, `onnxruntime-all` (oneDNN EP) | oneDNN (`dnnl.dll` / `libdnnl.so.3`), built from source | Apache-2.0 |
+| `onnxruntime-vsinpu` | TIM-VX (`libtim-vx.so`), built from source | MIT |
+| Windows `onnxruntime-all`, `onnxruntime-ep-webgpu` | DirectX Shader Compiler (`dxcompiler.dll`), built from source | NCSA |
+| Windows `onnxruntime-all`, `onnxruntime-ep-directml-amd`, `onnxruntime-ep-amdgpu` | DirectML (`DirectML.dll`) | Microsoft DirectML license (redistributable with applications) |
+| `onnxruntime-openvino`, `onnxruntime-openvino-intel` | OpenVINO runtime and device plugins (Windows also oneTBB) | Intel OpenVINO Distribution License: the files listed in its `redist.txt` |
+| `onnxruntime-qnn`, `onnxruntime-ep-qnn` | QAIRT backends and Hexagon skel libraries | Qualcomm AI Stack License (object code, as part of an application) |
+| `onnxruntime-nv-tensorrt-rtx`, `onnxruntime-ep-nv-tensorrt-rtx-*` | TensorRT for RTX and the CUDA runtime (`cudart`) | NVIDIA TensorRT for RTX license, CUDA EULA (Attachment A) |
+| `onnxruntime-ep-migraphx-amd`, `onnxruntime-ep-amdgpu` | MIGraphX, built from its develop branch | MIT |
+| `onnxruntime-ep-mlx` | MLX, mlx-c (with fmt, nlohmann/json, gguflib, metal-cpp) | MIT, Apache-2.0 |
+
+Not bundled, so install or fetch them separately:
+
+- **CUDA libraries beyond cudart, cuDNN and TensorRT**: their licenses allow it, but together they would push the CUDA / TensorRT packages past the 2 GiB GitHub release asset limit.
+- **The CANN toolkit**: Huawei's license does not allow redistribution.
+- **The Vitis AI runtime**: its license could not be verified.
+- **ROCm** (HIP, rocBLAS, MIOpen, ...): a system installation; the AMD packages expect it in `/opt/rocm` (Linux) or a HIP SDK / TheRock install (Windows). On Linux the OpenVINO runtime also needs the system oneTBB (`libtbb12`).
+
+[`scripts/fetch_ep_runtime.py`](scripts/fetch_ep_runtime.py) downloads the CUDA, cuDNN, TensorRT, CANN and Vitis AI runtimes from the same no-account sources as the download script, extracts **only the runtime files**, and copies them into place together with the vendors' license texts.
 
 ```bash
 # Point it at an extracted release package: the EPs, target triple, CUDA major version and the exact SDK
@@ -205,9 +226,7 @@ python scripts/fetch_ep_runtime.py --list
 | `vitisai` (Vitis AI bridge in the Windows x64 `onnxruntime` package) | Vitis AI runtime (`voe` wheel) | `onnxruntime_vitisai_ep.dll`, `dyn_dispatch_core.dll`, `aiecompiler_client.dll`, `onnxruntime_vitis_ai_custom_ops.dll` |
 | `cann` (`onnxruntime-all` on Linux) | CANN toolkit | Cannot be reduced to a few files; the vendor installer is run into `<dest>/cann` (source its `set_env.sh` before use) |
 
-Targets: `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`, `arm64ec-pc-windows-msvc`, `arm64x-pc-windows-msvc`, `aarch64-linux-android`. The script writes `THIRD_PARTY_RUNTIME.json` (versions, sources and extracted files) and copies the license texts into `third_party_licenses/`. Archives are only streamed, never fully unpacked; downloads are cached in `packages/` and verified when the upstream provides a checksum. The extracted files remain subject to their vendors' licenses: use them, but do not redistribute them.
-
-Not covered, because they are open source or may be redistributed: OpenVINO (Apache-2.0), ROCm / MIGraphX, DirectML (Microsoft's redistributable package), Vulkan / IREE / MLX dependencies. GPU / NPU drivers must be installed separately as before.
+Targets: `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`, `arm64ec-pc-windows-msvc`, `arm64x-pc-windows-msvc`, `aarch64-linux-android`. The script writes `THIRD_PARTY_RUNTIME.json` (versions, sources and extracted files) and copies the license texts into `third_party_licenses/`. Archives are only streamed, never fully unpacked; downloads are cached in `packages/` and verified when the upstream provides a checksum. The extracted files remain subject to their vendors' licenses; the CANN toolkit may not be redistributed at all. With `--package-dir`, the script fetches only what the package does not bundle (the QNN and TensorRT RTX runtimes are already in their packages). GPU / NPU drivers must be installed separately.
 
 ## Continuous integration (GitHub Actions)
 
@@ -288,6 +307,6 @@ These jobs are heavy (rocMLIR is an LLVM-based build) and may exceed the 6-hour 
   - `sdk_archive` and `sdk_retention_days`: whether to create third-party SDK archives and for how many days to keep them.
 - **Version**: tag builds use the tag without the leading `v`; other builds use `<ORT version>-dev.<date>.<commit>`.
 - **CUDA architectures**: the default is `80-real;80-virtual`: SM 8.0 SASS plus a compute_80 PTX that the driver JIT-compiles on newer GPUs (ORT's CMake drops a list that has only `-virtual` entries). GitHub-hosted runners have 4 cores, and every extra CUDA architecture roughly doubles the build time, which easily exceeds the 6-hour job limit. To build several SASS architectures, change the `CUDA_ARCHITECTURES` repository variable or the manual-run input, and move the heavy jobs to larger runners with `HEAVY_RUNNER_MAP`, e.g. `{"ubuntu-24.04": "linux-16core", "windows-2025": "windows-16core"}`.
-- **Third-party SDKs**: release packages contain only the libraries and headers built by this project, never third-party SDKs. `BUILD_INFO.json` in each package records the SDK versions used, and `scripts/fetch_ep_runtime.py --package-dir <package>` fetches the matching closed-source runtime files (see [Runtime files of closed-source SDKs](#runtime-files-of-closed-source-sdks)).
+- **Third-party SDKs**: release packages bundle the third-party runtime libraries that may be redistributed and fit the release size limit, with their license texts; `BUILD_INFO.json` in each package records the SDK versions used, and `scripts/fetch_ep_runtime.py --package-dir <package>` fetches the matching runtime files that are not bundled (see [Third-party runtime files](#third-party-runtime-files)).
 - **Visibility of SDK archives**: workflow artifacts of public GitHub repositories are visible to everyone, and most of these SDKs may not be redistributed, so `sdk-archive` only runs in private repositories; public repositories show a notice in the `plan` job and skip it.
 - **Checking recipes locally**: `python ci/build.py --recipe ort --variant cuda --triple x86_64-unknown-linux-gnu --work w --stage s --sdk-root sdk --dry-run` prints the commands that would run; `python ci/plan.py` prints the matrix size and the version.

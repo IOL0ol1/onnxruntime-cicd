@@ -149,8 +149,9 @@ jobs:
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: ${{ matrix.msvc_arch }}
-          # CUDA 12 does not accept the VS 2026 compiler (MSVC 14.5x); the image also ships the VS 2022 toolset
-          toolset: ${{ matrix.cuda_major == '12' && '14.44' || '' }}
+          # The image also ships the VS 2022 toolset: CUDA 12 does not accept the VS 2026 compiler (MSVC 14.5x), and the
+          # constexpr <cmath> comparisons of its STL clash with the HIP device overloads when building MIGraphX
+          toolset: ${{ (matrix.cuda_major == '12' || matrix.recipe == 'ep-amdgpu') && '14.44' || '' }}
 
       - name: Remove Git Bash link.exe (it shadows the MSVC linker)
         if: runner.os == 'Windows'

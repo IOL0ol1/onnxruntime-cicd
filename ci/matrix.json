@@ -84,7 +84,7 @@
     {"package": "onnxruntime-ep-qnn", "recipe": "ep-qnn", "triple": "aarch64-pc-windows-msvc", "runner": "windows-2025", "submodules": "eps/official/onnxruntime-qnn", "heavy": true},
     {"package": "onnxruntime-ep-qnn", "recipe": "ep-qnn", "triple": "arm64ec-pc-windows-msvc", "runner": "windows-2025", "submodules": "eps/official/onnxruntime-qnn", "heavy": true, "experimental": true},
     {"package": "onnxruntime-ep-qnn", "recipe": "ep-qnn", "triple": "arm64x-pc-windows-msvc", "runner": "windows-2025", "submodules": "eps/official/onnxruntime-qnn", "heavy": true, "experimental": true},
-    {"package": "onnxruntime-ep-qnn", "recipe": "ep-qnn", "triple": "x86_64-unknown-linux-gnu", "runner": "ubuntu-24.04", "submodules": "eps/official/onnxruntime-qnn", "heavy": true},
+    {"package": "onnxruntime-ep-qnn", "recipe": "ep-qnn", "triple": "x86_64-unknown-linux-gnu", "runner": "ubuntu-24.04", "submodules": "eps/official/onnxruntime-qnn", "heavy": true, "apt": "libc++1 libc++abi1"},
     {"package": "onnxruntime-ep-qnn", "recipe": "ep-qnn", "triple": "aarch64-unknown-linux-gnu", "runner": "ubuntu-24.04-arm", "submodules": "eps/official/onnxruntime-qnn", "heavy": true, "experimental": true},
     {"package": "onnxruntime-ep-qnn", "recipe": "ep-qnn", "triple": "aarch64-linux-android", "runner": "ubuntu-24.04", "submodules": "eps/official/onnxruntime-qnn", "heavy": true, "experimental": true, "keep_android_sdk": true},
     {"package": "onnxruntime-ep-mlx", "recipe": "ep-mlx", "triple": "aarch64-apple-darwin", "runner": "macos-15", "submodules": "eps/official/onnxruntime-ep-mlx"},
