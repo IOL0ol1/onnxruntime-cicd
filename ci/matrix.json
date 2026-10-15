@@ -35,7 +35,6 @@
     {"package": "onnxruntime-wasm-jsep", "recipe": "ort", "variant": "wasm-jsep", "triple": "wasm32-unknown-emscripten", "runner": "ubuntu-24.04", "submodules": "onnxruntime"},
     {"package": "onnxruntime-wasm-webgpu", "recipe": "ort", "variant": "wasm-webgpu", "triple": "wasm32-unknown-emscripten", "runner": "ubuntu-24.04", "submodules": "onnxruntime"},
     {"package": "onnxruntime-wasm-webgpu-jspi", "recipe": "ort", "variant": "wasm-webgpu-jspi", "triple": "wasm32-unknown-emscripten", "runner": "ubuntu-24.04", "submodules": "onnxruntime"},
-    {"package": "onnxruntime-wasm-webgpu-static-plugin", "recipe": "ort", "variant": "wasm-webgpu-static-plugin", "triple": "wasm32-unknown-emscripten", "runner": "ubuntu-24.04", "submodules": "onnxruntime"},
     {"package": "onnxruntime-wasm-static", "recipe": "ort", "variant": "wasm-static", "triple": "wasm32-unknown-emscripten", "runner": "ubuntu-24.04", "submodules": "onnxruntime"},
 
     {"package": "onnxruntime-qnn", "recipe": "ort", "variant": "qnn", "triple": "x86_64-pc-windows-msvc", "runner": "windows-2025", "submodules": "onnxruntime eps/official/onnxruntime-qnn"},

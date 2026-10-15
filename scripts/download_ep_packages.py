@@ -28,12 +28,14 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import os
 import platform as host_platform
 import re
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -172,10 +174,24 @@ def github_tags(repo: str) -> list[str]:
 
 
 def read_submodule(rel: str) -> str:
+    """Read a file of a submodule; when the submodule is not checked out (e.g. the CI plan job), fetch the file from
+    GitHub at the commit the superproject records, so the result is the same."""
     path = ROOT / rel
-    if not path.exists():
-        raise RuntimeError(f"{rel} is missing; run git submodule update --init first")
-    return path.read_text(encoding="utf-8")
+    if path.exists():
+        return path.read_text(encoding="utf-8")
+    try:
+        names = subprocess.run(["git", "config", "--file", str(ROOT / ".gitmodules"), "--get-regexp", r"\.path$"],
+                               capture_output=True, text=True, cwd=ROOT, check=True).stdout.split()
+        sub = next(p for p in names[1::2] if rel.startswith(p + "/"))
+        url = subprocess.run(["git", "config", "--file", str(ROOT / ".gitmodules"), f"submodule.{sub}.url"],
+                             capture_output=True, text=True, cwd=ROOT, check=True).stdout.strip()
+        sha = subprocess.run(["git", "rev-parse", f"HEAD:{sub}"], capture_output=True, text=True, cwd=ROOT,
+                             check=True).stdout.strip()
+        repo = re.match(r"https://github\.com/(.+?)(\.git)?$", url).group(1)
+        raw = f"https://raw.githubusercontent.com/{repo}/{sha}/{rel[len(sub) + 1:]}"
+        return urllib.request.urlopen(raw, timeout=60).read().decode("utf-8")
+    except (subprocess.CalledProcessError, StopIteration, AttributeError, OSError) as e:
+        raise RuntimeError(f"{rel} is missing (run git submodule update --init) and could not be fetched: {e}")
 
 
 def yaml_block(text: str, key: str) -> dict[str, str]:
@@ -530,18 +546,15 @@ def _digest(path: Path, algo: str) -> str:
     return h.hexdigest()
 
 
-def download_file(item: FileItem, out: Path) -> str:
-    dest = out / item.filename
-    if dest.exists() and (_check(dest, item) or not (item.sha256 or item.sha1)):
-        print(f"    already present, skipping: {dest.name}")
-        return _digest(dest, "sha256")
-    part = dest.with_name(dest.name + ".part")
+def _download_part(item: FileItem, part: Path, name: str) -> bool:
+    """Download into part, resuming what it already holds; True when the server's whole content has arrived."""
     offset = part.stat().st_size if part.exists() else 0
     headers = {"Range": f"bytes={offset}-"} if offset else {}
     with urllib.request.urlopen(_request(item.url, headers), timeout=600) as resp:
         if offset and resp.status != 206:
             offset = 0  # the server does not support resuming; start over
-        total = int(resp.headers.get("Content-Length") or 0) + offset
+        length = int(resp.headers.get("Content-Length") or 0)
+        total = length + offset if length else 0
         done, last = offset, -1
         with open(part, "ab" if offset else "wb") as f:
             while chunk := resp.read(1 << 20):
@@ -549,11 +562,35 @@ def download_file(item: FileItem, out: Path) -> str:
                 done += len(chunk)
                 pct = done * 100 // total if total else -1
                 if pct != last and pct % 10 == 0:
-                    print(f"    {dest.name}: {pct}% ({done >> 20} MiB)", flush=True)
+                    print(f"    {name}: {pct}% ({done >> 20} MiB)", flush=True)
                     last = pct
-    if (item.sha256 or item.sha1) and not _check(part, item):
-        part.unlink()
-        raise RuntimeError(f"checksum mismatch: {dest.name}")
+    if total and done < total:
+        print(f"    {name}: connection closed at {done >> 20} of {total >> 20} MiB", flush=True)
+        return False
+    return True
+
+
+def download_file(item: FileItem, out: Path) -> str:
+    dest = out / item.filename
+    if dest.exists() and (_check(dest, item) or not (item.sha256 or item.sha1)):
+        print(f"    already present, skipping: {dest.name}")
+        return _digest(dest, "sha256")
+    part = dest.with_name(dest.name + ".part")
+    # Large downloads (QAIRT is ~3 GB) sometimes end early without an error; resume them, and start over once if the
+    # completed file does not match its checksum
+    for attempt in range(1, 7):
+        try:
+            if _download_part(item, part, dest.name):
+                if not (item.sha256 or item.sha1) or _check(part, item):
+                    break
+                part.unlink()
+                print(f"    {dest.name}: checksum mismatch, downloading again", flush=True)
+        except (OSError, http.client.HTTPException) as e:  # URLError, timeouts, IncompleteRead, reset connections
+            print(f"    {dest.name}: {e.__class__.__name__}: {e}; resuming", flush=True)
+        if attempt == 6:
+            part.unlink(missing_ok=True)
+            raise RuntimeError(f"download failed or checksum mismatch: {dest.name}")
+        time.sleep(10 * attempt)
     part.replace(dest)
     print(f"    downloaded: {dest.name}{' (verified)' if item.sha256 or item.sha1 else ' (no upstream checksum)'}")
     return _digest(dest, "sha256")

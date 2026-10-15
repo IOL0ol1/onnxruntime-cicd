@@ -27,6 +27,9 @@ on:
       - ".gitmodules"
       - "onnxruntime"
       - "eps/**"
+  # Weekly: picks up new third-party SDK releases (part of the build inputs); unchanged entries reuse their packages
+  schedule:
+    - cron: "17 3 * * 1"
   workflow_dispatch:
     inputs:
       filter:
@@ -52,7 +55,8 @@ permissions:
 
 concurrency:
   group: build-${{ github.ref }}
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+  # A new push supersedes the running build; a scheduled run waits for it instead, and tag builds always finish
+  cancel-in-progress: ${{ github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/') }}
 
 env:
   PYTHONUTF8: "1"
@@ -110,7 +114,21 @@ jobs:
 
       - name: Free disk space (Linux)
         if: runner.os == 'Linux' && matrix.reuse_run == ''
-        run: bash ci/free_disk.sh "${{ matrix.keep_android_sdk }}"
+        uses: jlumbroso/free-disk-space@v2
+        with:
+          android: ${{ !matrix.keep_android_sdk }}  # the Android builds use the preinstalled SDK
+          large-packages: false  # removing them with apt takes minutes and frees little that the builds need
+
+      # The runners have 16 GB of RAM and a 4 GB swap file; linking the LTO WebAssembly builds and some EP builds needs
+      # more, and running out of memory shuts the runner down. Under sustained memory pressure systemd-oomd also kills
+      # whole cgroups, which can take the runner service with it; leave out-of-memory handling to the kernel.
+      - name: Add swap and stop systemd-oomd (Linux)
+        if: runner.os == 'Linux' && matrix.reuse_run == ''
+        run: |
+          { sudo fallocate -l 16G /swapfile-ci && sudo chmod 600 /swapfile-ci && sudo mkswap /swapfile-ci > /dev/null &&
+            sudo swapon /swapfile-ci; } || echo "::warning::could not add swap"
+          sudo systemctl stop systemd-oomd.socket systemd-oomd.service || true
+          swapon --show
 
       - name: Check out required submodules
         if: matrix.reuse_run == ''
@@ -208,7 +226,7 @@ jobs:
           docker run --rm \
             -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" -v "$RUNNER_TEMP:$RUNNER_TEMP" -w "$GITHUB_WORKSPACE" \
             -e CUDA_ARCHITECTURES -e PYTHONUTF8 -e PYTHONIOENCODING -e CMAKE_VERSION -e CMAKE_POLICY_VERSION_MINIMUM \
-            -e CMAKE_BUILD_PARALLEL_LEVEL -e GITHUB_TOKEN \
+            -e CMAKE_BUILD_PARALLEL_LEVEL -e GITHUB_TOKEN -e PIP_ROOT_USER_ACTION=ignore \
             "${{ matrix.docker }}" bash -c '
               set -euo pipefail
               apt-get update && apt-get install -y --no-install-recommends python3-pip python3-venv git patch ${{ matrix.apt }}

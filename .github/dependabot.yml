@@ -1,0 +1,19 @@
+# Weekly update pull requests (merging one triggers the build workflow; entries whose inputs did not change reuse
+# their packages, so only the affected builds run)
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+  # onnxruntime and the EP repositories: move each submodule to the newest commit of its branch
+  - package-ecosystem: gitsubmodule
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      submodules:
+        patterns: ["*"]

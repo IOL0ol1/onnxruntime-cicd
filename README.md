@@ -242,7 +242,7 @@ Targets: `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-pc-win
 
 ### Build matrix
 
-84 entries in total. The target platforms follow what each repository's own CI/CD publishes (the ORT v1.30.0 release assets, PyPI wheel tags, and the plugin repositories' workflows).
+83 entries in total. The target platforms follow what each repository's own CI/CD publishes (the ORT v1.30.0 release assets, PyPI wheel tags, and the plugin repositories' workflows).
 
 | Package | Contents | Target triples |
 |---|---|---|
@@ -251,7 +251,7 @@ Targets: `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-pc-win
 | `onnxruntime` (Apple frameworks) | Dynamic `onnxruntime.framework` per sysroot/arch, built with the official `build_apple_framework.py` settings (CoreML, XNNPACK on iOS) | `aarch64-apple-ios`, `aarch64-apple-ios-sim`, `x86_64-apple-ios`, `aarch64-apple-ios-macabi`, `x86_64-apple-ios-macabi`, `aarch64-apple-tvos` ⚠, `aarch64-apple-tvos-sim` ⚠, `x86_64-apple-tvos` ⚠, `aarch64-apple-visionos` ⚠, `aarch64-apple-visionos-sim` ⚠ |
 | `onnxruntime-all` | Every built-in EP the platform supports. Built-in means linked into the `onnxruntime` library itself (XNNPACK, WebGPU, DirectML, CoreML) or a shared provider that exports only the legacy `GetProvider` bridge entry point (oneDNN, TensorRT, CANN); providers that also export `CreateEpFactories` (CUDA, OpenVINO, QNN, Vitis AI, TensorRT RTX, MIGraphX) and plugin EPs are left out, except the CUDA EP that ships as a mandatory dependency of TensorRT. Linux x64: XNNPACK, WebGPU, oneDNN, TensorRT (+ CUDA 13), CANN. Linux aarch64: XNNPACK, WebGPU, TensorRT (+ CUDA 13), CANN. Windows x64: XNNPACK, WebGPU, DirectML, oneDNN, TensorRT (+ CUDA 13). Windows ARM64: XNNPACK, WebGPU, DirectML. macOS: XNNPACK, WebGPU, CoreML. Provider libraries must not be mixed with another package's `onnxruntime` library (the bridge interface layout depends on the build options) | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`, `aarch64-apple-darwin`, `x86_64-apple-darwin` |
 | `onnxruntime-android` | NNAPI + XNNPACK + WebGPU (same EP set as the official AAR) | `aarch64-linux-android`, `armv7-linux-androideabi`, `i686-linux-android`, `x86_64-linux-android` |
-| `onnxruntime-wasm` / `-wasm-jsep` / `-wasm-webgpu` / `-wasm-webgpu-jspi` / `-wasm-webgpu-static-plugin` | WebAssembly outputs of onnxruntime-web (`.wasm` / `.mjs`), same variants as ORT's `web.yml` | `wasm32-unknown-emscripten` |
+| `onnxruntime-wasm` / `-wasm-jsep` / `-wasm-webgpu` / `-wasm-webgpu-jspi` | WebAssembly outputs of onnxruntime-web (`.wasm` / `.mjs`), same variants as ORT's `web.yml` | `wasm32-unknown-emscripten` |
 | `onnxruntime-wasm-static` | WebAssembly static library `libonnxruntime_webassembly.a` plus the C/C++ API headers | `wasm32-unknown-emscripten` |
 | `onnxruntime-qnn` | In-tree QNN EP (the official `win-arm64` package still ships it) | `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc` |
 | `onnxruntime-cuda12` | CUDA 12 + TensorRT (the CUDA 13 build is part of `onnxruntime-all`) | `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc` |
@@ -299,11 +299,12 @@ These jobs are heavy (rocMLIR is an LLVM-based build) and may exceed the 6-hour 
 
 ### Usage
 
-- **Triggers**: pushing a `v*` tag builds and publishes a release; pushing to `main` with changes in `ci/`, `scripts/`, submodules or the workflow only builds; a manual run (`workflow_dispatch`) accepts:
+- **Triggers**: pushing a `v*` tag builds and publishes a release; pushing to `main` with changes in `ci/`, `scripts/`, submodules or the workflow only builds; a weekly scheduled run picks up new third-party SDK releases (entries whose inputs did not change reuse their packages); a manual run (`workflow_dispatch`) accepts:
   - `filter`: only build entries matching this regex, e.g. `ep-qnn|wasm`, `onnxruntime-all/x86_64` or `apple-ios`;
   - `cuda_archs`: CUDA architectures;
   - `publish`: publish a prerelease tagged `build-<version>`;
   - `force_rebuild`: build every entry even if an earlier run built the same inputs.
+- **Dependency updates**: Dependabot (`.github/dependabot.yml`) opens weekly pull requests that update the actions and move the submodules to the newest commits of their branches; merging one builds only the entries it affects.
 - **Version**: tag builds use the tag without the leading `v`; other builds use `<ORT version>-dev.<date>.<commit>`.
 - **CUDA architectures**: the default is `80-real;80-virtual`: SM 8.0 SASS plus a compute_80 PTX that the driver JIT-compiles on newer GPUs (ORT's CMake drops a list that has only `-virtual` entries). GitHub-hosted runners have 4 cores, and every extra CUDA architecture roughly doubles the build time, which easily exceeds the 6-hour job limit. To build several SASS architectures, change the `CUDA_ARCHITECTURES` repository variable or the manual-run input, and move the heavy jobs to larger runners with `HEAVY_RUNNER_MAP`, e.g. `{"ubuntu-24.04": "linux-16core", "windows-2025": "windows-16core"}`.
 - **Third-party SDKs**: release packages bundle the third-party runtime libraries that may be redistributed and fit the release size limit, with their license texts; `BUILD_INFO.json` in each package records the SDK versions used, and `scripts/fetch_ep_runtime.py --package-dir <package>` fetches the matching runtime files that are not bundled (see [Third-party runtime files](#third-party-runtime-files)).

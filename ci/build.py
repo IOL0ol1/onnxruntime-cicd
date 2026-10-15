@@ -397,8 +397,7 @@ def ort_variant(job: Job, src: Path) -> tuple[list[str], Callable[[Job, Path], N
         extra = {"wasm": catch,
                  "wasm-jsep": ["--use_jsep", "--use_webnn", *catch],
                  "wasm-webgpu": ["--use_webgpu", "--use_webnn", *catch],
-                 "wasm-webgpu-jspi": ["--use_webgpu", "--use_webnn", "--enable_wasm_jspi"],
-                 "wasm-webgpu-static-plugin": ["--use_webgpu", "static_plugin", "--use_webnn", *catch]}[v]
+                 "wasm-webgpu-jspi": ["--use_webgpu", "--use_webnn", "--enable_wasm_jspi"]}[v]
         return ["--build_wasm", "--enable_wasm_simd", "--enable_wasm_threads", "--target", "onnxruntime_webassembly",
                 "--disable_rtti", *extra], \
             lambda j, b: copy_files(j, ["ort-wasm-*.wasm", "ort-wasm-*.mjs"], b, j.stage / "lib")
@@ -452,7 +451,9 @@ def build_ort(job: Job) -> None:
         # Ninja puts it into the config directory, the Visual Studio generator (Windows ARM64) into Release/ below it.
         copy_files(job, ["dxcompiler.dll", "Release/dxcompiler.dll"], config_dir, job.stage / "bin")
     if job.os == "windows" and ("--use_webgpu" in flags or job.variant == "webgpu-plugin"):
-        stage_license(job, "DirectXShaderCompiler", build_dir, ["**/third_party/dxc/LICENSE.TXT"])
+        stage_license(job, "DirectXShaderCompiler", build_dir,
+                      [f"Release/_deps/dawn-src/third_party/directx-shader-compiler/src/{n}"
+                       for n in ("LICENSE.TXT", "ThirdPartyNotices.txt")])
     if "--use_dml" in flags:
         bundle_directml(job, build_dir)
     if "--use_openvino" in flags:
@@ -543,12 +544,18 @@ def install_rocm_wheels(job: Job) -> tuple[Path, Path]:
     the device-<gfx> packages also bring the device libraries HIP code needs. Returns (ROCm root, CMake prefix)."""
     targets = migraphx_gpu_targets().split(";")
     extras = ",".join(["libraries", "devel", *(f"device-{t}" for t in targets)])
-    run(job, [python(), "-m", "pip", "install", "--index-url", "https://repo.amd.com/rocm/whl-multi-arch/",
+    # The SDK unpacks to several GB: keep it in a virtual environment in the work directory (the runner's large data
+    # disk) rather than in the Python installation, whose disk (C:) runs out of space
+    venv = job.work / "rocm-venv"
+    run(job, [python(), "-m", "venv", venv])
+    scripts = venv / ("Scripts" if os.name == "nt" else "bin")
+    run(job, [scripts / "python", "-m", "pip", "install", "--index-url", "https://repo.amd.com/rocm/whl-multi-arch/",
               f"rocm[{extras}]=={WINDOWS_ROCM_VERSION}"])
-    run(job, ["rocm-sdk", "init"])
+    rocm_sdk = scripts / "rocm-sdk"
+    run(job, [rocm_sdk, "init"])
     if job.dry_run:
         return job.sdk_root / "rocm", job.sdk_root / "rocm" / "lib" / "cmake"
-    path = lambda kind: Path(subprocess.run(["rocm-sdk", "path", kind], capture_output=True, text=True,
+    path = lambda kind: Path(subprocess.run([str(rocm_sdk), "path", kind], capture_output=True, text=True,
                                             check=True).stdout.strip())
     return path("--root"), path("--cmake")
 
@@ -720,11 +727,11 @@ def build_ep_qnn(job: Job) -> None:
     if job.os != "android":  # Android needs ORT as an AAR, so the repository script builds it from source
         # Build against the ORT release the repository's own CI uses: its code follows that release's experimental
         # API, which later releases changed. (Not known in the plan job, which has no submodules checked out.)
-        packages = src / "qcom/packages.yml"
-        if packages.exists():
-            ort = sdk.dl.yaml_block(packages.read_text(encoding="utf-8"), "ort_prebuilt_windows_x64")["version"]
+        try:  # read at the gitlink commit when the submodule is not checked out (the plan job)
+            packages = sdk.dl.read_submodule("eps/official/onnxruntime-qnn/qcom/packages.yml")
+            ort = sdk.dl.yaml_block(packages, "ort_prebuilt_windows_x64")["version"]
             job.need("onnxruntime-sdk", pins={"onnxruntime-sdk": ort})
-        else:
+        except RuntimeError:
             job.need("onnxruntime-sdk")
         # the extracted package root: onnxruntime_prebuilt.cmake copies files from <root>/lib
         cmd += ["--ort-prebuilt", job.sdks["onnxruntime-sdk"]]
