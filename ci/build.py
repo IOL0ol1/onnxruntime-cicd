@@ -259,18 +259,6 @@ def bundle_directml(job: Job, build_dir: Path) -> None:
                                                "**/Microsoft.AI.DirectML*/ThirdPartyNotices.txt"])
 
 
-def stage_dawn(job: Job, config_dir: Path) -> None:
-    """Dawn's WebGPU headers (webgpu.h and the generated dawn/ headers) and license for the shared-Dawn package."""
-    src, gen = config_dir / "_deps" / "dawn-src", config_dir / "_deps" / "dawn-build" / "gen"
-    stage_headers(job, src / "include" / "webgpu", "webgpu")
-    stage_headers(job, src / "include" / "dawn", "dawn")
-    stage_headers(job, gen / "include" / "dawn", "dawn")  # generated, e.g. dawn/webgpu.h and dawn/webgpu_cpp.h
-    stage_license(job, "Dawn", src, ["LICENSE"])
-    if job.os == "macos" and not job.dry_run:  # the provider finds libwebgpu_dawn.dylib (@rpath) next to itself
-        for dylib in (job.stage / "lib").glob("libonnxruntime_providers_webgpu*.dylib"):
-            subprocess.run(["install_name_tool", "-add_rpath", "@loader_path", str(dylib)], check=False)
-
-
 def stage_ort_headers(job: Job, src: Path) -> None:
     """Copy the public ORT C/C++ API headers (for packages that are not produced by cmake --install)."""
     copy_files(job, ["include/onnxruntime/core/session/onnxruntime_*.h",
@@ -405,12 +393,6 @@ def ort_variant(job: Job, src: Path) -> tuple[list[str], Callable[[Job, Path], N
         return ["--use_webgpu", "shared_lib", "--wgsl_template", "static",
                 *(["--cmake_extra_defines", *backends] if backends else [])], \
             lambda j, b: stage_shared_libs(j, b, names)
-    if v == "webgpu-plugin-shared-dawn":  # the same plugin EP, linked against Dawn built as webgpu_dawn.dll/.so/.dylib
-        names = ["onnxruntime_providers_webgpu", "webgpu_dawn"] + (["dxcompiler"] if job.os == "windows" else [])
-        backends = dawn_backends(job)
-        return ["--use_webgpu", "shared_lib", "--wgsl_template", "static",
-                "--cmake_extra_defines", "onnxruntime_BUILD_DAWN_SHARED_LIBRARY=ON", *backends], \
-            lambda j, b: (stage_shared_libs(j, b, names), stage_dawn(j, b))
     if v == "openvino":  # OpenVINO_DIR / INTEL_OPENVINO_DIR are set by ci/sdk.py
         job.need("openvino")
         return ["--use_openvino", "CPU"], None
@@ -487,7 +469,7 @@ def build_ort(job: Job) -> None:
     if "--use_dnnl" in flags:  # oneDNN (Apache-2.0) is built from source for its provider, but not installed with it
         stage_shared_libs(job, config_dir / "dnnl" / "install", ["dnnl"])
         stage_license(job, "oneDNN", config_dir / "dnnl" / "src" / "dnnl" / "src", ["LICENSE", "THIRD-PARTY-PROGRAMS"])
-    if job.os == "windows" and "--use_webgpu" in flags and not job.variant.startswith("webgpu-plugin"):
+    if job.os == "windows" and "--use_webgpu" in flags and job.variant != "webgpu-plugin":
         # Dawn loads the DXC shader compiler it builds (dxcompiler.dll) at run time, as in the WebGPU plugin package.
         # Ninja puts it into the config directory, the Visual Studio generator (Windows ARM64) into Release/ below it.
         copy_files(job, ["dxcompiler.dll", "Release/dxcompiler.dll"], config_dir, job.stage / "bin")

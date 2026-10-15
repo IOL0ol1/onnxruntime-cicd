@@ -189,8 +189,7 @@ The release packages bundle the third-party runtime libraries whose licenses all
 |---|---|---|
 | x86_64 `onnxruntime`, `onnxruntime-all` (oneDNN EP) | oneDNN (`dnnl.dll` / `libdnnl.so.3`), built from source | Apache-2.0 |
 | `onnxruntime-vsinpu` | TIM-VX (`libtim-vx.so`), built from source | MIT |
-| Windows `onnxruntime-all`, `onnxruntime-ep-webgpu`, `onnxruntime-ep-webgpu-shared-dawn` | DirectX Shader Compiler (`dxcompiler.dll`), built from source | NCSA |
-| `onnxruntime-ep-webgpu-shared-dawn` | Dawn (`webgpu_dawn.dll` / `libwebgpu_dawn.so` / `.dylib`), built from source | BSD-3-Clause |
+| Windows `onnxruntime-all`, `onnxruntime-ep-webgpu` | DirectX Shader Compiler (`dxcompiler.dll`), built from source | NCSA |
 | Windows `onnxruntime-all`, `onnxruntime-ep-directml-amd`, `onnxruntime-ep-amdgpu` | DirectML (`DirectML.dll`) | Microsoft DirectML license (redistributable with applications) |
 | `onnxruntime-openvino`, `onnxruntime-openvino-intel` | OpenVINO runtime and device plugins (Windows also oneTBB) | Intel OpenVINO Distribution License: the files listed in its `redist.txt` |
 | `onnxruntime-qnn`, `onnxruntime-ep-qnn` | QAIRT backends and Hexagon skel libraries | Qualcomm AI Stack License (object code, as part of an application) |
@@ -207,9 +206,8 @@ The release packages bundle the third-party runtime libraries whose licenses all
 | `onnxruntime-ep-directml-amd`, Windows `onnxruntime-ep-amdgpu` | `include/DirectML.h` | `DirectML.lib` |
 | `onnxruntime-ep-mlx` | `include/mlx/` (MLX and mlx-c) | the bundled `libmlx*.dylib` |
 | `onnxruntime-ep-vulkan` | `include/vulkan/`, `include/vk_video/` | `vulkan-1.lib` (Windows); the loader comes with the graphics driver |
-| `onnxruntime-ep-webgpu-shared-dawn` | `include/webgpu/`, `include/dawn/` | `webgpu_dawn.lib` (Windows) |
 
-Not included: the QAIRT headers (its license allows object code only), the CUDA / cuDNN / TensorRT / TensorRT for RTX headers and import libraries (their licenses allow only the runtime files, accessed by your application), and the IREE, zDNN and statically linked Dawn backends of `onnxruntime-ep-iree`, `onnxruntime-ep-telum` and `onnxruntime-ep-webgpu`, which have no separate library to link against.
+Not included: the QAIRT headers (its license allows object code only), the CUDA / cuDNN / TensorRT / TensorRT for RTX headers and import libraries (their licenses allow only the runtime files, accessed by your application), and the IREE, zDNN and statically linked Dawn backends of `onnxruntime-ep-iree`, `onnxruntime-ep-telum` and `onnxruntime-ep-webgpu`, which have no separate library to link against (ONNX Runtime does not support building the WebGPU plugin EP with Dawn as a shared library: `onnxruntime_USE_EP_API_ADAPTERS` and `onnxruntime_BUILD_DAWN_SHARED_LIBRARY` are mutually exclusive).
 
 Not bundled, so install or fetch them separately:
 
@@ -256,7 +254,7 @@ Targets: `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-pc-win
 
 ### Build matrix
 
-88 entries in total. The target platforms follow what each repository's own CI/CD publishes (the ORT v1.30.0 release assets, PyPI wheel tags, and the plugin repositories' workflows).
+83 entries in total. The target platforms follow what each repository's own CI/CD publishes (the ORT v1.30.0 release assets, PyPI wheel tags, and the plugin repositories' workflows).
 
 | Package | Contents | Target triples |
 |---|---|---|
@@ -273,7 +271,6 @@ Targets: `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-pc-win
 | `onnxruntime-ep-cuda13` | CUDA plugin EP, CUDA 13 | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc` |
 | `onnxruntime-nv-tensorrt-rtx` | TensorRT RTX (in-tree) | `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc` |
 | `onnxruntime-ep-webgpu` | WebGPU plugin EP | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`, `aarch64-apple-darwin` |
-| `onnxruntime-ep-webgpu-shared-dawn` | The same WebGPU plugin EP, linked against Dawn built as a shared library (`webgpu_dawn`), with Dawn's headers | same as `onnxruntime-ep-webgpu` |
 | `onnxruntime-openvino` | OpenVINO (main repository) | `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc` |
 | `onnxruntime-openvino-intel` | OpenVINO (Intel fork `ovep-develop`) | Same as above |
 | `onnxruntime-migraphx` | MIGraphX (built in the `rocm/dev-ubuntu-24.04:7.2.4-complete` container) | `x86_64-unknown-linux-gnu` |
