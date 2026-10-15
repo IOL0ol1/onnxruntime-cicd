@@ -57,6 +57,11 @@
     {"package": "onnxruntime-ep-webgpu", "recipe": "ort", "variant": "webgpu-plugin", "triple": "x86_64-pc-windows-msvc", "runner": "windows-2025", "submodules": "onnxruntime"},
     {"package": "onnxruntime-ep-webgpu", "recipe": "ort", "variant": "webgpu-plugin", "triple": "aarch64-pc-windows-msvc", "runner": "windows-11-arm", "submodules": "onnxruntime"},
     {"package": "onnxruntime-ep-webgpu", "recipe": "ort", "variant": "webgpu-plugin", "triple": "aarch64-apple-darwin", "runner": "macos-15", "submodules": "onnxruntime"},
+    {"package": "onnxruntime-ep-webgpu-shared-dawn", "recipe": "ort", "variant": "webgpu-plugin-shared-dawn", "triple": "x86_64-unknown-linux-gnu", "runner": "ubuntu-24.04", "submodules": "onnxruntime", "apt": "libx11-dev libx11-xcb-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libvulkan-dev"},
+    {"package": "onnxruntime-ep-webgpu-shared-dawn", "recipe": "ort", "variant": "webgpu-plugin-shared-dawn", "triple": "aarch64-unknown-linux-gnu", "runner": "ubuntu-24.04-arm", "submodules": "onnxruntime", "apt": "libx11-dev libx11-xcb-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libvulkan-dev"},
+    {"package": "onnxruntime-ep-webgpu-shared-dawn", "recipe": "ort", "variant": "webgpu-plugin-shared-dawn", "triple": "x86_64-pc-windows-msvc", "runner": "windows-2025", "submodules": "onnxruntime"},
+    {"package": "onnxruntime-ep-webgpu-shared-dawn", "recipe": "ort", "variant": "webgpu-plugin-shared-dawn", "triple": "aarch64-pc-windows-msvc", "runner": "windows-11-arm", "submodules": "onnxruntime"},
+    {"package": "onnxruntime-ep-webgpu-shared-dawn", "recipe": "ort", "variant": "webgpu-plugin-shared-dawn", "triple": "aarch64-apple-darwin", "runner": "macos-15", "submodules": "onnxruntime"},
 
     {"package": "onnxruntime-openvino", "recipe": "ort", "variant": "openvino", "triple": "x86_64-unknown-linux-gnu", "runner": "ubuntu-24.04", "submodules": "onnxruntime"},
     {"package": "onnxruntime-openvino", "recipe": "ort", "variant": "openvino", "triple": "x86_64-pc-windows-msvc", "runner": "windows-2025", "submodules": "onnxruntime"},

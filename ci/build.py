@@ -167,6 +167,25 @@ def stage_shared_libs(job: Job, base: Path, names: list[str]) -> None:
         copy_files(job, [f"**/*{n}{ext}*" for n in names], base, job.stage / "lib")
 
 
+def stage_headers(job: Job, src: Path, dest: str) -> None:
+    """Copy a backend's interface headers (a directory tree) into include/<dest>/ of the package."""
+    if job.dry_run:
+        print(f"[dry-run] headers {src} -> include/{dest}")
+        return
+    if not src.is_dir():
+        print(f"::warning::backend headers not found: {src}", flush=True)
+        return
+    shutil.copytree(src, job.stage / "include" / dest, dirs_exist_ok=True)
+
+
+def stage_dev_files(job: Job, patterns: list[str], base: Path, dest: Path) -> None:
+    """Copy a backend's import libraries / headers; a missing one is reported, but does not fail the build."""
+    try:
+        copy_files(job, patterns, base, dest)
+    except SystemExit:
+        print(f"::warning::backend development files not found: {patterns} in {base}", flush=True)
+
+
 def stage_license(job: Job, name: str, base: Path, patterns: list[str]) -> None:
     """Copy the license texts of a bundled third-party component into third_party_licenses/<name>/."""
     try:
@@ -232,8 +251,24 @@ def bundle_directml(job: Job, build_dir: Path) -> None:
     """DirectML.dll from the Microsoft.AI.DirectML NuGet package the build restored (redistributable with applications)."""
     arch = {"x86_64": "x64", "aarch64": "arm64"}.get(job.triple.split("-")[0], "x64")
     copy_files(job, [f"**/Microsoft.AI.DirectML*/bin/{arch}-win/DirectML.dll"], build_dir, job.stage / "bin")
+    # the interface for developers: DirectML.h and the import library (the license covers the whole package)
+    stage_dev_files(job, [f"**/Microsoft.AI.DirectML*/bin/{arch}-win/DirectML.lib"], build_dir, job.stage / "lib")
+    stage_dev_files(job, ["**/Microsoft.AI.DirectML*/include/*.h"], build_dir, job.stage / "include")
     stage_license(job, "DirectML", build_dir, ["**/Microsoft.AI.DirectML*/LICENSE.txt",
+                                               "**/Microsoft.AI.DirectML*/LICENSE-CODE.txt",
                                                "**/Microsoft.AI.DirectML*/ThirdPartyNotices.txt"])
+
+
+def stage_dawn(job: Job, config_dir: Path) -> None:
+    """Dawn's WebGPU headers (webgpu.h and the generated dawn/ headers) and license for the shared-Dawn package."""
+    src, gen = config_dir / "_deps" / "dawn-src", config_dir / "_deps" / "dawn-build" / "gen"
+    stage_headers(job, src / "include" / "webgpu", "webgpu")
+    stage_headers(job, src / "include" / "dawn", "dawn")
+    stage_headers(job, gen / "include" / "dawn", "dawn")  # generated, e.g. dawn/webgpu.h and dawn/webgpu_cpp.h
+    stage_license(job, "Dawn", src, ["LICENSE"])
+    if job.os == "macos" and not job.dry_run:  # the provider finds libwebgpu_dawn.dylib (@rpath) next to itself
+        for dylib in (job.stage / "lib").glob("libonnxruntime_providers_webgpu*.dylib"):
+            subprocess.run(["install_name_tool", "-add_rpath", "@loader_path", str(dylib)], check=False)
 
 
 def stage_ort_headers(job: Job, src: Path) -> None:
@@ -370,6 +405,12 @@ def ort_variant(job: Job, src: Path) -> tuple[list[str], Callable[[Job, Path], N
         return ["--use_webgpu", "shared_lib", "--wgsl_template", "static",
                 *(["--cmake_extra_defines", *backends] if backends else [])], \
             lambda j, b: stage_shared_libs(j, b, names)
+    if v == "webgpu-plugin-shared-dawn":  # the same plugin EP, linked against Dawn built as webgpu_dawn.dll/.so/.dylib
+        names = ["onnxruntime_providers_webgpu", "webgpu_dawn"] + (["dxcompiler"] if job.os == "windows" else [])
+        backends = dawn_backends(job)
+        return ["--use_webgpu", "shared_lib", "--wgsl_template", "static",
+                "--cmake_extra_defines", "onnxruntime_BUILD_DAWN_SHARED_LIBRARY=ON", *backends], \
+            lambda j, b: (stage_shared_libs(j, b, names), stage_dawn(j, b))
     if v == "openvino":  # OpenVINO_DIR / INTEL_OPENVINO_DIR are set by ci/sdk.py
         job.need("openvino")
         return ["--use_openvino", "CPU"], None
@@ -446,11 +487,11 @@ def build_ort(job: Job) -> None:
     if "--use_dnnl" in flags:  # oneDNN (Apache-2.0) is built from source for its provider, but not installed with it
         stage_shared_libs(job, config_dir / "dnnl" / "install", ["dnnl"])
         stage_license(job, "oneDNN", config_dir / "dnnl" / "src" / "dnnl" / "src", ["LICENSE", "THIRD-PARTY-PROGRAMS"])
-    if job.os == "windows" and "--use_webgpu" in flags and job.variant != "webgpu-plugin":
+    if job.os == "windows" and "--use_webgpu" in flags and not job.variant.startswith("webgpu-plugin"):
         # Dawn loads the DXC shader compiler it builds (dxcompiler.dll) at run time, as in the WebGPU plugin package.
         # Ninja puts it into the config directory, the Visual Studio generator (Windows ARM64) into Release/ below it.
         copy_files(job, ["dxcompiler.dll", "Release/dxcompiler.dll"], config_dir, job.stage / "bin")
-    if job.os == "windows" and ("--use_webgpu" in flags or job.variant == "webgpu-plugin"):
+    if job.os == "windows" and "--use_webgpu" in flags:
         stage_license(job, "DirectXShaderCompiler", build_dir,
                       [f"Release/_deps/dawn-src/third_party/directx-shader-compiler/src/{n}"
                        for n in ("LICENSE.TXT", "ThirdPartyNotices.txt")])
@@ -703,10 +744,17 @@ def build_ep_amdgpu(job: Job) -> None:
     if job.variant != "dml":  # MIGraphX (MIT) is built from its develop branch here, so bundle it with its license
         if job.os == "windows":
             copy_files(job, ["bin/migraphx*.dll"], migraphx, job.stage / "bin")
+            stage_dev_files(job, ["lib/migraphx*.lib"], migraphx, job.stage / "lib")
         else:
             copy_files(job, ["lib/libmigraphx*.so*", "lib/migraphx/lib/*.so*"], migraphx, job.stage / "lib")
             set_origin_rpath(job, job.stage / "lib")
+        stage_headers(job, migraphx / "include" / "migraphx", "migraphx")
         stage_license(job, "MIGraphX", job.sdks["amdmigraphx"], ["LICENSE*"])
+    if job.variant == "amdgpu":  # its HIP backend: the HIP headers, and the import library on Windows (MIT)
+        stage_headers(job, rocm / "include" / "hip", "hip")
+        if job.os == "windows":
+            stage_dev_files(job, ["lib/amdhip64.lib"], rocm, job.stage / "lib")
+        stage_license(job, "HIP", rocm, ["share/doc/hip/LICENSE*", "share/doc/*hip*/LICENSE*"])
 
 
 QNN_TASKS = {
@@ -774,6 +822,7 @@ def build_ep_mlx(job: Job) -> None:
     run(job, ["cargo", "build", "--release"], cwd=src, env=env)
     copy_files(job, ["release/libonnxruntime_mlx_ep.dylib"], job.work / "target", job.stage / "lib")
     copy_files(job, ["lib/libmlx*.dylib", "lib/mlx.metallib"], prefix, job.stage / "lib")  # MLX is MIT-licensed and may be redistributed
+    stage_headers(job, prefix / "include" / "mlx", "mlx")
     # libmlx statically links fmt, nlohmann/json and gguflib and is compiled with the metal-cpp headers
     for name, sub in (("mlx", "mlx-source"), ("mlx-c", "source"), ("fmt", "fmt-source"), ("nlohmann-json", "json-source"),
                       ("gguflib", "gguflib-source"), ("metal-cpp", "metal-cpp-source/metal-cpp")):
@@ -817,6 +866,12 @@ def build_ep_vulkan(job: Job) -> None:
     env = {"VULKAN_SDK": str(job.sdks["vulkan-sdk"]), "CARGO_TARGET_DIR": str(job.work / "target")}
     run(job, ["cargo", "build", "--release"], cwd=src, env=env)
     stage_shared_libs(job, job.work / "target" / "release", ["onnxruntime_vulkan_ep"])
+    sdk_root = job.sdks["vulkan-sdk"]
+    for name in ("vulkan", "vk_video"):
+        stage_headers(job, sdk_root / "include" / name, name)
+    if job.os == "windows":
+        stage_dev_files(job, ["Lib/vulkan-1.lib"], sdk_root, job.stage / "lib")
+    stage_license(job, "Vulkan-SDK", sdk_root, ["LICENSE*", "Licenses/*", "share/doc/vulkan/*LICENSE*"])
 
 
 RECIPES: dict[str, Callable[[Job], None]] = {
