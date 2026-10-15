@@ -343,6 +343,20 @@ def all_builtin_flags(job: Job) -> list[str]:
     return flags
 
 
+def allow_onnx_printer_on_tvos(src: Path) -> None:
+    """ONNX's printer.cc uses std::to_chars, which Apple's SDKs mark unavailable before iOS / tvOS 16.3. ORT's ONNX
+    patch adds a fallback for iOS only; extend its condition to tvOS (the tvOS frameworks target 15.1). The two
+    patched lines keep their count, so the patch's hunk headers stay valid."""
+    path = src / "cmake/patches/onnx/onnx.patch"
+    text = path.read_text(encoding="utf-8")
+    old = ("+#if defined(__APPLE__) && defined(__ENVIRONMENT_IPHONE_OS_VERSION_MIN_REQUIRED__) && \\\n"
+           "+    __ENVIRONMENT_IPHONE_OS_VERSION_MIN_REQUIRED__ < 160300\n")
+    new = ("+#if defined(__APPLE__) && ((defined(__ENVIRONMENT_IPHONE_OS_VERSION_MIN_REQUIRED__) && __ENVIRONMENT_IPHONE_OS_VERSION_MIN_REQUIRED__ < 160300) || \\\n"
+           "+    (defined(__ENVIRONMENT_TV_OS_VERSION_MIN_REQUIRED__) && __ENVIRONMENT_TV_OS_VERSION_MIN_REQUIRED__ < 160300))\n")
+    if old in text:
+        path.write_text(text.replace(old, new), encoding="utf-8", newline="")
+
+
 def allow_cann_with_cuda(src: Path) -> None:
     """The provider bridge defines AllocateBufferWithOptions in both its CUDA and its CANN section, so a build with
     both providers fails with a redefinition; keep only the CUDA copy (both forward to the same host function)."""
@@ -501,6 +515,8 @@ def build_ort_apple(job: Job) -> None:
     sysroot, arch, settings = APPLE_FRAMEWORKS[job.triple]
     settings = src / "tools/ci_build/github/apple" / settings
     build_dir = job.work / "build"
+    if sysroot.startswith("appletv") and not job.dry_run:
+        allow_onnx_printer_on_tvos(src)
     if sysroot == "macabi" and not job.dry_run:
         # ORT's build.py turns warnings into errors for Catalyst (unlike iOS / tvOS / visionOS), and the CoreML EP uses
         # APIs newer than the 14.0 deployment target without availability guards
