@@ -685,7 +685,9 @@ def build_migraphx_windows(job: Job) -> tuple[Path, Path]:
     run(job, ["rbuild", "prepare", "-d", cget, "-s", "gh-win-gpu", "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release",
               "-DLLVM_DISABLE_ASSEMBLY_FILES=On", "-DLLVM_ENABLE_DIA_SDK=Off"], cwd=src,
         env={"PATH": path, "CC": "clang-cl", "CXX": "clang-cl", "CXXFLAGS": "/std:c++17", "CGET_BUILD_PATH": str(short)})
+    # as on Linux: without BUILD_TESTING=Off the build also compiles MIGraphX's test executables
     run(job, ["rbuild", "build", "-d", cget, "-s", "gh-win-gpu", "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release",
+              "-DBUILD_TESTING=Off", "-DMIGRAPHX_ENABLE_PYTHON=Off",
               f"-DGPU_TARGETS={migraphx_gpu_targets()}", f"-DCMAKE_INSTALL_PREFIX={install}"], cwd=src,
         env={"PATH": path, "CC": "clang", "CXX": "clang++", "CMAKE_PREFIX_PATH": f"{rocm_cmake};{cget}"})
     run(job, ["cmake", "--install", src / "build", "--prefix", install])

@@ -254,7 +254,11 @@ jobs:
 
   report-failure:
     needs: [resolve, build, assemble]
-    if: always() && needs.resolve.outputs.ok == 'true' && (needs.build.result == 'failure' || needs.assemble.result == 'failure')
+    # a build that hits the 6-hour job limit is "cancelled"; a run that a newer request of the issue cancelled is not
+    # reported (cancelled()), so that it does not overwrite the newer run's status
+    if: >-
+      !cancelled() && needs.resolve.outputs.ok == 'true' &&
+      (contains(fromJSON('["failure","cancelled"]'), needs.build.result) || needs.assemble.result == 'failure')
     runs-on: ubuntu-24.04
     steps:
       - uses: peter-evans/create-or-update-comment@v5
@@ -264,6 +268,6 @@ jobs:
           edit-mode: replace
           body: |
             ${{ env.STATUS_MARKER }}
-            ❌ **The bundle build failed** in [run ${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) (${{ needs.build.result == 'failure' && 'building a package; packages that did build are kept and reused' || 'assembling the bundle' }}). Edit the issue or comment `/rebuild` to try again.
+            ❌ **The bundle build failed** in [run ${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) (${{ needs.build.result == 'cancelled' && 'a package build hit the 6-hour job limit; packages that did build are kept and reused' || needs.build.result == 'failure' && 'building a package; packages that did build are kept and reused' || 'assembling the bundle' }}). Edit the issue to try again.
 
             ${{ needs.resolve.outputs.summary }}
