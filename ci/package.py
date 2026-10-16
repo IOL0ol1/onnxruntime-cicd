@@ -133,8 +133,6 @@ def main(argv: list[str]) -> int:
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     (args.out / f"{archive.name}.sha256").write_text(f"{digest}  {archive.name}\n", encoding="utf-8")
     print(f"{archive}  {archive.stat().st_size >> 20} MiB  sha256={digest}")
-    if archive.stat().st_size >= 2 << 30:  # GitHub rejects release assets of 2 GiB or more
-        print(f"::warning::{archive.name} is {archive.stat().st_size >> 20} MiB, too large for a GitHub release asset")
     return 0
 
 

@@ -4,8 +4,7 @@ This repository collects the ONNX Runtime main repository and the Execution Prov
 
 - Every project with public git sources is included as a **git submodule** (shallow clone).
 - SDKs and dependencies that cannot be fetched automatically at build time (CUDA, TensorRT, QAIRT, OpenVINO, CANN, ROCm, the Vitis AI runtime, ...) are downloaded into `packages/` by [`scripts/download_ep_packages.py`](scripts/download_ep_packages.py) from official sources that need no account; see [External dependencies and the download script](#external-dependencies-and-the-download-script).
-- [`.github/workflows/build.yml`](.github/workflows/build.yml) builds everything with a matrix and publishes packages per target triple; see [Continuous integration](#continuous-integration-github-actions).
-- A configurator page on GitHub Pages turns a selection of target and EPs into a bundle request, which builds one ready-to-use package with the headers, link files and libraries of ONNX Runtime and of every selected backend; see [Bundles](#bundles).
+- A configurator page on GitHub Pages turns a selection of target and EPs into a bundle request (an issue), and GitHub Actions builds one ready-to-use package with the headers, link files and libraries of ONNX Runtime and of every selected backend; see [Bundles](#bundles). Packages are built on demand from the [build recipes](#build-recipes) and reused while their sources do not change; there is no scheduled build of everything.
 
 > Surveyed on 2026-10-08, against the latest ONNX Runtime release **v1.30.0** (2026-09-10) and the `main` branch.
 
@@ -27,18 +26,19 @@ onnxruntime-cicd/
 │       ├── onnxruntime-ep-iree/         # IREE (MLIR compiler) plugin EP
 │       ├── onnxruntime-ep-telum/        # IBM Telum (IBM Z AI accelerator) plugin EP
 │       └── onnxruntime-ep-vulkan/       # Vulkan compute plugin EP (experimental)
+├── deps/
+│   └── amdmigraphx/                     # ROCm/AMDMIGraphX (develop), built for the AMD plugin EPs
 ├── .github/
-│   ├── workflows/build.yml              # CI: matrix builds, packaging and releases for all platforms
-│   ├── workflows/bundle.yml             # bundle requests (issues from the configurator page)
+│   ├── workflows/bundle.yml             # bundle requests: builds the packages on demand and assembles the bundle
 │   ├── workflows/pages.yml              # publishes site/ and catalog.json on GitHub Pages
-│   ├── actions/build-entry/             # the build steps of one recipe, shared by build.yml and bundle.yml
+│   ├── actions/build-entry/             # the build steps of one recipe (SDKs, ccache, build cache)
 │   └── ISSUE_TEMPLATE/bundle.yml        # the bundle request form
 ├── ci/                                  # CI scripts: plan.py / build.py / sdk.py / package.py / matrix.json,
 │                                        # catalog.py / bundle.py for bundle requests
 ├── site/                                # the bundle configurator (static page)
 ├── scripts/
 │   ├── download_ep_packages.py          # downloads the external SDKs and dependencies EPs need
-│   └── fetch_ep_runtime.py              # extracts the runtime files of closed-source SDKs for the release packages
+│   └── fetch_ep_runtime.py              # extracts the runtime / development files of closed-source SDKs
 └── packages/                            # download output (in .gitignore)
 ```
 
@@ -71,6 +71,7 @@ git submodule update --init --depth 1 eps/official/onnxruntime-ep-tensorrt
 | `eps/official/onnxruntime-ep-mlx` | [onnxruntime/onnxruntime-ep-mlx](https://github.com/onnxruntime/onnxruntime-ep-mlx) | `main` | Apple Silicon (MLX) | Community (moved into the onnxruntime organization) | PyPI package `onnxruntime-ep-mlx`; requires ORT ≥ 1.29 |
 | `eps/vendor/nvidia-tensorrt-rtx-ep` | [NVIDIA/TensorRT-RTX-EP-ABI](https://github.com/NVIDIA/TensorRT-RTX-EP-ABI) | `main` | NVIDIA RTX GPU (TensorRT-RTX) | NVIDIA | Plugin TensorRT RTX EP; PyPI package `onnxruntime-ep-nv-tensorrt-rtx` |
 | `eps/vendor/intel-onnxruntime-openvino` | [intel/onnxruntime](https://github.com/intel/onnxruntime) | `ovep-develop` | Intel CPU / iGPU / dGPU / NPU (OpenVINO) | Intel | OpenVINO EP development line, regularly synced with upstream; the official plugin package `onnxruntime-ep-openvino` is binary-only |
+| `deps/amdmigraphx` | [ROCm/AMDMIGraphX](https://github.com/ROCm/AMDMIGraphX) | `develop` | MIGraphX itself, for the AMD plugin EPs | AMD | Built from source because the AMD plugin EPs follow its `develop` API; a submodule so that its version only changes with an update, which keeps the MIGraphX build cache valid |
 | `eps/community/onnxruntime-ep-iree` | [iree-org/onnxruntime-ep-iree](https://github.com/iree-org/onnxruntime-ep-iree) | `main` | CPU / HIP / CUDA / Vulkan through IREE | IREE community | Plugin EP |
 | `eps/community/onnxruntime-ep-telum` | [IBM/onnxruntime-ep-telum](https://github.com/IBM/onnxruntime-ep-telum) | `main` | IBM Telum (on-chip AI accelerator of IBM Z, zDNN) | IBM | Plugin EP; requires ORT ≥ 1.24.1 |
 | `eps/community/onnxruntime-ep-vulkan` | [justinchuby/onnxruntime-ep-vulkan](https://github.com/justinchuby/onnxruntime-ep-vulkan) | `main` | Cross-platform Vulkan compute | Personal project | **Experimental**, written in Rust; its README states that CI is currently red |
@@ -148,7 +149,6 @@ python scripts/download_ep_packages.py --with-optional                          
 | `openvino` | OpenVINO (in-tree + Intel fork) | 2026.2.1 (same as the Intel fork CI) | `storage.openvinotoolkit.org` | sha256 |
 | `cann` | Huawei CANN | Latest release (currently 9.1.1) | Huawei Cloud Ascend artifactory `ascend.devcloud.huaweicloud.com/artifactory/cann-run` (instead of the official site, which needs a Huawei account) | sha256 |
 | `rocm` | MIGraphX / AMDGPU (in-tree + `onnxruntime-ep-amdgpu`) | Latest TheRock multi-arch package (currently 7.14.1); the Windows MIGraphX CI build installs TheRock's 7.13.0 Python wheels instead | `repo.amd.com/rocm/tarball-multi-arch` | — |
-| `amdmigraphx` | Build script of the MIGraphX EP in `onnxruntime-ep-amdgpu` (needs MIGraphX sources) | `develop` (same as the official build script) | git: `github.com/ROCm/AMDMIGraphX` | — |
 | `vitisai` | AMD Vitis AI (Ryzen AI NPU) | Latest version of each package | Public AMD PyPI index `pypi.amd.com/simple` | sha256 |
 | `android-ndk` | NNAPI, QNN / XNNPACK on Android | 28.0.13004108 (same as ORT `android.yml`) | `dl.google.com/android/repository` | sha1 |
 | `onnxruntime-sdk` | All plugin EPs (headers and libraries as `ORT_HOME`); `--platform windows-arm64x` selects the `win-arm64x` package | Latest release (currently 1.30.0) | GitHub Releases | sha256 |
@@ -188,7 +188,7 @@ Notes:
 
 ## Third-party runtime files
 
-The release packages bundle the third-party runtime libraries whose licenses allow distributing them with an application, each with its license texts in `third_party_licenses/<component>/` (bundled vendor runtimes are also listed in `THIRD_PARTY_RUNTIME.json`). These files stay under their own licenses, not under the license of the ONNX Runtime binaries. `ThirdPartyNotices.txt` covers the open-source code linked into the binaries.
+The packages bundle the third-party runtime libraries whose licenses allow distributing them with an application, each with its license texts in `third_party_licenses/<component>/` (bundled vendor runtimes are also listed in `THIRD_PARTY_RUNTIME.json`). These files stay under their own licenses, not under the license of the ONNX Runtime binaries. `ThirdPartyNotices.txt` covers the open-source code linked into the binaries.
 
 | Bundled in | Component | License |
 |---|---|---|
@@ -216,7 +216,7 @@ Not included: the QAIRT headers (its license allows object code only), the CUDA 
 
 Not bundled, so install or fetch them separately:
 
-- **CUDA libraries beyond cudart, cuDNN and TensorRT**: their licenses allow it, but together they would push the CUDA / TensorRT packages past the 2 GiB GitHub release asset limit.
+- **CUDA libraries beyond cudart, cuDNN and TensorRT**: their licenses allow it, but they are several GB; the packages leave them out and [bundles](#bundles) add them.
 - **The CANN toolkit**: Huawei's license does not allow redistribution.
 - **The Vitis AI runtime**: its license could not be verified.
 - **ROCm** (HIP, rocBLAS, MIOpen, ...): a system installation; the AMD packages expect it in `/opt/rocm` (Linux) or a HIP SDK / TheRock install (Windows). On Linux the OpenVINO runtime also needs the system oneTBB (`libtbb12`).
@@ -224,7 +224,7 @@ Not bundled, so install or fetch them separately:
 [`scripts/fetch_ep_runtime.py`](scripts/fetch_ep_runtime.py) downloads the CUDA, cuDNN, TensorRT, CANN and Vitis AI runtimes from the same no-account sources as the download script, extracts **only the runtime files**, and copies them into place together with the vendors' license texts.
 
 ```bash
-# Point it at an extracted release package: the EPs, target triple, CUDA major version and the exact SDK
+# Point it at an extracted package: the EPs, target triple, CUDA major version and the exact SDK
 # versions used by the build are read from BUILD_INFO.json; files go into the package's bin/ (Windows) or lib/
 python scripts/fetch_ep_runtime.py --package-dir onnxruntime-all-<version>-x86_64-pc-windows-msvc
 
@@ -247,21 +247,13 @@ An EP can be suffixed with the parts to fetch: `--ep cuda:dev` extracts the back
 
 Targets: `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`, `arm64ec-pc-windows-msvc`, `arm64x-pc-windows-msvc`, `aarch64-linux-android`. The script writes `THIRD_PARTY_RUNTIME.json` (versions, sources and extracted files) and copies the license texts into `third_party_licenses/`. Archives are only streamed, never fully unpacked; downloads are cached in `packages/` and verified when the upstream provides a checksum. The extracted files remain subject to their vendors' licenses; the CANN toolkit may not be redistributed at all. With `--package-dir`, the script fetches only what the package does not bundle (the QNN and TensorRT RTX runtimes are already in their packages). GPU / NPU drivers must be installed separately.
 
-## Continuous integration (GitHub Actions)
+## Build recipes
 
-[`.github/workflows/build.yml`](.github/workflows/build.yml) builds the whole project with a matrix and packages the outputs per **target triple**.
-
-### Jobs
-
-| Job | Purpose |
-|---|---|
-| `plan` | Runs [`ci/plan.py`](ci/plan.py): generates the build matrix from [`ci/matrix.json`](ci/matrix.json), walks every recipe in dry-run mode to collect the third-party SDKs it needs, and computes the version |
-| `build` | One job per matrix entry: checks out only the submodules it needs (shallow), [`ci/build.py`](ci/build.py) downloads the SDKs, builds and stages `bin/ lib/ include/`, and [`ci/package.py`](ci/package.py) packs it as `<package>-<version>-<target-triple>.tar.gz/.zip` with a `.sha256` and `BUILD_INFO.json` |
-| `release` | On a `v*` tag push, or a manual run with `publish` checked, publishes all packages and `SHA256SUMS` as a GitHub Release (publicly downloadable when the repository is public) |
+Every package is built by one entry of [`ci/matrix.json`](ci/matrix.json) (a recipe and variant of [`ci/build.py`](ci/build.py) for one target triple) through the [build steps](.github/actions/build-entry/action.yml) shared by all builds: check out only the submodules the entry needs (shallow), download the third-party SDKs (`ci/sdk.py`), build and stage `bin/ lib/ include/`, and pack it with [`ci/package.py`](ci/package.py) as `<package>-<inputs hash>-<target-triple>.tar.gz/.zip` with a `.sha256` and `BUILD_INFO.json`. Nothing builds them on a schedule: a [bundle request](#bundles) builds the packages it needs, and later requests reuse them (see [Builds on demand and caching](#builds-on-demand-and-caching)).
 
 ### Build matrix
 
-83 entries in total. The target platforms follow what each repository's own CI/CD publishes (the ORT v1.30.0 release assets, PyPI wheel tags, and the plugin repositories' workflows).
+83 entries in total; each is a package a bundle request can use. The target platforms follow what each repository's own CI/CD publishes (the ORT v1.30.0 release assets, PyPI wheel tags, and the plugin repositories' workflows).
 
 | Package | Contents | Target triples |
 |---|---|---|
@@ -294,9 +286,9 @@ Targets: `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-pc-win
 | `onnxruntime-ep-telum` | IBM Telum plugin EP (cross-compiled on x86_64) | `s390x-unknown-linux-gnu` |
 | `onnxruntime-ep-vulkan` | Vulkan plugin EP | `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc` |
 
-⚠ marks experimental entries (`experimental: true`); their failures do not fail the run or block the release. `arm64ec-pc-windows-msvc` and `arm64x-pc-windows-msvc` are not official Rust triples; they name the Windows ARM64EC and ARM64X binaries.
+⚠ marks experimental entries (`experimental: true`): known to fail at times. `arm64ec-pc-windows-msvc` and `arm64x-pc-windows-msvc` are not official Rust triples; they name the Windows ARM64EC and ARM64X binaries.
 
-Not built in CI:
+Not built:
 
 - The Zhouyi EP: its closed-source toolchain is not publicly available (see above).
 - QNN's `build_ort_linux_aarch64_oe_gcc11_2` task: its OE GCC 11.2 toolchain is hosted on an internal Qualcomm server.
@@ -311,25 +303,20 @@ The AMD plugin EPs follow AMDMIGraphX `develop`, whose API is newer than any ROC
 There is no prebuilt MIGraphX for Windows: AMD's MIGraphX wheels (`stable.repo.amd.com/rocm/migraphx/whl-next`) are Linux-only, and on Windows the MIGraphX EP is otherwise only distributed through the Windows ML EP catalog. The Windows `onnxruntime-ep-migraphx-amd` and `onnxruntime-ep-amdgpu` jobs therefore follow AMDMIGraphX's own `windows.yaml` CI:
 
 1. ROCm comes from TheRock's Python wheels (`rocm[libraries,devel,device-<gfx>]==7.13.0`, like the upstream CI); unlike the SDK tarball, the device packages also contain the device libraries HIP code needs.
-2. The AMDMIGraphX sources (`amdmigraphx` component, `develop`) are built with `rbuild` (`gh-win-gpu` profile; `clang-cl` for the dependencies including rocMLIR, the ROCm `clang++` for MIGraphX itself).
+2. The AMDMIGraphX sources (the `deps/amdmigraphx` submodule) are built with `rbuild` (`gh-win-gpu` profile; `clang-cl` for the dependencies including rocMLIR, the ROCm `clang++` for MIGraphX itself).
 3. The AMD plugin EP is then built against that MIGraphX install.
 
 These jobs are heavy (rocMLIR is an LLVM-based build) and may exceed the 6-hour limit of GitHub-hosted runners; move them to a larger runner with `HEAVY_RUNNER_MAP`. The GPU architectures come from the `MIGRAPHX_GPU_TARGETS` repository variable (default `gfx1100;gfx1101;gfx1102;gfx1200;gfx1201`, i.e. RDNA3 / RDNA4, which the Windows ML MIGraphX EP requires).
 
-### Usage
+### Builds on demand and caching
 
-- **Triggers**: pushing a `v*` tag builds and publishes a release; pushing to `main` with changes in `ci/`, `scripts/`, submodules or the workflow only builds; a weekly scheduled run picks up new third-party SDK releases (entries whose inputs did not change reuse their packages); a manual run (`workflow_dispatch`) accepts:
-  - `filter`: only build entries matching this regex, e.g. `ep-qnn|wasm`, `onnxruntime-all/x86_64` or `apple-ios`;
-  - `cuda_archs`: CUDA architectures;
-  - `publish`: publish a prerelease tagged `build-<version>`;
-  - `force_rebuild`: build every entry even if an earlier run built the same inputs.
-- **Dependency updates**: Dependabot (`.github/dependabot.yml`) opens weekly pull requests that update the actions and move the submodules to the newest commits of their branches; merging one builds only the entries it affects.
-- **Version**: tag builds use the tag without the leading `v`; other builds use `<ORT version>-dev.<date>.<commit>`.
-- **CUDA architectures**: the default is `80-real;80-virtual`: SM 8.0 SASS plus a compute_80 PTX that the driver JIT-compiles on newer GPUs (ORT's CMake drops a list that has only `-virtual` entries). GitHub-hosted runners have 4 cores, and every extra CUDA architecture roughly doubles the build time, which easily exceeds the 6-hour job limit. To build several SASS architectures, change the `CUDA_ARCHITECTURES` repository variable or the manual-run input, and move the heavy jobs to larger runners with `HEAVY_RUNNER_MAP`, e.g. `{"ubuntu-24.04": "linux-16core", "windows-2025": "windows-16core"}`.
-- **Third-party SDKs**: release packages bundle the third-party runtime libraries that may be redistributed and fit the release size limit, with their license texts; `BUILD_INFO.json` in each package records the SDK versions used, and `scripts/fetch_ep_runtime.py --package-dir <package>` fetches the matching runtime files that are not bundled (see [Third-party runtime files](#third-party-runtime-files)).
-- **Package reuse**: the `plan` job hashes the inputs of every matrix entry (the entry, the commits of its submodules, the resolved third-party SDK versions, the Docker image digest, the CUDA architectures and the CI scripts and workflow). When an unexpired earlier run built the same hash (recorded by an `inputs-<package>-<triple>-<hash>` artifact next to `pkg-<package>-<triple>`), the job downloads that package and repackages it under the new version (`reused_from` in BUILD_INFO.json) instead of building. Any change to `ci/`, `scripts/`, the workflow or `.github/actions/` rebuilds everything; the `force_rebuild` input of a manual run rebuilds regardless. Packages expire with the artifact retention (90 days).
-- **Build cache**: long-running open-source build steps are kept in the Actions cache: currently the MIGraphX dependencies that `rbuild prepare` builds on Windows (about 2.5 hours). The key hashes their inputs (MIGraphX's requirement files, the ROCm version, the MSVC toolset), so an update builds them again instead of reusing old files, and only a complete result is saved. Third-party SDK downloads are not cached: they take a few minutes at most, would exceed the 10 GB cache quota, and caches of a public repository can be restored by pull-request workflows, which the SDK licenses do not allow.
-- **Checking recipes locally**: `python ci/build.py --recipe ort --variant cuda --triple x86_64-unknown-linux-gnu --work w --stage s --sdk-root sdk --dry-run` prints the commands that would run; `python ci/plan.py` prints the matrix size and the version.
+- **Package reuse**: [`ci/plan.py`](ci/plan.py) hashes the inputs of every package build: the entry, the commits of its submodules, the build scripts (`ci/build.py`, `ci/sdk.py`, `ci/package.py`, `scripts/`, the build-entry action), the resolved third-party SDK versions, the Docker image digest and the CUDA architectures. The package artifact is named `pkg-<package>-<triple>-<hash>` and kept for 90 days; a bundle request whose package has the same hash downloads that artifact instead of building it. Changes to the bundle and page code (`ci/bundle.py`, `ci/catalog.py`, `site/`) do not invalidate packages. `python ci/plan.py` lists every entry with its hash and whether an artifact can be reused.
+- **Compiler cache**: the CUDA and MIGraphX builds compile through ccache ([`hendrikmuhs/ccache-action`](https://github.com/hendrikmuhs/ccache-action), up to 2 GB per entry). CMake reads `CMAKE_C_COMPILER_LAUNCHER`, `CMAKE_CXX_COMPILER_LAUNCHER` and `CMAKE_CUDA_COMPILER_LAUNCHER` from the environment, so ONNX Runtime, MIGraphX with its dependencies and the EP repositories all use it (not the Visual Studio generator builds, nor container builds). A first build gains nothing; a build after a submodule update recompiles only what changed. The repository has 10 GB of Actions cache; the least recently used entries are evicted, and entries unused for 7 days expire.
+- **MIGraphX on Windows**: the dependencies `rbuild prepare` builds (rocMLIR and others, about 2.5 hours) and the MIGraphX install share one Actions cache entry, keyed by the dependency inputs (MIGraphX's requirement files, the ROCm version, the MSVC toolset, the GPU targets) and the `deps/amdmigraphx` commit. A new MIGraphX commit restores the entry of the same dependency inputs and rebuilds only MIGraphX; an unchanged commit reuses the install, which the `ep-migraphx-amd` and `ep-amdgpu` builds share.
+- **Third-party SDKs** are not cached: they take a few minutes at most, would exceed the cache quota, and caches of a public repository can be restored by pull-request workflows, which the SDK licenses do not allow.
+- **Dependency updates**: Dependabot (`.github/dependabot.yml`) opens weekly pull requests that update the actions and move the submodules to the newest commits of their branches. Merging one builds nothing; the next request that needs an affected package builds it.
+- **CUDA architectures**: the default is `80-real;80-virtual`: SM 8.0 SASS plus a compute_80 PTX that the driver JIT-compiles on newer GPUs (ORT's CMake drops a list that has only `-virtual` entries). GitHub-hosted runners have 4 cores, and every extra CUDA architecture roughly doubles the build time, which easily exceeds the 6-hour job limit. To build several SASS architectures, set the `CUDA_ARCHITECTURES` repository variable and move the heavy builds to larger runners with `HEAVY_RUNNER_MAP`, e.g. `{"ubuntu-24.04": "linux-16core", "windows-2025": "windows-16core"}` (`RUNNER_MAP` replaces runners for every build).
+- **Checking recipes locally**: `python ci/build.py --recipe ort --variant cuda --triple x86_64-unknown-linux-gnu --work w --stage s --sdk-root sdk --dry-run` prints the commands that would run.
 
 ## Bundles
 
@@ -337,13 +324,13 @@ A **bundle** is one package for one target triple with exactly the EPs a user se
 
 ```
 site/ (GitHub Pages) --prefilled issue--> issue "[bundle] ..." --issues event--> .github/workflows/bundle.yml
-  ^ catalog.json                                                                   resolve -> (compile) -> assemble
-  pages.yml <- release / successful build                                          artifact link in the issue
+  ^ catalog.json (ci/catalog.py, from ci/matrix.json)                              resolve -> build (packages not
+  pages.yml <- push to main                                                        reused) -> assemble -> artifact link
 ```
 
 ### Configurator page
 
-[`site/`](site/) is published by [`.github/workflows/pages.yml`](.github/workflows/pages.yml) (set **Settings → Pages → Source** to *GitHub Actions*) together with `catalog.json`, which [`ci/catalog.py`](ci/catalog.py) generates from the build matrix and the package source: the latest release, or without releases the artifacts of the latest successful build on `main`. The page is redeployed on every release, every successful build and every change to it.
+[`site/`](site/) is published by [`.github/workflows/pages.yml`](.github/workflows/pages.yml) (set **Settings → Pages → Source** to *GitHub Actions*) together with `catalog.json`, which [`ci/catalog.py`](ci/catalog.py) generates from the build recipes: every package of every target, the EPs it contains and how it provides them. The page is redeployed when it or the recipes change.
 
 1. **Target**: platform and architecture (every target triple of the matrix).
 2. **Execution providers**: one row per EP that lists every way to get it on that target:
@@ -353,17 +340,17 @@ site/ (GitHub Pages) --prefilled issue--> issue "[bundle] ..." --issues event-->
 
    Options that conflict with the current selection are disabled with the reason: two packages that contain the same library (the CUDA, QNN and TensorRT RTX EPs exist both as provider libraries and as plugin EPs under the same file name), packages built for different CUDA major versions, EPs that need another one (TensorRT brings the CUDA EP). Switching the core removes plugin EPs that conflict with the new core.
 3. **Options**: whether to include the headers and link files of the backends, and which parts `fetch-restricted` should fetch.
-4. **Request**: the EPs and how each one is provided, the download size, the third-party components with links to their licenses, and the license acknowledgement. *Create bundle request* opens a prefilled issue (`.github/ISSUE_TEMPLATE/bundle.yml`).
+4. **Request**: the EPs and how each one is provided, which packages take long to build, the third-party components with links to their licenses, and the license acknowledgement. *Create bundle request* opens a prefilled issue (`.github/ISSUE_TEMPLATE/bundle.yml`).
 
 ### Building a bundle
 
-[`.github/workflows/bundle.yml`](.github/workflows/bundle.yml) runs for issues titled `[bundle] ...` whose author is a collaborator of the repository (`OWNER`, `MEMBER` or `COLLABORATOR`); everyone else's issues are ignored. Editing the issue builds it again; a collaborator's comment starting with `/rebuild` builds it again even if an identical bundle exists.
+[`.github/workflows/bundle.yml`](.github/workflows/bundle.yml) runs for issues titled `[bundle] ...` whose author is a collaborator of the repository (`OWNER`, `MEMBER` or `COLLABORATOR`); everyone else's issues are ignored. Editing the issue builds it again (reusing the packages that exist); a collaborator's comment starting with `/rebuild` builds the packages and the bundle again without reusing anything.
 
 | Job | Purpose |
 |---|---|
-| `resolve` | [`ci/bundle.py`](ci/bundle.py) `resolve` reads the configuration from the issue, validates it against a fresh catalog of the package source it names (the same rules as the page) and writes the plan; the status comment in the issue shows it. An unexpired bundle with the same configuration is linked instead of building it again |
-| `compile` | Compile mode only: builds the custom core with `ci/build.py --recipe ort --variant custom --eps ...` through the same [build steps](.github/actions/build-entry/action.yml) as the matrix, on the runner (and container, for MIGraphX) of the matrix entries that build those EPs |
-| `assemble` | Downloads the packages (`gh release download` / `gh run download`, checked against their SHA-256), merges them, adds the redistributable third-party runtimes with the SDK versions the packages were built with, writes the CMake package, `plugins.json`, the example, `README.md` and `BUNDLE_INFO.json`, uploads the bundle as an artifact and links it in the issue, which is then closed |
+| `resolve` | [`ci/bundle.py`](ci/bundle.py) `resolve` reads the configuration from the issue, validates it against the catalog (the same rules as the page) and plans every package with [`ci/plan.py`](ci/plan.py): its build job and inputs hash, and the artifact of an earlier run it can reuse. The status comment in the issue shows which packages are reused and which are built. An unexpired bundle with the same configuration and package hashes is linked instead of building it again |
+| `build` | One job per package that cannot be reused, through the shared [build steps](.github/actions/build-entry/action.yml); a custom core is built with `ci/build.py --recipe ort --variant custom --eps ...` on the runner (and container, for MIGraphX) of the matrix entries that build those EPs. Each package is kept as an artifact for 90 days, also when another package of the request fails |
+| `assemble` | Downloads the packages (`gh run download`, checked against their SHA-256), merges them, adds the redistributable third-party runtimes with the SDK versions the packages were built with, writes the CMake package, `plugins.json`, the example, `README.md` and `BUNDLE_INFO.json`, uploads the bundle as an artifact and links it in the issue, which is then closed |
 
 The bundle artifact is kept for 90 days; downloading it needs a GitHub login. It contains `onnxruntime-bundle-<key>-<triple>.zip` (Windows) or `.tar.gz` with:
 
@@ -400,8 +387,8 @@ The CMake package defines `onnxruntime::onnxruntime` and a target per backend wh
 ### Checking requests locally
 
 ```bash
-python ci/catalog.py --out catalog.json                       # what the page offers (needs network)
-python ci/bundle.py resolve --config config.json --plan plan.json
-python ci/bundle.py download --plan plan.json --dest packages # needs the GitHub CLI (gh auth login)
+python ci/catalog.py --out catalog.json                       # what the page offers
+python ci/bundle.py resolve --config config.json --plan plan.json   # GITHUB_TOKEN finds reusable packages
+python ci/bundle.py download --plan plan.json --dest packages # reused packages only; needs the GitHub CLI
 python ci/bundle.py assemble --plan plan.json --packages packages --work work --out dist
 ```

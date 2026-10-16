@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Download the closed-source SDKs that some providers / EPs need at runtime, and extract only the runtime files.
 
-The release packages bundle the vendor runtimes whose licenses allow distributing them with an application and
-that keep the packages under the 2 GiB release asset limit (QAIRT, TensorRT for RTX with the CUDA runtime; ci/build.py
-uses this script for that). The CUDA libraries, cuDNN and TensorRT are left out for their size, the CANN toolkit and
-the Vitis AI runtime for their licenses. This script fetches those from the same no-account official sources as
+The packages bundle the small vendor runtimes whose licenses allow distributing them with an application (QAIRT,
+TensorRT for RTX with the CUDA runtime; ci/build.py uses this script for that). The CUDA libraries, cuDNN and TensorRT
+are left out of the packages for their size (bundles add them, see ci/bundle.py), the CANN toolkit and the Vitis AI
+runtime for their licenses. This script fetches those from the same no-account official sources as
 scripts/download_ep_packages.py and copies just the runtime libraries next to the ONNX Runtime binaries.
 
-Typical use: point it at an extracted release package. The EPs, target triple, CUDA major version and the exact
+Typical use: point it at an extracted package. The EPs, target triple, CUDA major version and the exact
 SDK versions used for the build are read from the package's BUILD_INFO.json:
 
     python scripts/fetch_ep_runtime.py --package-dir onnxruntime-all-1.31.0-x86_64-pc-windows-msvc
@@ -330,7 +330,7 @@ def merge_selections(sels: list[Selection]) -> dict[str, Selection]:
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description="Download closed-source EP runtimes and extract only the runtime files")
     ap.add_argument("--list", action="store_true", help="list the supported EPs")
-    ap.add_argument("--package-dir", type=Path, help="extracted release package or bundle; EPs, target and versions come "
+    ap.add_argument("--package-dir", type=Path, help="extracted package or bundle; EPs, target and versions come "
                                                      "from its BUILD_INFO.json / BUNDLE_INFO.json")
     ap.add_argument("--ep", nargs="+", metavar="EP[:PARTS]",
                     help=f"EPs to fetch for ({', '.join(EPS)}), optionally with the parts: runtime (default), dev, "

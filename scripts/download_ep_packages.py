@@ -6,7 +6,7 @@ Scope (obsolete / deprecated EPs are ignored):
   - Open-source SDKs that must be installed beforehand: OpenVINO, ROCm, Android NDK, Vulkan SDK,
     ONNX Runtime prebuilt packages (used by plugin EP builds)
   - Open-source dependencies whose sources must be prepared before building (shallow git clone):
-    AMDMIGraphX, TIM-VX, zDNN
+    TIM-VX, zDNN
 
 Every source is an official direct link or official mirror that requires no account (NVIDIA redist /
 developer.download.nvidia.com, Qualcomm softwarecenter public API, Huawei Cloud Ascend artifactory,
@@ -502,9 +502,6 @@ COMPONENTS: tuple[Component, ...] = (
               "ascend.devcloud.huaweicloud.com artifactory (official Huawei Cloud mirror)"),
     Component("rocm", "AMD MIGraphX / AMDGPU (in-tree + onnxruntime-ep-amdgpu)", ("linux-x86_64", "windows-x86_64"), LATEST,
               resolve_rocm, "repo.amd.com/rocm/tarball-multi-arch (TheRock)"),
-    Component("amdmigraphx", "AMD MIGraphX (sources required by the onnxruntime-ep-amdgpu build script)",
-              ("linux-x86_64", "windows-x86_64"),
-              "develop", _git_resolver("ROCm/AMDMIGraphX", lambda: "develop"), "github.com/ROCm/AMDMIGraphX"),
     Component("vitisai", "AMD Vitis AI (Ryzen AI NPU)", ("windows-x86_64",), LATEST, resolve_vitisai,
               "pypi.amd.com/simple (public AMD index)"),
     # The default version matches ORT's android.yml CI

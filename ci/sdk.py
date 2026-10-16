@@ -42,7 +42,6 @@ ENV_VARS: dict[str, dict[str, str]] = {
     "openvino": {"INTEL_OPENVINO_DIR": "", "OpenVINO_DIR": "runtime/cmake"},
     "cann": {"CANN_HOME": ""},
     "rocm": {"ROCM_PATH": "", "HIP_PATH": ""},
-    "amdmigraphx": {"AMDMIGRAPHX_SRC": ""},
     "android-ndk": {"ANDROID_NDK_HOME": "", "ANDROID_NDK_ROOT": ""},
     "onnxruntime-sdk": {"ORT_HOME": ""},
     "vitisai": {"VITISAI_WHEELS": ""},

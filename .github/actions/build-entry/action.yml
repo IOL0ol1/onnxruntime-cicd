@@ -44,6 +44,12 @@ inputs:
   reuse:
     description: '"true": set up the environment only'
     default: "false"
+  ccache:
+    description: '"true": compile through ccache, kept in the Actions cache (not in containers)'
+    default: "false"
+  ccache-key:
+    description: Actions cache key prefix of the ccache directory
+    default: ""
 
 runs:
   using: composite
@@ -132,6 +138,27 @@ runs:
           if [ "$RUNNER_OS" = "Linux" ]; then echo "CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)"; fi
         } >> "$GITHUB_ENV"
 
+    # Compiler cache for the long builds (CUDA, MIGraphX). The ccache directory is restored from the newest cache with
+    # the key prefix and saved after the job; CMake reads the compiler launchers from the environment, so every CMake
+    # project of the build (ONNX Runtime, MIGraphX and its dependencies, EP repositories) uses it. The repository has
+    # 10 GB of Actions cache; the least recently used entries are evicted.
+    - name: Set up ccache
+      if: inputs.ccache == 'true' && inputs.docker == '' && inputs.reuse != 'true'
+      uses: hendrikmuhs/ccache-action@v1.2
+      with:
+        key: ccache-${{ inputs.ccache-key }}
+        max-size: 2G
+
+    - name: Use ccache for CMake builds
+      if: inputs.ccache == 'true' && inputs.docker == '' && inputs.reuse != 'true'
+      shell: bash
+      run: |
+        {
+          echo "CMAKE_C_COMPILER_LAUNCHER=ccache"
+          echo "CMAKE_CXX_COMPILER_LAUNCHER=ccache"
+          echo "CMAKE_CUDA_COMPILER_LAUNCHER=ccache"
+        } >> "$GITHUB_ENV"
+
     # Long-running, open-source build steps (see build_cache in ci/build.py) are reused across runs. The key hashes
     # their inputs, so an update gets a new key; only complete results are saved.
     - name: Build cache key
@@ -154,6 +181,7 @@ runs:
       uses: actions/cache/restore@v6
       with:
         key: ${{ steps.cache.outputs.key }}
+        restore-keys: ${{ steps.cache.outputs.restore-keys }}
         path: ${{ steps.cache.outputs.path }}
 
     - name: Build
@@ -175,9 +203,8 @@ runs:
       if: always() && steps.cache.outputs.key != '' && steps.restore.outputs.cache-hit != 'true'
       shell: bash
       env:
-        CACHE_PATH: ${{ steps.cache.outputs.path }}
         CACHE_MARKER: ${{ steps.cache.outputs.marker }}
-      run: if [ -f "$CACHE_PATH/$CACHE_MARKER" ]; then echo "save=true" >> "$GITHUB_OUTPUT"; fi
+      run: if [ -f "$CACHE_MARKER" ]; then echo "save=true" >> "$GITHUB_OUTPUT"; fi
 
     - name: Save build cache
       if: always() && steps.cache-check.outputs.save == 'true'

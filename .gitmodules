@@ -48,3 +48,8 @@
 	url = https://github.com/intel/onnxruntime.git
 	branch = ovep-develop
 	shallow = true
+[submodule "deps/amdmigraphx"]
+	path = deps/amdmigraphx
+	url = https://github.com/ROCm/AMDMIGraphX.git
+	branch = develop
+	shallow = true

@@ -1,5 +1,5 @@
-# Weekly update pull requests (merging one triggers the build workflow; entries whose inputs did not change reuse
-# their packages, so only the affected builds run)
+# Weekly update pull requests. Merging one builds nothing by itself: the next bundle request that needs an updated
+# package builds it (packages whose build inputs did not change are reused)
 version: 2
 updates:
   - package-ecosystem: github-actions
@@ -9,7 +9,7 @@ updates:
     groups:
       actions:
         patterns: ["*"]
-  # onnxruntime and the EP repositories: move each submodule to the newest commit of its branch
+  # onnxruntime, the EP repositories and AMDMIGraphX: move each submodule to the newest commit of its branch
   - package-ecosystem: gitsubmodule
     directory: /
     schedule:

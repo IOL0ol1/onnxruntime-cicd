@@ -41,7 +41,7 @@ function archOf(triple) {
 }
 
 function itemsFor(cat, triple) {
-  return cat.items.filter((it) => it.triple === triple && it.asset);
+  return cat.items.filter((it) => it.triple === triple);
 }
 
 // The libraries a core provides (onnxruntime and its shared provider libraries)
@@ -75,7 +75,7 @@ function validate(sel, cat) {
   const parts = [[sel.core, coreProvides(sel, cat)]];
   for (const p of sel.plugins) {
     const it = findItem(cat, p, sel.triple);
-    if (!it || !it.asset) return `${p} is not available for ${sel.triple}`;
+    if (!it) return `${p} is not available for ${sel.triple}`;
     parts.push([p, it.provides]);
   }
   for (const [name, libs] of parts) {
@@ -186,11 +186,13 @@ function summarize(sel, cat) {
   const eps = { ...coreEps(sel, cat) };
   const sources = {};
   for (const ep of Object.keys(eps)) sources[ep] = [`${eps[ep]} (${sel.core})`];
-  let size = 0;
-  if (sel.core !== CUSTOM_CORE) size += (findItem(cat, sel.core, sel.triple).asset || {}).size || 0;
+  // packages whose first build takes long (CUDA, MIGraphX, custom cores)
+  const long = [];
+  if (sel.core === CUSTOM_CORE) long.push(`custom core (${sel.compile.join(", ")})`);
+  else if (findItem(cat, sel.core, sel.triple).heavy) long.push(sel.core);
   for (const p of sel.plugins) {
     const it = findItem(cat, p, sel.triple);
-    size += it.asset.size || 0;
+    if (it.heavy) long.push(p);
     for (const [ep, form] of Object.entries(it.eps)) (sources[ep] = sources[ep] || []).push(`${form} (${p})`);
   }
   const bundled = new Set(), fetchable = {}, system = new Set();
@@ -205,7 +207,7 @@ function summarize(sel, cat) {
   const fetched = new Set();
   for (const [ep, f] of Object.entries(fetchable)) if (!wanted || wanted.includes(ep)) f.components.forEach((c) => fetched.add(c));
   const majors = cudaMajors(sel, cat);
-  return { sources, size, bundled: [...bundled], fetchable, fetched: [...fetched], system: [...system],
+  return { sources, long, bundled: [...bundled], fetchable, fetched: [...fetched], system: [...system],
            cudaMajor: majors.size ? [...majors][0] : null };
 }
 
@@ -213,8 +215,7 @@ function config(sel, cat) {
   const s = summarize(sel, cat);
   const custom = sel.core === CUSTOM_CORE;
   return {
-    schema: 1,
-    source: { type: cat.source.type, id: String(cat.source.id) },
+    schema: 2,
     triple: sel.triple,
     core: custom ? null : sel.core,
     compile: custom ? sel.compile : null,
@@ -255,7 +256,6 @@ if (typeof document !== "undefined") {
     for (const c of children.flat()) if (c !== null && c !== undefined && c !== false) el.append(c);
     return el;
   };
-  const mib = (n) => (n >= 1 << 30 ? `${(n / (1 << 30)).toFixed(1)} GiB` : `${Math.max(1, Math.round(n / (1 << 20)))} MiB`);
 
   let cat = null;
   let sel = null;
@@ -307,13 +307,12 @@ if (typeof document !== "undefined") {
       if (r.error) disabled = r.error;
     }
     const pkgLabel = opt.kind === "compile" ? "custom core" : opt.pkg.replace(/^onnxruntime-/, "");
-    const size = opt.item && opt.item.asset ? mib(opt.item.asset.size) : "";
     const cls = ["chip", selected && "on", disabled && "off", opt.kind === "plugin" ? "plugin" : "core",
                  opt.item && opt.item.experimental && "exp"].filter(Boolean).join(" ");
     const title = disabled ? `Not available with the current selection: ${disabled}` :
-      opt.kind === "plugin" ? `Plugin EP package ${opt.pkg} (${size}); can be combined with any core` :
+      opt.kind === "plugin" ? `Plugin EP package ${opt.pkg}; can be combined with any core` :
       opt.kind === "compile" ? "Compile a custom core with this in-tree EP (takes up to a few hours)" :
-      `Core package ${opt.pkg} (${size}); selecting it replaces the current core`;
+      `Core package ${opt.pkg}; selecting it replaces the current core`;
     return h("button", {
       type: "button", class: cls, title, "aria-pressed": selected ? "true" : "false", disabled: !!disabled,
       onclick: () => {
@@ -325,6 +324,7 @@ if (typeof document !== "undefined") {
       },
     }, h("span", { class: "form" }, FORM_LABEL[opt.form] || opt.form), h("span", { class: "pkg" }, pkgLabel),
        opt.item && opt.item.cuda_major ? h("span", { class: "tag" }, `CUDA ${opt.item.cuda_major}`) : null,
+       (opt.item && opt.item.heavy) || opt.kind === "compile" ? h("span", { class: "tag" }, "long build") : null,
        opt.item && opt.item.experimental ? h("span", { class: "tag warn" }, "experimental") : null);
   }
 
@@ -384,8 +384,9 @@ if (typeof document !== "undefined") {
       h("h2", {}, "4. Request"),
       h("div", { class: "table-wrap" }, h("table", { class: "summary" },
         h("thead", {}, h("tr", {}, h("th", {}, "EP"), h("th", {}, "Provided as"))), h("tbody", {}, rows))),
-      h("p", {}, `Packages to download: ${mib(s.size)} (before third-party runtimes)`,
-        sel.core === CUSTOM_CORE ? "; the custom core is compiled first, which takes up to a few hours." : "."),
+      h("p", {}, "Every package is built for the request unless an earlier request built it from the same sources in ",
+        "the last 90 days. ", s.long.length ? `First builds of ${s.long.join(", ")} take up to a few hours.`
+          : "This selection builds in well under an hour."),
       s.bundled.length ? h("p", {}, "Bundled third-party runtimes: ", s.bundled.map((c) => comp(c).name).join(", "), ".") : null,
       s.fetched.length ? h("p", {}, "Downloaded on your machine by fetch-restricted: ",
         s.fetched.map((c) => `${comp(c).name} (${comp(c).fetched})`).join("; "), ".") : null,
@@ -432,11 +433,8 @@ if (typeof document !== "undefined") {
       return;
     }
     const src = cat.source;
-    $("#source").replaceChildren(src
-      ? h("span", {}, "Packages: ", h("a", { href: src.url }, `${src.type === "release" ? "release" : "build run"} ${src.id}`),
-          ` · ${new Date(src.created_at).toLocaleDateString()}`)
-      : h("span", { class: "warn" }, "No packages are published yet."));
-    if (!src) return;
+    $("#source").replaceChildren(h("span", {}, "Build recipes: commit ", h("a", { href: src.url }, src.id),
+      ` · ${new Date(src.created_at).toLocaleDateString()}`));
     const first = cat.triples.find((t) => t === "x86_64-pc-windows-msvc") || cat.triples[0];
     sel = restore() || newSelection(cat, first);
     render();

@@ -1,5 +1,5 @@
-# Publishes the bundle configurator (site/) on GitHub Pages together with catalog.json (ci/catalog.py), which lists the
-# packages of the latest release (or, without releases, of the latest successful build on main).
+# Publishes the bundle configurator (site/) on GitHub Pages together with catalog.json (ci/catalog.py), which describes
+# the packages the build recipes can build for each target.
 #
 # Settings -> Pages -> Build and deployment -> Source must be "GitHub Actions".
 
@@ -12,20 +12,13 @@ on:
       - ".github/workflows/pages.yml"
       - "site/**"
       - "ci/catalog.py"
+      - "ci/plan.py"
       - "ci/build.py"
       - "ci/matrix.json"
-  release:
-    types: [published]
-  # a finished build changes what the catalog offers when there is no release yet
-  workflow_run:
-    workflows: [build]
-    types: [completed]
-    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
-  actions: read  # artifacts of the build runs
   pages: write
   id-token: write
 
@@ -35,7 +28,6 @@ concurrency:
 
 jobs:
   deploy:
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-24.04
     environment:
       name: github-pages
@@ -48,8 +40,6 @@ jobs:
           python-version: "3.12"
 
       - name: Generate the catalog
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
         run: python ci/catalog.py --out site/catalog.json
 
       - uses: actions/configure-pages@v6

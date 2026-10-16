@@ -84,6 +84,8 @@ DEFAULT_CUDA_ARCHS = "80-real;80-virtual"  # ORT drops a list that has only -vir
 # ROCm (TheRock wheels) used for the Windows MIGraphX source build (same as the AMDMIGraphX windows.yaml CI)
 WINDOWS_ROCM_VERSION = "7.13.0"
 DEFAULT_MIGRAPHX_GPU_TARGETS = "gfx1100;gfx1101;gfx1102;gfx1200;gfx1201"
+# AMDMIGraphX sources (a submodule on its develop branch, which the AMD plugin EPs follow)
+MIGRAPHX_SRC = ROOT / "deps" / "amdmigraphx"
 
 
 @dataclass
@@ -200,8 +202,7 @@ def bundle_vendor_runtime(job: Job, eps: list[str]) -> None:
     """Bundle the runtime libraries of vendor SDKs whose licenses allow distributing them as part of an application
     (QAIRT, TensorRT for RTX with the CUDA runtime), with the license texts. scripts/fetch_ep_runtime.py selects the
     files; the archives are already in the SDK download cache. CUDA libraries beyond cudart, cuDNN and TensorRT are
-    redistributable too, but would push the packages past the 2 GiB release asset limit; users fetch them with the
-    script instead."""
+    redistributable too, but take several GB; bundles add them (ci/bundle.py)."""
     if job.dry_run:
         print(f"[dry-run] bundle vendor runtime for {', '.join(eps)}")
         return
@@ -624,8 +625,7 @@ def build_migraphx_linux(job: Job) -> tuple[Path, Path]:
     """Build MIGraphX (develop, which the AMD EPs follow) with its GPU backend, the same way AMDMIGraphX's ci.yaml does:
     inside its rocm/migraphx-ci-ubuntu image, which has ROCm in /opt/rocm and the dependencies in /usr/local.
     Returns (MIGraphX install prefix, ROCm root)."""
-    job.need("amdmigraphx")
-    src, b, install = job.sdks["amdmigraphx"], job.work / "migraphx-build", job.work / "migraphx-install"
+    src, b, install = MIGRAPHX_SRC, job.work / "migraphx-build", job.work / "migraphx-install"
     rocm = Path(os.environ.get("ROCM_PATH", "/opt/rocm"))
     run(job, ["cmake", "-S", src, "-B", b, "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release",
               f"-DCMAKE_C_COMPILER={rocm / 'llvm/bin/clang'}", f"-DCMAKE_CXX_COMPILER={rocm / 'llvm/bin/clang++'}",
@@ -663,10 +663,13 @@ def build_migraphx_windows(job: Job) -> tuple[Path, Path]:
     ROCm comes from TheRock's Python wheels; MIGraphX's own dependencies (including rocMLIR) are built by rbuild.
     Returns (MIGraphX install prefix, ROCm root).
     """
-    job.need("amdmigraphx")
-    src = job.sdks["amdmigraphx"]
+    src = MIGRAPHX_SRC
     rocm, rocm_cmake = install_rocm_wheels(job)
     install, cget = job.work / "migraphx-install", job.work / "cget"
+    marker, commit = install / ".migraphx-commit", git_commit(src)
+    if not job.dry_run and marker.exists() and marker.read_text(encoding="utf-8").strip() == commit:
+        print(f"MIGraphX {commit[:12]} is already built (build cache): {install}", flush=True)
+        return install, rocm
     path = os.pathsep.join([str(rocm / "lib" / "llvm" / "bin"), str(rocm / "bin"), os.environ.get("PATH", "")])
     # rocMLIR has long paths; build the dependencies in a short directory like the upstream CI does
     short = Path(job.work.anchor) / "b"
@@ -686,6 +689,8 @@ def build_migraphx_windows(job: Job) -> tuple[Path, Path]:
               f"-DGPU_TARGETS={migraphx_gpu_targets()}", f"-DCMAKE_INSTALL_PREFIX={install}"], cwd=src,
         env={"PATH": path, "CC": "clang", "CXX": "clang++", "CMAKE_PREFIX_PATH": f"{rocm_cmake};{cget}"})
     run(job, ["cmake", "--install", src / "build", "--prefix", install])
+    if not job.dry_run:
+        marker.write_text(commit, encoding="utf-8")  # lets a cached install be reused (see build_cache)
     return install, rocm
 
 
@@ -805,7 +810,7 @@ def build_ep_amdgpu(job: Job) -> None:
             copy_files(job, ["lib/libmigraphx*.so*", "lib/migraphx/lib/*.so*"], migraphx, job.stage / "lib")
             set_origin_rpath(job, job.stage / "lib")
         stage_headers(job, migraphx / "include" / "migraphx", "migraphx")
-        stage_license(job, "MIGraphX", job.sdks["amdmigraphx"], ["LICENSE*"])
+        stage_license(job, "MIGraphX", MIGRAPHX_SRC, ["LICENSE*"])
     if job.variant == "amdgpu":  # its HIP backend: the HIP headers, and the import library on Windows (MIT)
         stage_headers(job, rocm / "include" / "hip", "hip")
         if job.os == "windows":
@@ -938,11 +943,13 @@ RECIPES: dict[str, Callable[[Job], None]] = {
 }
 
 
-def required_sdks(recipe: str, variant: str, triple: str, cuda_major: str = "13") -> set[tuple[str, str, str]]:
+def required_sdks(recipe: str, variant: str, triple: str, cuda_major: str = "13",
+                  eps: str = "") -> set[tuple[str, str, str]]:
     """Walk through a recipe in dry-run mode and return the required (component, platform, pinned version) tuples."""
     import contextlib
     import io
-    job = Job(recipe, variant, triple, Path("work"), Path("stage"), Path("sdk"), cuda_major, DEFAULT_CUDA_ARCHS, True)
+    job = Job(recipe, variant, triple, Path("work"), Path("stage"), Path("sdk"), cuda_major, DEFAULT_CUDA_ARCHS, True,
+              eps=[e for e in eps.split(",") if e])
     with contextlib.redirect_stdout(io.StringIO()):
         try:
             RECIPES[recipe](job)
@@ -968,23 +975,32 @@ def watch_memory(interval: int = 30) -> None:
     threading.Thread(target=loop, daemon=True).start()
 
 
-def build_cache(job: Job) -> tuple[str, Path, str] | None:
-    """(key, path, marker) of the build state a recipe can reuse from the Actions cache, or None.
+def git_commit(path: Path) -> str:
+    out = subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"], capture_output=True, text=True)
+    return out.stdout.strip() or "unknown"
+
+
+def build_cache(job: Job) -> tuple[str, str, list[Path], str] | None:
+    """(key, restore key prefix, paths, marker) of the build state a recipe can reuse from the Actions cache, or None.
 
     Only open-source build results are cached (the repository is public, and caches of a public repository can be
     restored by pull-request workflows). The key hashes everything the cached files depend on, so a version update
-    produces a new key instead of reusing old files; the cache is saved only when the marker file exists, i.e. the
-    cached step finished.
+    produces a new key instead of reusing old files; the cache is saved only when the marker file (relative to the
+    first path) exists, i.e. the cached step finished.
     """
     if job.recipe == "ep-amdgpu" and job.os == "windows" and job.variant != "dml":
         # MIGraphX's third-party dependencies (rocMLIR, ...) built by `rbuild prepare`: about 2.5 hours. They depend on
         # the files rbuild hashes for them, the ROCm (clang) version and the MSVC toolset, as in AMDMIGraphX's own CI.
-        job.need("amdmigraphx")
-        src, digest = job.sdks["amdmigraphx"], hashlib.sha256()
+        # The MIGraphX install itself is cached with them, keyed by the submodule commit; a new commit restores the
+        # dependencies of the same hash (restore key prefix) and builds only MIGraphX again (build_migraphx_windows).
+        digest = hashlib.sha256()
         for name in ("requirements.txt", "dev-requirements.txt", "rbuild.ini"):
-            digest.update(name.encode() + b"\0" + ((src / name).read_bytes() if (src / name).exists() else b""))
-        digest.update(f"{WINDOWS_ROCM_VERSION}|{os.environ.get('VCToolsVersion', '')}".encode())
-        return f"migraphx-deps-{job.triple}-{digest.hexdigest()[:20]}", job.work / "cget", "hash"
+            path = MIGRAPHX_SRC / name
+            digest.update(name.encode() + b"\0" + (path.read_bytes() if path.exists() else b""))
+        digest.update(f"{WINDOWS_ROCM_VERSION}|{os.environ.get('VCToolsVersion', '')}|{migraphx_gpu_targets()}".encode())
+        prefix = f"migraphx-{job.triple}-{digest.hexdigest()[:20]}-"
+        return (prefix + git_commit(MIGRAPHX_SRC)[:12], prefix, [job.work / "cget", job.work / "migraphx-install"],
+                "hash")
     return None
 
 
@@ -1002,7 +1018,8 @@ def main(argv: list[str]) -> int:
                     help="CMAKE_CUDA_ARCHITECTURES (defaults to the CUDA_ARCHITECTURES environment variable)")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--cache-info", type=Path, metavar="FILE",
-                    help="only append key=, path= and marker= of the recipe's reusable build state (see build_cache) "
+                    help="only append key=, restore-keys=, path= and marker= of the recipe's reusable build state "
+                         "(see build_cache) "
                          "to FILE, e.g. $GITHUB_OUTPUT; nothing for recipes without one")
     args = ap.parse_args(argv)
     for stream in (sys.stdout, sys.stderr):
@@ -1013,8 +1030,10 @@ def main(argv: list[str]) -> int:
               eps=[e for e in args.eps.split(",") if e])
     if args.cache_info:
         if cache := build_cache(job):
+            key, restore, paths, marker = cache
             with args.cache_info.open("a", encoding="utf-8") as f:
-                f.write(f"key={cache[0]}\npath={cache[1]}\nmarker={cache[2]}\n")
+                f.write(f"key={key}\nrestore-keys={restore}\nmarker={paths[0] / marker}\n")
+                f.write("path<<EOF_PATHS\n" + "\n".join(str(p) for p in paths) + "\nEOF_PATHS\n")
         return 0
     if Path("/proc/meminfo").exists() and not args.dry_run:
         watch_memory()

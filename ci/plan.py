@@ -1,56 +1,52 @@
 #!/usr/bin/env python3
-"""CI helper: generate the build matrix (with the inputs of each entry, see add_reuse) and the version; write them to $GITHUB_OUTPUT.
+"""CI helper: plan the package builds of a bundle request.
+
+Every package is built from a build recipe entry of ci/matrix.json (or, for a custom core, a synthetic entry with
+the selected in-tree EPs) by the build-entry action. Its package artifact is named after the hash of its build
+inputs, so a later request with the same inputs reuses the package (while the artifact lasts) instead of building it
+again; this replaces a scheduled build of every entry.
+
+    python ci/plan.py                    # print every matrix entry with its inputs hash and reusable artifact
 
 Environment variables (all optional):
-  FILTER            keep only entries whose package name or "package/triple" matches this regex (workflow_dispatch input)
   RUNNER_MAP        JSON mapping default runner labels to custom labels, e.g. {"ubuntu-24.04": "my-large-linux"}
   HEAVY_RUNNER_MAP  same, but only applied to heavy=true entries (long builds such as CUDA and QNN)
-  FORCE_REBUILD     "true" to build every entry even if an earlier run built the same inputs (see add_reuse)
-  GITHUB_TOKEN      lets the plan find earlier runs with the same inputs; without it everything is built
+  CUDA_ARCHITECTURES  part of the inputs of the CUDA builds
+  GITHUB_TOKEN      lets the plan find the packages of earlier runs with the same inputs
 """
 
 from __future__ import annotations
 
-import datetime
 import hashlib
 import importlib.util
 import json
 import os
-import re
 import subprocess
 import sys
 import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-_bspec = importlib.util.spec_from_file_location("ci_build", ROOT / "ci" / "build.py")
-build = importlib.util.module_from_spec(_bspec)
-sys.modules["ci_build"] = build
-_bspec.loader.exec_module(build)
+if "ci_build" in sys.modules:
+    build = sys.modules["ci_build"]
+else:
+    _bspec = importlib.util.spec_from_file_location("ci_build", ROOT / "ci" / "build.py")
+    build = importlib.util.module_from_spec(_bspec)
+    sys.modules["ci_build"] = build
+    _bspec.loader.exec_module(build)
 
 DEFAULTS = {"variant": "default", "cuda_major": "13", "experimental": False, "heavy": False, "docker": "", "apt": "",
-            "keep_android_sdk": False}
+            "keep_android_sdk": False, "eps": ""}
+# The files a package build depends on besides its entry, submodules and SDKs. Changes elsewhere (the bundle and
+# page code) keep the packages valid.
+BUILD_FILES = ("ci/build.py", "ci/sdk.py", "ci/package.py", "scripts", ".github/actions/build-entry")
+# components whose resolved version depends on the CUDA major version
+CUDA_DEPENDENT = {"cuda", "cudnn", "tensorrt", "tensorrt-rtx"}
 
 
-def version() -> tuple[str, str]:
-    """Return (version, release tag). Tag pushes use the tag itself; otherwise ORT version + date + commit."""
-    ref = os.environ.get("GITHUB_REF", "")
-    if ref.startswith("refs/tags/v"):
-        tag = ref.removeprefix("refs/tags/")
-        return tag[1:], tag
-    sha = os.environ.get("GITHUB_SHA") or subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True,
-                                                          cwd=ROOT).stdout.strip()
-    ort = "0.0.0"
-    try:  # the submodule may not be checked out, so read VERSION_NUMBER upstream at the gitlink commit
-        line = subprocess.run(["git", "ls-tree", "HEAD", "onnxruntime"], capture_output=True, text=True, cwd=ROOT).stdout
-        ort_sha = line.split()[2]
-        url = f"https://raw.githubusercontent.com/microsoft/onnxruntime/{ort_sha}/VERSION_NUMBER"
-        ort = urllib.request.urlopen(url, timeout=60).read().decode().strip()
-    except (IndexError, OSError):
-        pass
-    date = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d")
-    v = f"{ort}-dev.{date}.{sha[:8] or 'local'}"
-    return v, f"build-{v}"
+def entries() -> list[dict]:
+    """The build recipe entries of ci/matrix.json, with defaults."""
+    return [{**DEFAULTS, **e} for e in json.loads((ROOT / "ci" / "matrix.json").read_text(encoding="utf-8"))["include"]]
 
 
 def msvc_arch(triple: str, runner: str) -> str:
@@ -63,47 +59,21 @@ def msvc_arch(triple: str, runner: str) -> str:
     return "amd64"
 
 
-def build_matrix() -> list[dict]:
-    entries = json.loads((ROOT / "ci" / "matrix.json").read_text(encoding="utf-8"))["include"]
-    pattern = re.compile(os.environ.get("FILTER") or ".*")
-    runner_map = json.loads(os.environ.get("RUNNER_MAP") or "{}")
-    heavy_map = json.loads(os.environ.get("HEAVY_RUNNER_MAP") or "{}")
-    out = []
-    for e in entries:
-        e = {**DEFAULTS, **e}
-        if not (pattern.search(e["package"]) or pattern.search(f"{e['package']}/{e['triple']}")):
-            continue
-        runner = e["runner"]
-        e["runner"] = (heavy_map.get(runner) if e["heavy"] else None) or runner_map.get(runner) or runner
-        e.setdefault("msvc_arch", msvc_arch(e["triple"], runner))
-        e["id"] = f"{e['package']}-{e['triple']}"
-        out.append(e)
-    ids = [e["id"] for e in out]
-    dup = {i for i in ids if ids.count(i) > 1}
-    if dup:
-        raise SystemExit(f"duplicate package-triple entries in the matrix: {dup}")
-    return out
-
-
-# components whose resolved version depends on the CUDA major version
-CUDA_DEPENDENT = {"cuda", "cudnn", "tensorrt", "tensorrt-rtx"}
-
-
 def git(*args: str) -> str:
     return subprocess.run(["git", *args], capture_output=True, text=True, cwd=ROOT, check=True).stdout.strip()
 
 
-class Inputs:
-    """Hash of everything a build entry depends on, used to reuse the package of an earlier run with the same inputs.
+def sdks_of(e: dict) -> set[str]:
+    return {c for c, _, _ in build.required_sdks(e["recipe"], e["variant"], e["triple"], e["cuda_major"], e["eps"])}
 
-    Covered: the entry itself, the commits of its submodules, the CI scripts and workflow (any change there rebuilds
-    everything), the resolved third-party SDK versions, the Docker image digest and the CUDA architectures. Anything
-    that cannot be resolved makes the entry unique to this run, so it is rebuilt.
-    """
+
+class Inputs:
+    """Hash of everything a build entry depends on: the entry itself, the commits of its submodules, the build scripts,
+    the resolved third-party SDK versions, the Docker image digest and the CUDA architectures. Anything that cannot be
+    resolved makes the hash unique, so the entry is built."""
 
     def __init__(self) -> None:
-        self.ci = git("rev-parse", "HEAD:ci", "HEAD:scripts", "HEAD:.github/workflows/build.yml",
-                      "HEAD:.github/actions").split()
+        self.files = git("rev-parse", *(f"HEAD:{p}" for p in BUILD_FILES)).split()
         self.sdks: dict[tuple, str] = {}
         self.images: dict[str, str] = {}
 
@@ -120,9 +90,9 @@ class Inputs:
                     value = (out.stdout.split() or [""])[0] or f"unresolved-{os.urandom(8).hex()}"
                 else:
                     value = resolved.version + "|" + ",".join(f.filename for f in resolved.files)
-            except Exception as e:  # e.g. a version read from a submodule that the plan job has not checked out
+            except Exception as e:
                 value = f"unresolved-{os.urandom(8).hex()}"
-                print(f"  {comp} ({plat}): not resolved here ({str(e).splitlines()[0][:100]})", file=sys.stderr)
+                print(f"  {comp} ({plat}): not resolved ({str(e).splitlines()[0][:100]})", file=sys.stderr)
             self.sdks[key] = value
         return self.sdks[key]
 
@@ -138,58 +108,63 @@ class Inputs:
 
     def of(self, e: dict) -> str:
         subs = {s: git("rev-parse", f"HEAD:{s}") for s in e["submodules"].split()}
-        sdks = sorted((c, p, pin, self.sdk(c, p, e["cuda_major"] if c in CUDA_DEPENDENT else "13", pin))
-                      for c, p, pin in build.required_sdks(e["recipe"], e["variant"], e["triple"], e["cuda_major"]))
-        data = {"entry": e, "submodules": subs, "ci": self.ci, "sdks": sdks, "image": self.image(e["docker"]),
+        cuda = e["cuda_major"]
+        sdks = sorted((c, p, pin, self.sdk(c, p, cuda if c in CUDA_DEPENDENT else "13", pin))
+                      for c, p, pin in build.required_sdks(e["recipe"], e["variant"], e["triple"], cuda, e["eps"]))
+        recipe = {k: e[k] for k in ("package", "recipe", "variant", "triple", "cuda_major", "eps", "docker", "apt")}
+        data = {"entry": recipe, "submodules": subs, "files": self.files, "sdks": sdks, "image": self.image(e["docker"]),
                 "cuda_archs": os.environ.get("CUDA_ARCHITECTURES", "")}
-        return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()[:32]
+        return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()[:16]
 
 
-def previous_run(marker: str) -> str:
-    """Run id of the newest unexpired build whose marker artifact records the same inputs ("" if none)."""
-    repo, token = os.environ.get("GITHUB_REPOSITORY"), os.environ.get("GITHUB_TOKEN")
-    if not (repo and token):
-        return ""
-    req = urllib.request.Request(f"https://api.github.com/repos/{repo}/actions/artifacts?name={marker}",
+def build_entry(e: dict, inputs: Inputs) -> dict:
+    """A build job of the bundle workflow for a recipe entry: runner, MSVC settings, inputs hash and artifact name."""
+    runner_map = json.loads(os.environ.get("RUNNER_MAP") or "{}")
+    heavy_map = json.loads(os.environ.get("HEAVY_RUNNER_MAP") or "{}")
+    runner = e["runner"]
+    sdks = sdks_of(e)
+    digest = inputs.of(e)
+    name = e["package"] + (f"-{hashlib.sha256(e['eps'].encode()).hexdigest()[:6]}" if e["eps"] else "")
+    return {
+        "id": f"{name}-{e['triple']}",
+        "package": e["package"], "recipe": e["recipe"], "variant": e["variant"], "triple": e["triple"],
+        "eps": e["eps"], "cuda_major": e["cuda_major"], "submodules": e["submodules"], "docker": e["docker"],
+        "apt": e["apt"], "keep_android_sdk": bool(e["keep_android_sdk"]),
+        "runner": (heavy_map.get(runner) if e["heavy"] else None) or runner_map.get(runner) or runner,
+        "msvc_arch": e.get("msvc_arch") or msvc_arch(e["triple"], runner),
+        # CUDA 12 does not accept the VS 2026 compiler (MSVC 14.5x), and the constexpr <cmath> comparisons of its STL
+        # clash with the HIP device overloads when building MIGraphX: use the VS 2022 toolset the image also ships
+        "msvc_toolset": "14.44" if (e["cuda_major"] == "12" and "cuda" in sdks) or e["recipe"] == "ep-amdgpu" else "",
+        # compiler caching (ccache in the Actions cache, 10 GB per repository) for the long builds only: CUDA and
+        # MIGraphX; container builds are left out
+        "ccache": not e["docker"] and ("cuda" in sdks or (e["recipe"] == "ep-amdgpu" and e["variant"] != "dml")),
+        "hash": digest,
+        "artifact": f"pkg-{name}-{e['triple']}-{digest}",
+    }
+
+
+def find_artifact(name: str) -> dict | None:
+    """{"run": run id, "id": artifact id} of the newest unexpired artifact with this name, or None."""
+    repo, token = os.environ.get("GITHUB_REPOSITORY") or "IOL0ol1/onnxruntime-cicd", os.environ.get("GITHUB_TOKEN")
+    if not token:
+        return None
+    req = urllib.request.Request(f"https://api.github.com/repos/{repo}/actions/artifacts?name={name}&per_page=20",
                                  headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"})
     try:
         arts = json.load(urllib.request.urlopen(req, timeout=60))["artifacts"]
     except (OSError, KeyError, ValueError):
-        return ""
+        return None
     arts = sorted((a for a in arts if not a["expired"]), key=lambda a: a["created_at"], reverse=True)
-    return str(arts[0]["workflow_run"]["id"]) if arts else ""
-
-
-def add_reuse(builds: list[dict]) -> None:
-    """Give each entry its inputs hash and, unless FORCE_REBUILD is set, the run whose package it can reuse."""
-    force = os.environ.get("FORCE_REBUILD", "").lower() == "true"
-    inputs = Inputs()
-    for e in builds:
-        # marker artifact of a build, named like the package artifact pkg-<id>
-        e["inputs_artifact"] = f"inputs-{e['id']}-{inputs.of(e)}"
-        e["reuse_run"] = "" if force else previous_run(e["inputs_artifact"])
-        if e["reuse_run"]:
-            print(f"  reuse {e['id']} from run {e['reuse_run']}")
+    return {"run": str(arts[0]["workflow_run"]["id"]), "id": str(arts[0]["id"])} if arts else None
 
 
 def main() -> int:
-    builds = build_matrix()
-    add_reuse(builds)
-    v, tag = version()
-    outputs = {
-        "build_matrix": json.dumps({"include": builds}),
-        "version": v,
-        "release_tag": tag,
-        "count": str(len(builds)),
-    }
-    for k, val in outputs.items():
-        print(f"{k}={val if k != 'build_matrix' else f'<{len(builds)} entries>'}")
-    if gh_out := os.environ.get("GITHUB_OUTPUT"):
-        with open(gh_out, "a", encoding="utf-8") as f:
-            for k, val in outputs.items():
-                f.write(f"{k}={val}\n")
-    if not builds:
-        raise SystemExit("FILTER matched no build entries")
+    inputs = Inputs()
+    for e in entries():
+        b = build_entry(e, inputs)
+        found = find_artifact(b["artifact"])
+        print(f"{b['id']:60} {b['runner']:18} ccache={str(b['ccache']):5} {b['hash']} "
+              f"{'reuse run ' + found['run'] if found else 'build'}")
     return 0
 
 

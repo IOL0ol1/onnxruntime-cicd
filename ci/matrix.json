@@ -1,5 +1,5 @@
 {
-  "_comment": "Build matrix. package = release package name; recipe/variant are defined in ci/build.py; submodules = paths to check out (with nested submodules); cuda_major = CUDA major version; heavy = long build (see HEAVY_RUNNER_MAP); experimental = allowed to fail; msvc_arch overrides the MSVC environment architecture.",
+  "_comment": "Build recipes of the packages bundle requests build on demand (ci/plan.py). package = package name; recipe/variant are defined in ci/build.py; submodules = paths to check out (with nested submodules); cuda_major = CUDA major version; heavy = long build (see HEAVY_RUNNER_MAP); experimental = known to fail at times; msvc_arch overrides the MSVC environment architecture.",
   "include": [
     {"package": "onnxruntime", "recipe": "ort", "triple": "x86_64-unknown-linux-gnu", "runner": "ubuntu-24.04", "submodules": "onnxruntime"},
     {"package": "onnxruntime", "recipe": "ort", "triple": "aarch64-unknown-linux-gnu", "runner": "ubuntu-24.04-arm", "submodules": "onnxruntime"},
@@ -75,10 +75,10 @@
     {"package": "onnxruntime-ep-nv-tensorrt-rtx-cuda12", "recipe": "ep-nv-tensorrt-rtx", "cuda_major": "12", "triple": "x86_64-unknown-linux-gnu", "runner": "ubuntu-24.04", "submodules": "eps/vendor/nvidia-tensorrt-rtx-ep"},
     {"package": "onnxruntime-ep-nv-tensorrt-rtx-cuda12", "recipe": "ep-nv-tensorrt-rtx", "cuda_major": "12", "triple": "x86_64-pc-windows-msvc", "runner": "windows-2025", "submodules": "eps/vendor/nvidia-tensorrt-rtx-ep"},
     {"package": "onnxruntime-ep-directml-amd", "recipe": "ep-amdgpu", "variant": "dml", "triple": "x86_64-pc-windows-msvc", "runner": "windows-2025", "submodules": "eps/official/onnxruntime-ep-amdgpu"},
-    {"package": "onnxruntime-ep-migraphx-amd", "recipe": "ep-amdgpu", "variant": "migraphx", "triple": "x86_64-unknown-linux-gnu", "runner": "ubuntu-24.04", "submodules": "eps/official/onnxruntime-ep-amdgpu", "docker": "rocm/migraphx-ci-ubuntu:latest", "heavy": true},
-    {"package": "onnxruntime-ep-migraphx-amd", "recipe": "ep-amdgpu", "variant": "migraphx", "triple": "x86_64-pc-windows-msvc", "runner": "windows-2025", "submodules": "eps/official/onnxruntime-ep-amdgpu", "heavy": true, "experimental": true},
-    {"package": "onnxruntime-ep-amdgpu", "recipe": "ep-amdgpu", "variant": "amdgpu", "triple": "x86_64-unknown-linux-gnu", "runner": "ubuntu-24.04", "submodules": "eps/official/onnxruntime-ep-amdgpu", "docker": "rocm/migraphx-ci-ubuntu:latest", "heavy": true},
-    {"package": "onnxruntime-ep-amdgpu", "recipe": "ep-amdgpu", "variant": "amdgpu", "triple": "x86_64-pc-windows-msvc", "runner": "windows-2025", "submodules": "eps/official/onnxruntime-ep-amdgpu", "heavy": true, "experimental": true},
+    {"package": "onnxruntime-ep-migraphx-amd", "recipe": "ep-amdgpu", "variant": "migraphx", "triple": "x86_64-unknown-linux-gnu", "runner": "ubuntu-24.04", "submodules": "eps/official/onnxruntime-ep-amdgpu deps/amdmigraphx", "docker": "rocm/migraphx-ci-ubuntu:latest", "heavy": true},
+    {"package": "onnxruntime-ep-migraphx-amd", "recipe": "ep-amdgpu", "variant": "migraphx", "triple": "x86_64-pc-windows-msvc", "runner": "windows-2025", "submodules": "eps/official/onnxruntime-ep-amdgpu deps/amdmigraphx", "heavy": true, "experimental": true},
+    {"package": "onnxruntime-ep-amdgpu", "recipe": "ep-amdgpu", "variant": "amdgpu", "triple": "x86_64-unknown-linux-gnu", "runner": "ubuntu-24.04", "submodules": "eps/official/onnxruntime-ep-amdgpu deps/amdmigraphx", "docker": "rocm/migraphx-ci-ubuntu:latest", "heavy": true},
+    {"package": "onnxruntime-ep-amdgpu", "recipe": "ep-amdgpu", "variant": "amdgpu", "triple": "x86_64-pc-windows-msvc", "runner": "windows-2025", "submodules": "eps/official/onnxruntime-ep-amdgpu deps/amdmigraphx", "heavy": true, "experimental": true},
     {"package": "onnxruntime-ep-qnn", "recipe": "ep-qnn", "triple": "x86_64-pc-windows-msvc", "runner": "windows-2025", "submodules": "eps/official/onnxruntime-qnn", "heavy": true},
     {"package": "onnxruntime-ep-qnn", "recipe": "ep-qnn", "triple": "aarch64-pc-windows-msvc", "runner": "windows-2025", "submodules": "eps/official/onnxruntime-qnn", "heavy": true},
     {"package": "onnxruntime-ep-qnn", "recipe": "ep-qnn", "triple": "arm64ec-pc-windows-msvc", "runner": "windows-2025", "submodules": "eps/official/onnxruntime-qnn", "heavy": true, "experimental": true},

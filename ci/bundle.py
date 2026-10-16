@@ -9,11 +9,12 @@ Qualcomm SDKs, the Vitis AI runtime, the CANN toolkit).
 
     python ci/bundle.py resolve --event $GITHUB_EVENT_PATH --plan plan.json --github-output $GITHUB_OUTPUT
     python ci/bundle.py resolve --config config.json --plan plan.json         # check a configuration locally
+    python ci/bundle.py download --plan plan.json --dest DIR
     python ci/bundle.py assemble --plan plan.json --packages DIR --work WORK --out DIST
 
-`resolve` validates the configuration against a fresh catalog (ci/catalog.py) of the package source it names and
-writes the plan; `assemble` takes the downloaded package archives (DIR/<package>/<archive>) and writes the bundle
-archive into DIST.
+`resolve` validates the configuration against the catalog (ci/catalog.py) and writes the plan: the build job and
+inputs hash of every package (ci/plan.py), and the artifact of an earlier run it can reuse; the workflow builds the
+others. `download` fetches the package artifacts into DIR/<package>/, `assemble` writes the bundle archive into DIST.
 """
 
 from __future__ import annotations
@@ -47,13 +48,11 @@ def _load(name: str, path: Path):
 
 catalog = _load("ci_catalog", ROOT / "ci" / "catalog.py")
 build = catalog.build
-plan_mod = _load("ci_plan", ROOT / "ci" / "plan.py")
+plan_mod = catalog.plan
 
-CONFIG_SCHEMA = 1
+CONFIG_SCHEMA = 2
 CUSTOM_CORE = "onnxruntime-custom"  # package name of a compiled core
 CUDA_EPS = {"cuda", "tensorrt", "nv-tensorrt-rtx"}
-# Files at the top of a package (not in bin/ lib/ include/ ...): kept per package in packages/<name>/
-PACKAGE_META = {"BUILD_INFO.json", "LICENSE", "ThirdPartyNotices.txt", "THIRD_PARTY_RUNTIME.json"}
 
 
 class RequestError(Exception):
@@ -78,36 +77,30 @@ def parse_issue(body: str) -> dict:
     return config
 
 
-def compile_settings(triple: str, eps: list[str], cuda_major: str) -> dict:
-    """Runner and environment of a custom core build, taken from the matrix entries that build those EPs."""
+def custom_entry(triple: str, eps: list[str], cuda_major: str) -> dict:
+    """Build recipe entry of a custom core: the runner of the target's core builds, with the packages and container of
+    the matrix entries that build those EPs."""
     entries = [e for e in catalog.entries() if e["triple"] == triple and e["recipe"] == "ort"
                and e["variant"] not in ("cuda-plugin", "webgpu-plugin", "arm64x")]
     base = next((e for e in entries if e["package"] == "onnxruntime-all"), None) or \
         next(e for e in entries if e["package"] == "onnxruntime")
-    apt, docker, heavy = set((base.get("apt") or "").split()), "", bool(base.get("heavy"))
+    apt, docker, heavy = set(base["apt"].split()), "", bool(base["heavy"])
     for ep in eps:
         carrier = next(e for e in entries if ep in catalog.core_eps(e))
-        apt |= set((carrier.get("apt") or "").split())
-        docker = docker or carrier.get("docker", "")
-        heavy = heavy or bool(carrier.get("heavy"))
-    runner = base["runner"]
-    runner_map = json.loads(os.environ.get("RUNNER_MAP") or "{}")
-    heavy_map = json.loads(os.environ.get("HEAVY_RUNNER_MAP") or "{}")
-    return {"runner": (heavy_map.get(runner) if heavy else None) or runner_map.get(runner) or runner,
-            "msvc_arch": plan_mod.msvc_arch(triple, runner), "docker": docker, "apt": " ".join(sorted(apt)),
-            "keep_android_sdk": False, "toolset": "14.44" if cuda_major == "12" and "windows" in triple else ""}
+        apt |= set(carrier["apt"].split())
+        docker = docker or carrier["docker"]
+        heavy = heavy or bool(carrier["heavy"])
+    return {**plan_mod.DEFAULTS, "package": CUSTOM_CORE, "recipe": "ort", "variant": "custom", "triple": triple,
+            "runner": base["runner"], "submodules": "onnxruntime", "cuda_major": cuda_major, "eps": ",".join(eps),
+            "apt": " ".join(sorted(apt)), "docker": docker, "heavy": heavy}
 
 
 def make_plan(config: dict, cat: dict) -> dict:
-    """Validate a configuration against the catalog and work out what the bundle consists of."""
+    """Validate a configuration against the catalog and work out what the bundle consists of (without the builds;
+    see plan_builds)."""
     if config.get("schema") != CONFIG_SCHEMA:
-        raise RequestError(f"unsupported configuration schema {config.get('schema')!r} (expected {CONFIG_SCHEMA})")
-    src = cat["source"]
-    want = config.get("source") or {}
-    if not src or (want.get("type"), str(want.get("id"))) != (src["type"], str(src["id"])):
-        current = f"{src['type']} {src['id']}" if src else "none"
-        raise RequestError(f"package source {want.get('type')} {want.get('id')} is not available any more "
-                           f"(current: {current}); reload the configurator page and create a new request")
+        raise RequestError(f"unsupported configuration schema {config.get('schema')!r} (expected {CONFIG_SCHEMA}); "
+                           "reload the configurator page and create a new request")
     triple = config.get("triple")
     if triple not in cat["triples"]:
         raise RequestError(f"unknown target triple {triple!r}")
@@ -117,8 +110,6 @@ def make_plan(config: dict, cat: dict) -> dict:
         it = items.get((name, triple))
         if not it or it["kind"] != kind:
             raise RequestError(f"{name} is not a {kind} package for {triple}")
-        if not it["asset"]:
-            raise RequestError(f"{name} for {triple} is not in {src['type']} {src['id']} (its build failed or expired)")
         return it
 
     core_name, compile_eps = config.get("core"), list(dict.fromkeys(config.get("compile") or []))
@@ -172,21 +163,21 @@ def make_plan(config: dict, cat: dict) -> dict:
         bundled |= set(tp.get("components", [])) if tp.get("bundle") else set()
     components = sorted({c for ep in eps for c in cat["third_party"].get(ep, {}).get("components", [])})
 
-    normalized = {"schema": CONFIG_SCHEMA, "source": {"type": src["type"], "id": str(src["id"])}, "triple": triple,
-                  "core": core_name, "compile": compile_eps or None, "plugins": [p["package"] for p in plugins],
-                  "cuda_major": cuda_major or None, "dev": dev,
+    entries = {(e["package"], e["triple"]): e for e in catalog.entries()}
+    packages = ([{"package": core_name, "kind": "core", "entry": entries[(core_name, triple)]}] if core else
+                [{"package": CUSTOM_CORE, "kind": "core", "entry": custom_entry(triple, compile_eps, cuda_major or "13")}])
+    packages += [{"package": p["package"], "kind": "plugin", "entry": entries[(p["package"], triple)]} for p in plugins]
+    normalized = {"schema": CONFIG_SCHEMA, "triple": triple, "core": core_name, "compile": compile_eps or None,
+                  "plugins": [p["package"] for p in plugins], "cuda_major": cuda_major or None, "dev": dev,
                   "fetch": sorted({f.split(":")[0] for f in fetch}) if wanted is not None else None}
-    key = hashlib.sha256(json.dumps(normalized, sort_keys=True).encode()).hexdigest()[:12]
-    plan = {
-        "key": key,
-        "name": f"onnxruntime-bundle-{key}-{triple}",
+    return {
         "config": normalized,
-        "source": src,
+        "source": cat["source"],
         "triple": triple,
         "core": core,
-        "compile": ({"eps": compile_eps, "cuda_major": cuda_major or "13",
-                     **compile_settings(triple, compile_eps, cuda_major or "13")} if compile_eps else None),
+        "compile": {"eps": compile_eps, "cuda_major": cuda_major or "13"} if compile_eps else None,
         "plugins": plugins,
+        "packages": packages,
         "eps": eps,
         "cuda_major": cuda_major or None,
         "bundle_runtime": bundle_runtime,
@@ -196,24 +187,35 @@ def make_plan(config: dict, cat: dict) -> dict:
         "system": system,
         "components": {c: cat["components"][c] for c in components + system},
     }
+
+
+def plan_builds(plan: dict, reuse: bool = True) -> None:
+    """Give every package of a plan its build job and inputs hash, and the earlier artifact it can reuse; name the
+    bundle after the configuration and the packages' hashes."""
+    inputs = plan_mod.Inputs()
+    for p in plan["packages"]:
+        p["build"] = plan_mod.build_entry(p["entry"], inputs)
+        p["reuse"] = plan_mod.find_artifact(p["build"]["artifact"]) if reuse else None
+    digest = json.dumps([plan["config"], [p["build"]["hash"] for p in plan["packages"]]], sort_keys=True)
+    plan["key"] = hashlib.sha256(digest.encode()).hexdigest()[:12]
+    plan["name"] = f"onnxruntime-bundle-{plan['key']}-{plan['triple']}"
     plan["summary"] = summary(plan)
-    return plan
 
 
 def summary(plan: dict) -> str:
     """Markdown description of a plan for the request issue."""
+    repo = os.environ.get("GITHUB_REPOSITORY") or "IOL0ol1/onnxruntime-cicd"
     lines = [f"**Target:** `{plan['triple']}`  ",
-             f"**Packages:** {plan['source']['type']} [{plan['source']['id']}]({plan['source']['url']})  "]
-    if plan["core"]:
-        lines.append(f"**Core:** `{plan['core']['package']}`  ")
-    else:
-        c = plan["compile"]
-        lines.append(f"**Core:** compiled with {', '.join(c['eps'])} on `{c['runner']}`"
-                     f"{' in ' + c['docker'] if c['docker'] else ''}  ")
-    if plan["plugins"]:
-        lines.append(f"**Plugin EPs:** {', '.join('`' + p['package'] + '`' for p in plan['plugins'])}  ")
+             f"**Recipes:** commit [{plan['source']['id']}]({plan['source']['url']})  "]
     if plan["cuda_major"]:
         lines.append(f"**CUDA:** {plan['cuda_major']}.x  ")
+    lines += ["", "| Package | Build |", "|---|---|"]
+    for p in plan["packages"]:
+        name = p["package"] + (f" ({', '.join(plan['compile']['eps'])})" if p["package"] == CUSTOM_CORE else "")
+        b, r = p.get("build", {}), p.get("reuse")
+        how = (f"reused from [run {r['run']}](https://github.com/{repo}/actions/runs/{r['run']})" if r else
+               f"built on `{b['runner']}`{' in ' + b['docker'] if b.get('docker') else ''}" if b else "")
+        lines.append(f"| `{name}` | {how} |")
     lines += ["", "| EP | Provided as |", "|---|---|"]
     lines += [f"| {plan_ep_name(ep)} | {'; '.join(forms)} |" for ep, forms in plan["eps"].items()]
     if plan["bundle_runtime"]:
@@ -241,20 +243,14 @@ def write_outputs(path: Path, values: dict[str, str]) -> None:
 
 
 def cmd_resolve(args: argparse.Namespace) -> int:
-    outputs: dict[str, str] = {}
     try:
         if args.event:
             event = json.loads(args.event.read_text(encoding="utf-8"))
             config = parse_issue(event["issue"]["body"])
         else:
             config = json.loads(args.config.read_text(encoding="utf-8"))
-        src = config.get("source") or {}
-        spec = f"{src.get('type')}:{src.get('id')}" if src.get("type") in ("release", "run") else "none"
-        try:
-            cat = catalog.catalog(spec)
-        except Exception as e:  # the source does not exist (any more)
-            raise RequestError(f"package source {spec} cannot be read: {e}")
-        plan = make_plan(config, cat)
+        plan = make_plan(config, catalog.catalog())
+        plan_builds(plan, reuse=not args.no_reuse)
     except Exception as e:  # report every failure in the issue, not only invalid requests
         if not isinstance(e, RequestError):
             e = RequestError(f"internal error while resolving the request ({type(e).__name__}: {e})")
@@ -265,12 +261,13 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     args.plan.parent.mkdir(parents=True, exist_ok=True)
     args.plan.write_text(json.dumps(plan, indent=1), encoding="utf-8")
     print(plan["summary"])
-    c = plan["compile"] or {}
+    builds = [p["build"] for p in plan["packages"] if not p["reuse"]]
+    found = plan_mod.find_artifact(plan["name"]) if not args.no_reuse else None
+    repo = os.environ.get("GITHUB_REPOSITORY") or "IOL0ol1/onnxruntime-cicd"
     outputs = {"ok": "true", "key": plan["key"], "name": plan["name"], "summary": plan["summary"],
-               "existing_url": existing_bundle(plan["name"]) if args.reuse_existing else "",
-               "compile": "true" if c else "false", "triple": plan["triple"], "runner": c.get("runner", ""),
-               "msvc_arch": c.get("msvc_arch", ""), "docker": c.get("docker", ""), "apt": c.get("apt", ""),
-               "toolset": c.get("toolset", ""), "cuda_major": c.get("cuda_major", ""), "eps": ",".join(c.get("eps", []))}
+               "existing_url": f"https://github.com/{repo}/actions/runs/{found['run']}/artifacts/{found['id']}"
+               if found else "",
+               "builds": json.dumps({"include": builds}), "has_builds": "true" if builds else "false"}
     if args.github_output:
         write_outputs(args.github_output, outputs)
     return 0
@@ -293,12 +290,12 @@ def extract(archive: Path, dest: Path) -> Path:
 
 
 def package_archive(directory: Path) -> Path:
-    """The package archive in directory, checked against its .sha256 file (build artifacts) or SHA256SUMS (releases)."""
+    """The package archive in directory, checked against its .sha256 file."""
     archives = [p for p in directory.iterdir() if p.name.endswith((".zip", ".tar.gz"))]
     if len(archives) != 1:
         raise SystemExit(f"expected one package archive in {directory}, found {[p.name for p in archives]}")
     archive = archives[0]
-    sums = [archive.with_name(archive.name + ".sha256"), directory / "SHA256SUMS"]
+    sums = [archive.with_name(archive.name + ".sha256")]
     expected = next((line.split()[0] for f in sums if f.exists() for line in f.read_text(encoding="utf-8").splitlines()
                      if line.split()[-1:] == [archive.name]), None)
     if not expected:
@@ -310,36 +307,21 @@ def package_archive(directory: Path) -> Path:
 
 
 def cmd_download(args: argparse.Namespace) -> int:
-    """Download the packages of a plan (not a compiled core) into DEST/<package>/ with the GitHub CLI."""
+    """Download the package artifacts of a plan into DEST/<package>/ with the GitHub CLI: the reused ones from their
+    earlier runs, the others from this run (GITHUB_RUN_ID)."""
     plan = json.loads(args.plan.read_text(encoding="utf-8"))
-    src, repo = plan["source"], os.environ.get("GITHUB_REPOSITORY") or "IOL0ol1/onnxruntime-cicd"
-    gh = shutil.which("gh") or "gh"
-    for it in ([plan["core"]] if plan["core"] else []) + plan["plugins"]:
-        dest = args.dest / it["package"]
-        dest.mkdir(parents=True, exist_ok=True)
-        print(f"==> {it['package']}: {it['asset']['name']} ({it['asset']['size'] >> 20} MiB)", flush=True)
-        if src["type"] == "run":
-            cmd = [gh, "run", "download", src["id"], "-R", repo, "-n", it["asset"]["name"], "-D", str(dest)]
-        else:
-            cmd = [gh, "release", "download", src["id"], "-R", repo, "-p", it["asset"]["name"], "-p", "SHA256SUMS",
-                   "-D", str(dest)]
-        subprocess.run(cmd, check=True)
-    return 0
-
-
-def existing_bundle(name: str) -> str:
-    """Download URL of an unexpired artifact of an earlier bundle build with the same name ("" if none)."""
-    if not os.environ.get("GITHUB_TOKEN"):
-        return ""
-    try:
-        arts = catalog.api(f"actions/artifacts?name={name}&per_page=20")["artifacts"]
-    except OSError:
-        return ""
-    arts = sorted((a for a in arts if not a["expired"]), key=lambda a: a["created_at"], reverse=True)
-    if not arts:
-        return ""
     repo = os.environ.get("GITHUB_REPOSITORY") or "IOL0ol1/onnxruntime-cicd"
-    return f"https://github.com/{repo}/actions/runs/{arts[0]['workflow_run']['id']}/artifacts/{arts[0]['id']}"
+    gh = shutil.which("gh") or "gh"
+    for p in plan["packages"]:
+        dest = args.dest / p["package"]
+        dest.mkdir(parents=True, exist_ok=True)
+        run = (p["reuse"] or {}).get("run") or os.environ.get("GITHUB_RUN_ID")
+        if not run:
+            raise SystemExit(f"{p['package']} was not reused and GITHUB_RUN_ID is not set")
+        print(f"==> {p['package']}: {p['build']['artifact']} (run {run})", flush=True)
+        subprocess.run([gh, "run", "download", run, "-R", repo, "-n", p["build"]["artifact"], "-D", str(dest)],
+                       check=True)
+    return 0
 
 
 def pe_version(path: Path) -> tuple[int, ...] | None:
@@ -683,7 +665,7 @@ def cmd_assemble(args: argparse.Namespace) -> int:
     if stage.exists():
         shutil.rmtree(stage)
     stage.mkdir(parents=True)
-    packages = [plan["core"]["package"] if plan["core"] else CUSTOM_CORE] + [p["package"] for p in plan["plugins"]]
+    packages = [p["package"] for p in plan["packages"]]
     owners: dict[str, str] = {}
     conflicts: list[dict] = []
     build_infos: dict[str, dict] = {}
@@ -773,8 +755,8 @@ def main(argv: list[str]) -> int:
     r.add_argument("--plan", type=Path, required=True, help="output: plan.json")
     r.add_argument("--github-output", type=Path, help="append the plan's settings to this file ($GITHUB_OUTPUT); "
                                                       "an invalid request then sets ok=false and error= instead of failing")
-    r.add_argument("--reuse-existing", action="store_true",
-                   help="look for an unexpired artifact of an earlier build of the same bundle (existing_url=)")
+    r.add_argument("--no-reuse", action="store_true",
+                   help="build every package and the bundle again instead of reusing earlier artifacts")
     d = sub.add_parser("download", help="download the packages of a plan with the GitHub CLI")
     d.add_argument("--plan", type=Path, required=True)
     d.add_argument("--dest", type=Path, required=True)
