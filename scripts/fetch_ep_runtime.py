@@ -18,6 +18,11 @@ Or select EPs and a target explicitly:
     python scripts/fetch_ep_runtime.py --ep qnn --target aarch64-pc-windows-msvc --dry-run
     python scripts/fetch_ep_runtime.py --list
 
+An EP can be suffixed with the parts to fetch: `cuda:runtime` (the default), `cuda:dev` (the backend's headers into
+include/<backend>/ and its import libraries into lib/, which the vendors' licenses do not let us redistribute) or
+`cuda:runtime+dev`. Bundles built from a bundle request (ci/bundle.py) record what they still need in
+BUNDLE_INFO.json; their fetch-restricted script runs this script with --package-dir on the bundle.
+
 Only the Python standard library is required (.tar.zst archives also need a `tar` with zstd support).
 """
 
@@ -76,6 +81,15 @@ QAIRT_SKELS = {
 }
 LICENSE_FILE = re.compile(r"(?i)^[^/]+(/[^/]+)?/(license|eula|notice|acknowledg)[^/]*$|\.dist-info/licenses/[^/]+$")
 SKIP_DIRS = re.compile(r"(?i)/(samples?|python|doc|docs|include|targets/[^/]+/lib/stubs|stubs)/")
+SKIP_DEV_DIRS = re.compile(r"(?i)/(samples?|python|doc|docs)/")
+PARTS = ("runtime", "dev")
+
+
+@dataclass
+class DevRule:
+    """A development file rule: archive paths matching `pattern` go to <root>/<dest>/<the pattern's "rel" group>."""
+    pattern: str
+    dest: str
 
 
 @dataclass
@@ -85,6 +99,7 @@ class Selection:
     patterns: list[str] = field(default_factory=list)       # regexes on the path inside the archive
     archives: list[str] = field(default_factory=list)       # only download archives whose name starts with one of these
     install: bool = False                                    # run the vendor installer instead of extracting
+    dev: list[DevRule] = field(default_factory=list)        # headers / import libraries, keeping their directory tree
 
 
 def _libs(os_name: str, *pairs: tuple[str, str]) -> list[str]:
@@ -118,7 +133,48 @@ def selections_for(ep: str, os_name: str, qnn_abi: str) -> list[Selection]:
         return [Selection("vitisai", [r"onnxruntime/capi/[^/]+\.dll$"], ["voe-"])]
     if ep == "cann":
         return [Selection("cann", install=True)]
+    if ep == "openvino":
+        return []  # the packages bundle the OpenVINO runtime
     raise SystemExit(f"unknown EP: {ep}")
+
+
+def _headers(subdir: str, dest: str, depth: int = 1) -> DevRule:
+    """Headers below <top-level dirs>/<subdir>/ (archives have `depth` top-level directories) into dest/."""
+    # extension-less files are C++ standard-library style headers (CCCL's cuda/std/version, ...)
+    return DevRule(rf"^(?:[^/]+/){{{depth}}}{subdir}/(?P<rel>.+\.(?:h|hpp|hxx|inl|inc|cuh|cu)|(?:.+/)?[^/.]+)$", dest)
+
+
+def _import_libs(platform: str, os_name: str, names: str, subdir: str = "lib", depth: int = 1) -> list[DevRule]:
+    """Windows import libraries below <top-level dirs>/<subdir>/[x64|arm64/] into lib/ (the bundled .so files serve
+    as link files elsewhere)."""
+    if os_name != "windows":
+        return []
+    arch = "arm64" if platform == "windows-arm64" else "x64"
+    return [DevRule(rf"^(?:[^/]+/){{{depth}}}{subdir}/(?:{arch}/)?(?P<rel>(?:{names})\.lib)$", "lib")]
+
+
+def dev_selections_for(ep: str, platform: str, os_name: str, cuda_major: str) -> list[Selection]:
+    """The headers and import libraries of an EP's backend SDK, laid out like the bundles' own backend files."""
+    cuda_archives = [*CUDA_ARCHIVES.values(), "cuda_crt", "cccl", "cuda_cccl"] + (["cuda_nvcc"] if cuda_major == "12" else [])
+    cuda = Selection("cuda", archives=cuda_archives,
+                     dev=[_headers("include", "include/cuda"),
+                          *_import_libs(platform, os_name, "cudart|cublas|cublasLt|cufft|curand|nvrtc|nvJitLink|cuda")])
+    if ep == "cuda":
+        return [cuda, Selection("cudnn", dev=[_headers("include", "include/cudnn"),
+                                              *_import_libs(platform, os_name, r"cudnn[\w]*")])]
+    if ep == "tensorrt":
+        return [cuda, Selection("tensorrt", dev=[_headers("include", "include/tensorrt"),
+                                                 *_import_libs(platform, os_name, r"nvinfer[\w]*|nvonnxparser[\w]*")])]
+    if ep == "nv-tensorrt-rtx":
+        return [cuda, Selection("tensorrt-rtx", dev=[_headers("include", "include/tensorrt_rtx"),
+                                                     *_import_libs(platform, os_name, r"tensorrt[\w]*")])]
+    if ep == "qnn":  # the zip holds qairt/<version>/include/QNN/; QNN backends are loaded at run time, not linked
+        return [Selection("qairt", dev=[_headers("include/QNN", "include/qnn", depth=2)])]
+    if ep == "openvino":
+        return [Selection("openvino", dev=[_headers("runtime/include", "include"),
+                                           *_import_libs(platform, os_name, r"openvino[\w]*",
+                                                         "runtime/lib/intel64/Release")])]
+    return []  # Vitis AI and CANN have no separate development files
 
 
 EPS = {
@@ -128,6 +184,7 @@ EPS = {
     "qnn": "Qualcomm QNN EP (in-tree or plugin): QAIRT backends and Hexagon skel libraries",
     "vitisai": "AMD Vitis AI EP: closed-source backend DLLs from the voe wheel (Windows x64)",
     "cann": "Huawei CANN EP: installs the CANN toolkit (its libraries need the full install and set_env.sh)",
+    "openvino": "Intel OpenVINO EP: development files only (OpenVINO headers and import libraries)",
 }
 # (recipe, variant) in BUILD_INFO.json -> EPs whose closed-source runtime files the package does not bundle
 # (the QNN and TensorRT RTX packages already contain theirs)
@@ -144,16 +201,31 @@ def _wanted(path: str, patterns: list[re.Pattern]) -> bool:
     return not SKIP_DIRS.search("/" + path) and any(p.search(path) for p in patterns)
 
 
-def extract_selected(archive: Path, patterns: list[re.Pattern], dest: Path, licenses: Path) -> list[str]:
-    """Copy matching files from archive into dest (flattened); license files go to licenses/. Returns copied names."""
+def _dev_target(path: str, dev: list[tuple[re.Pattern, Path]]) -> Path | None:
+    """Where a development file goes (None: not one)."""
+    if SKIP_DEV_DIRS.search("/" + path):
+        return None
+    for pattern, dest in dev:
+        if m := pattern.search(path):
+            return dest / m.group("rel")
+    return None
+
+
+def extract_selected(archive: Path, patterns: list[re.Pattern], dest: Path, licenses: Path,
+                     dev: list[tuple[re.Pattern, Path]] = ()) -> list[str]:
+    """Copy matching files from archive: runtime files into dest (flattened), development files to the targets of
+    their dev rules (keeping their directory tree), license files into licenses/. Returns the copied names."""
     copied: list[str] = []
     name = archive.name.lower()
+    selected = lambda m: LICENSE_FILE.search(m) or _wanted(m, patterns) or _dev_target(m, dev)
 
     def store(member: str, data: bytes) -> None:
         if LICENSE_FILE.search(member):
             target = licenses / member.replace("/", "__")
         elif _wanted(member, patterns):
             target = dest / Path(member).name
+            copied.append(target.name)
+        elif target := _dev_target(member, dev):
             copied.append(target.name)
         else:
             return
@@ -163,26 +235,26 @@ def extract_selected(archive: Path, patterns: list[re.Pattern], dest: Path, lice
     if name.endswith((".zip", ".whl")):
         with zipfile.ZipFile(archive) as zf:
             for info in zf.infolist():
-                if not info.is_dir() and (LICENSE_FILE.search(info.filename) or _wanted(info.filename, patterns)):
+                if not info.is_dir() and selected(info.filename):
                     store(info.filename, zf.read(info))
     elif name.endswith(".zst"):  # Python's tarfile cannot read zstd before 3.14; use the system tar
         listing = subprocess.run(["tar", "--zstd", "-tf", str(archive)], check=True, capture_output=True, text=True).stdout
-        members = [m for m in listing.splitlines() if not m.endswith("/") and (LICENSE_FILE.search(m) or _wanted(m, patterns))]
+        members = [m for m in listing.splitlines() if not m.endswith("/") and selected(m)]
         with tempfile.TemporaryDirectory() as tmp:
             if members:
                 subprocess.run(["tar", "--zstd", "-xf", str(archive), "-C", tmp, *members], check=True)
             for m in members:
                 src = Path(tmp) / m
-                if src.is_symlink() and os.name != "nt":
+                if src.is_symlink() and os.name != "nt" and _wanted(m, patterns):
                     _symlink(dest, src.name, os.readlink(src), copied)
                 elif src.is_file():
                     store(m, src.read_bytes())
     else:
         with tarfile.open(archive, "r|*") as tf:  # streaming: no random access into multi-GB tarballs
             for member in tf:
-                if not (LICENSE_FILE.search(member.name) or _wanted(member.name, patterns)):
+                if not selected(member.name):
                     continue
-                if member.issym() and os.name != "nt":
+                if member.issym() and os.name != "nt" and _wanted(member.name, patterns):
                     _symlink(dest, Path(member.name).name, member.linkname, copied)
                 elif member.isfile():
                     store(member.name, tf.extractfile(member).read())
@@ -226,20 +298,53 @@ def pins_from_build_info(sdks: dict[str, str]) -> dict[str, str]:
     return pins
 
 
+def parse_eps(values: list[str]) -> dict[str, set[str]]:
+    """["cuda", "qnn:dev", "tensorrt:runtime+dev"] -> {EP: parts}; a bare EP means its runtime files."""
+    eps: dict[str, set[str]] = {}
+    for value in values:
+        ep, _, parts = value.partition(":")
+        parts = set((parts or "runtime").split("+"))
+        if ep not in EPS or not parts <= set(PARTS):
+            raise SystemExit(f"invalid --ep {value!r}: use <ep>[:runtime|dev|runtime+dev] with an EP from {', '.join(EPS)}")
+        eps.setdefault(ep, set()).update(parts)
+    return eps
+
+
+def merge_selections(sels: list[Selection]) -> dict[str, Selection]:
+    """Merge the selections of several EPs per component (an empty archive list means all archives)."""
+    merged: dict[str, Selection] = {}
+    for sel in sels:
+        cur = merged.get(sel.component)
+        if cur is None:
+            merged[sel.component] = Selection(sel.component, list(sel.patterns), list(sel.archives), sel.install,
+                                              list(sel.dev))
+            continue
+        cur.install = cur.install or sel.install
+        cur.patterns += [p for p in sel.patterns if p not in cur.patterns]
+        cur.dev += [r for r in sel.dev if r not in cur.dev]
+        cur.archives = cur.archives + [a for a in sel.archives if a not in cur.archives] \
+            if cur.archives and sel.archives else []
+    return merged
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description="Download closed-source EP runtimes and extract only the runtime files")
     ap.add_argument("--list", action="store_true", help="list the supported EPs")
-    ap.add_argument("--package-dir", type=Path, help="extracted release package; EPs, target and versions come from BUILD_INFO.json")
-    ap.add_argument("--ep", nargs="+", choices=sorted(EPS), help="EPs to fetch runtimes for")
+    ap.add_argument("--package-dir", type=Path, help="extracted release package or bundle; EPs, target and versions come "
+                                                     "from its BUILD_INFO.json / BUNDLE_INFO.json")
+    ap.add_argument("--ep", nargs="+", metavar="EP[:PARTS]",
+                    help=f"EPs to fetch for ({', '.join(EPS)}), optionally with the parts: runtime (default), dev, "
+                         "runtime+dev")
     ap.add_argument("--target", choices=sorted(TARGETS), help="target triple (default: from BUILD_INFO.json or this host)")
     ap.add_argument("--cuda-major", choices=("12", "13"), help="CUDA major version (default: from BUILD_INFO.json, else 13)")
     ap.add_argument("--pin", nargs="+", default=[], metavar="NAME=VER", help="override SDK versions, same syntax as download_ep_packages.py")
-    ap.add_argument("--dest", type=Path, help="output directory (default: the package's bin/ on Windows or lib/ elsewhere, "
-                                              "otherwise ./ep-runtime/<target>)")
+    ap.add_argument("--dest", type=Path, help="output directory of the runtime files (default: the package's bin/ on "
+                                              "Windows or lib/ elsewhere, otherwise ./ep-runtime/<target>)")
     ap.add_argument("--cache", type=Path, default=dl.DEFAULT_DEST, help=f"download cache (default: {dl.DEFAULT_DEST})")
-    ap.add_argument("--licenses-dir", type=Path, help="where the license texts go (default: <dest>/third_party_licenses); "
-                                                      "THIRD_PARTY_RUNTIME.json is written next to it")
+    ap.add_argument("--licenses-dir", type=Path, help="where the license texts go (default: <package-dir or dest>/"
+                                                      "third_party_licenses); THIRD_PARTY_RUNTIME.json is written next to it")
     ap.add_argument("--dry-run", action="store_true", help="resolve the SDK files and show the extraction rules only")
+    ap.add_argument("--yes", action="store_true", help="accept the vendor licenses a bundle lists without asking")
     args = ap.parse_args(argv)
     for stream in (sys.stdout, sys.stderr):
         if not stream.isatty() and hasattr(stream, "reconfigure"):
@@ -253,27 +358,41 @@ def main(argv: list[str]) -> int:
 
     info: dict = {}
     if args.package_dir:
-        info_file = args.package_dir / "BUILD_INFO.json"
-        if not info_file.exists():
-            raise SystemExit(f"{info_file} not found")
-        info = json.loads(info_file.read_text(encoding="utf-8"))
+        bundle_file, info_file = args.package_dir / "BUNDLE_INFO.json", args.package_dir / "BUILD_INFO.json"
+        if bundle_file.exists():  # a bundle: ci/bundle.py records what it still needs
+            info = json.loads(bundle_file.read_text(encoding="utf-8"))["fetch_restricted"]
+        elif info_file.exists():
+            info = json.loads(info_file.read_text(encoding="utf-8"))
+        else:
+            raise SystemExit(f"neither {bundle_file} nor {info_file} found")
     target = args.target or info.get("target_triple") or next(
         (t for t, v in TARGETS.items() if v[0] == dl.detect_platform()), None)
     if target not in TARGETS:
         raise SystemExit(f"target {target} has no closed-source runtime to fetch (supported: {', '.join(TARGETS)})")
     platform, os_name, qnn_abi = TARGETS[target]
 
-    eps = args.ep
-    if not eps:
+    if args.ep or "eps" in info:
+        eps = parse_eps(args.ep or info["eps"])
+    else:
         recipe, _, variant = info.get("recipe", "/").partition("/")
-        eps = PACKAGE_EPS.get((recipe, variant or "default"), [])
+        names = PACKAGE_EPS.get((recipe, variant or "default"), [])
         if (recipe, variant) == ("ort", "default") and target == "x86_64-pc-windows-msvc":
-            eps = ["vitisai"]  # the default Windows x64 package includes the Vitis AI bridge
+            names = ["vitisai"]  # the default Windows x64 package includes the Vitis AI bridge
         if (recipe, variant) == ("ort", "all"):  # the EP set depends on the target; follow the SDKs it was built with
-            eps = [ep for ep in ("cuda", "tensorrt", "cann") if ep in info.get("third_party_sdks", {})]
-        if not eps:
-            print("nothing to do: this package does not use a closed-source SDK at runtime")
-            return 0
+            names = [ep for ep in ("cuda", "tensorrt", "cann") if ep in info.get("third_party_sdks", {})]
+        eps = parse_eps(names)
+    if not eps:
+        print("nothing to do: no closed-source SDK files are needed")
+        return 0
+    if info.get("licenses") and not args.dry_run:
+        print("The files are downloaded from their vendors and are subject to the vendors' licenses:")
+        for lic in info["licenses"]:
+            print(f"  {lic['name']}: {lic['license']}")
+        if not args.yes:
+            if not sys.stdin.isatty():
+                raise SystemExit("run again with --yes to accept these licenses")
+            if input("Accept these licenses and continue? [y/N] ").strip().lower() not in ("y", "yes"):
+                return 1
     cuda_major = args.cuda_major or info.get("cuda_major") or "13"
     pins = pins_from_build_info(info.get("third_party_sdks", {}))
     pins.update(dict(p.split("=", 1) for p in args.pin))
@@ -285,19 +404,20 @@ def main(argv: list[str]) -> int:
     else:
         dest = Path("ep-runtime") / target
     dest = dest.resolve()
-    licenses = args.licenses_dir.resolve() if args.licenses_dir else dest / "third_party_licenses"
+    root = (args.package_dir or dest).resolve()  # development files go to its include/ and lib/
+    licenses = args.licenses_dir.resolve() if args.licenses_dir else root / "third_party_licenses"
 
-    # Merge the selections of all requested EPs per component
-    merged: dict[str, Selection] = {}
-    for ep in eps:
-        for sel in selections_for(ep, os_name, qnn_abi):
-            cur = merged.setdefault(sel.component, Selection(sel.component, [], [], sel.install))
-            cur.patterns += [p for p in sel.patterns if p not in cur.patterns]
-            cur.archives += [a for a in sel.archives if a not in cur.archives]
-
-    print(f"target {target}, EPs: {', '.join(eps)}, CUDA {cuda_major}.x, output: {dest}")
+    merged = merge_selections([sel for ep, parts in eps.items() for sel in
+                               (selections_for(ep, os_name, qnn_abi) if "runtime" in parts else []) +
+                               (dev_selections_for(ep, platform, os_name, cuda_major) if "dev" in parts else [])])
+    labels = ", ".join(f"{ep}:{'+'.join(sorted(parts))}" for ep, parts in eps.items())
+    print(f"target {target}, EPs: {labels}, CUDA {cuda_major}.x, runtime files: {dest}, development files: {root}")
     ctx = dl.Context(platform, cuda_major, "ubuntu24", pins)
-    report = {"target_triple": target, "eps": eps, "components": {}}
+    report_file = licenses.parent / "THIRD_PARTY_RUNTIME.json"
+    report = json.loads(report_file.read_text(encoding="utf-8")) if report_file.exists() else {}
+    report["target_triple"] = target
+    report["eps"] = sorted(set(report.get("eps", [])) | {f"{ep}:{p}" for ep, parts in eps.items() for p in parts})
+    components = report.setdefault("components", {})
     for comp_name, sel in merged.items():
         comp = dl.component(comp_name)
         print(f"==> {comp_name}")
@@ -305,28 +425,35 @@ def main(argv: list[str]) -> int:
         out, resolved = dl.fetch(comp, ctx, args.cache.resolve(), dry_run=args.dry_run, file_filter=file_filter)
         files = resolved.files
         if args.dry_run:
-            for p in sel.patterns or ["(vendor installer)"]:
+            for p in sel.patterns or ([] if sel.dev else ["(vendor installer)"]):
                 print(f"    extract: {p}")
+            for r in sel.dev:
+                print(f"    develop: {r.pattern} -> {r.dest}/")
             continue
-        entry = {"version": resolved.version, "source": comp.source, "files": []}
+        entry = components.setdefault(comp_name, {"files": []})
+        entry.update({"version": resolved.version, "source": comp.source})
         if sel.install:
             prefix = install_cann(out / files[0].filename, dest)
             entry["install_prefix"] = str(prefix)
             print(f"    installed to {prefix}; run `source {prefix}/cann/set_env.sh` (8.x: ascend-toolkit/set_env.sh) before use")
         else:
             patterns = [re.compile(p) for p in sel.patterns]
+            dev = [(re.compile(r.pattern), root / r.dest) for r in sel.dev]
+            new: list[str] = []
             for f in files:
-                entry["files"] += extract_selected(out / f.filename, patterns, dest, licenses / comp_name)
-            if not entry["files"]:
-                raise SystemExit(f"no runtime files matched in {comp_name} {resolved.version}")
-            print(f"    {len(entry['files'])} files: {', '.join(sorted(set(entry['files'])))}")
-        report["components"][comp_name] = entry
+                new += extract_selected(out / f.filename, patterns, dest, licenses / comp_name, dev)
+            if not new:
+                raise SystemExit(f"no matching files in {comp_name} {resolved.version}")
+            entry["files"] = sorted(set(entry.get("files", [])) | set(new))
+            shown = sorted(set(new))
+            print(f"    {len(shown)} files: {', '.join(shown[:40])}{' ...' if len(shown) > 40 else ''}")
 
     if not args.dry_run:
         report["note"] = ("These files are third-party software under their vendors' licenses (see third_party_licenses/), "
                           "not under the license of the ONNX Runtime binaries next to them.")
-        (licenses.parent / "THIRD_PARTY_RUNTIME.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-        print(f"done: runtime files in {dest}, license texts in {licenses}")
+        report_file.parent.mkdir(parents=True, exist_ok=True)
+        report_file.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        print(f"done: runtime files in {dest}, development files in {root}, license texts in {licenses}")
     return 0
 
 

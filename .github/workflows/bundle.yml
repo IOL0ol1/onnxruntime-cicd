@@ -1,0 +1,260 @@
+# Bundle requests: an issue created from the configurator page (GitHub Pages, site/) with the bundle form
+# (.github/ISSUE_TEMPLATE/bundle.yml) builds one package with the selected core and EPs and links it in the issue.
+#
+# - Only collaborators trigger builds: issues and /rebuild comments of anyone else are ignored.
+# - ci/bundle.py resolve validates the configuration against the package source it names (a release or a build run)
+#   and plans the bundle; a custom core (compile mode) is built like a matrix entry with ci/build.py --variant custom.
+# - The bundle is uploaded as an artifact (90 days; downloading needs a GitHub login). Third-party files whose licenses
+#   do not allow redistributing them are fetched on the user's machine by fetch-restricted.(sh|ps1) in the bundle.
+# - Editing the issue rebuilds it; a comment starting with /rebuild rebuilds it even if the same bundle exists.
+
+name: bundle
+
+on:
+  issues:
+    types: [opened, edited, reopened]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  issues: write  # status comment, closing the issue
+  actions: read  # packages and earlier bundles from workflow artifacts
+
+concurrency:
+  group: bundle-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: utf-8
+  CUDA_ARCHITECTURES: ${{ vars.CUDA_ARCHITECTURES || '80-real;80-virtual' }}
+  MIGRAPHX_GPU_TARGETS: ${{ vars.MIGRAPHX_GPU_TARGETS }}
+  CMAKE_VERSION: "4.2.3"
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+  STATUS_MARKER: "<!-- onnxruntime-bundle-status -->"
+
+jobs:
+  resolve:
+    if: >-
+      startsWith(github.event.issue.title, '[bundle]') && !github.event.issue.pull_request && (
+        (github.event_name == 'issues' &&
+         contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association)) ||
+        (github.event_name == 'issue_comment' && startsWith(github.event.comment.body, '/rebuild') &&
+         contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)))
+    runs-on: ubuntu-24.04
+    outputs:
+      ok: ${{ steps.resolve.outputs.ok }}
+      key: ${{ steps.resolve.outputs.key }}
+      name: ${{ steps.resolve.outputs.name }}
+      summary: ${{ steps.resolve.outputs.summary }}
+      existing_url: ${{ steps.resolve.outputs.existing_url }}
+      compile: ${{ steps.resolve.outputs.compile }}
+      triple: ${{ steps.resolve.outputs.triple }}
+      runner: ${{ steps.resolve.outputs.runner }}
+      msvc_arch: ${{ steps.resolve.outputs.msvc_arch }}
+      docker: ${{ steps.resolve.outputs.docker }}
+      apt: ${{ steps.resolve.outputs.apt }}
+      toolset: ${{ steps.resolve.outputs.toolset }}
+      cuda_major: ${{ steps.resolve.outputs.cuda_major }}
+      eps: ${{ steps.resolve.outputs.eps }}
+      comment_id: ${{ steps.status.outputs.comment-id }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Resolve the request
+        id: resolve
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RUNNER_MAP: ${{ vars.RUNNER_MAP }}
+          HEAVY_RUNNER_MAP: ${{ vars.HEAVY_RUNNER_MAP }}
+          REUSE: ${{ github.event_name == 'issues' }}  # /rebuild builds again
+        run: >-
+          python ci/bundle.py resolve --event "$GITHUB_EVENT_PATH" --plan "$RUNNER_TEMP/plan/plan.json"
+          --github-output "$GITHUB_OUTPUT" $( [ "$REUSE" = true ] && echo --reuse-existing )
+
+      - name: Find the status comment
+        id: find
+        uses: peter-evans/find-comment@v4
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          comment-author: github-actions[bot]
+          body-includes: ${{ env.STATUS_MARKER }}
+
+      - name: Report the plan
+        id: status
+        uses: peter-evans/create-or-update-comment@v5
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          comment-id: ${{ steps.find.outputs.comment-id }}
+          edit-mode: replace
+          body: |
+            ${{ env.STATUS_MARKER }}
+            ${{ steps.resolve.outputs.ok != 'true' && format('❌ **This request cannot be built:** {0}', steps.resolve.outputs.error) || '' }}
+            ${{ steps.resolve.outputs.ok == 'true' && steps.resolve.outputs.existing_url != '' && format('✅ **This bundle was built before:** [{0}]({1}) (download needs a GitHub login; comment `/rebuild` to build it again)', steps.resolve.outputs.name, steps.resolve.outputs.existing_url) || '' }}
+            ${{ steps.resolve.outputs.ok == 'true' && steps.resolve.outputs.existing_url == '' && format('⏳ **Building** `{0}` in [run {1}]({2}/{3}/actions/runs/{1})', steps.resolve.outputs.name, github.run_id, github.server_url, github.repository) || '' }}
+
+            ${{ steps.resolve.outputs.summary }}
+
+      - name: Close the issue (the bundle exists)
+        if: steps.resolve.outputs.existing_url != ''
+        uses: actions/github-script@v9
+        with:
+          script: |
+            await github.rest.issues.update({...context.repo, issue_number: context.issue.number,
+                                             state: 'closed', state_reason: 'completed'});
+
+      - name: Fail on an invalid request
+        if: steps.resolve.outputs.ok != 'true'
+        run: exit 1
+
+      - uses: actions/upload-artifact@v7
+        if: steps.resolve.outputs.ok == 'true' && steps.resolve.outputs.existing_url == ''
+        with:
+          name: bundle-plan-${{ steps.resolve.outputs.key }}
+          path: ${{ runner.temp }}/plan/plan.json
+          retention-days: 7
+
+  # Compile mode: a custom core with the selected in-tree EPs, built like a matrix entry
+  compile:
+    needs: resolve
+    if: needs.resolve.outputs.ok == 'true' && needs.resolve.outputs.existing_url == '' && needs.resolve.outputs.compile == 'true'
+    name: compile core · ${{ needs.resolve.outputs.triple }}
+    runs-on: ${{ needs.resolve.outputs.runner }}
+    timeout-minutes: 360
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/build-entry
+        with:
+          recipe: ort
+          variant: custom
+          eps: ${{ needs.resolve.outputs.eps }}
+          triple: ${{ needs.resolve.outputs.triple }}
+          cuda-major: ${{ needs.resolve.outputs.cuda_major }}
+          submodules: onnxruntime
+          docker: ${{ needs.resolve.outputs.docker }}
+          apt: ${{ needs.resolve.outputs.apt }}
+          msvc-arch: ${{ needs.resolve.outputs.msvc_arch }}
+          msvc-toolset: ${{ needs.resolve.outputs.toolset }}
+
+      - name: Package
+        env:
+          TRIPLE: ${{ needs.resolve.outputs.triple }}
+          KEY: ${{ needs.resolve.outputs.key }}
+          CUDA_MAJOR: ${{ needs.resolve.outputs.cuda_major }}
+          EPS: ${{ needs.resolve.outputs.eps }}
+        run: >-
+          python ci/package.py --stage "$STAGE_DIR" --name onnxruntime-custom --triple "$TRIPLE" --version "custom-$KEY"
+          --source onnxruntime --sdk-versions "$SDK_ROOT/sdk-versions.json" --out "$DIST_DIR"
+          --extra "cuda_architectures=${CUDA_ARCHITECTURES}" "cuda_major=$CUDA_MAJOR" "recipe=ort/custom" "eps=$EPS"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bundle-core-${{ needs.resolve.outputs.key }}
+          path: ${{ runner.temp }}/dist/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  assemble:
+    needs: [resolve, compile]
+    if: >-
+      always() && needs.resolve.outputs.ok == 'true' && needs.resolve.outputs.existing_url == '' &&
+      (needs.compile.result == 'success' || needs.compile.result == 'skipped')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      # CUDA / cuDNN / TensorRT downloads and the bundle itself take several GB
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v2
+        with:
+          large-packages: false
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: bundle-plan-${{ needs.resolve.outputs.key }}
+          path: ${{ runner.temp }}/plan
+
+      - name: Download the packages
+        run: python ci/bundle.py download --plan "$RUNNER_TEMP/plan/plan.json" --dest "$RUNNER_TEMP/packages"
+
+      - name: Download the compiled core
+        if: needs.resolve.outputs.compile == 'true'
+        uses: actions/download-artifact@v8
+        with:
+          name: bundle-core-${{ needs.resolve.outputs.key }}
+          path: ${{ runner.temp }}/packages/onnxruntime-custom
+
+      - name: Assemble the bundle
+        env:
+          BUNDLE_ISSUE_URL: ${{ github.event.issue.html_url }}
+          BUNDLE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: >-
+          python ci/bundle.py assemble --plan "$RUNNER_TEMP/plan/plan.json" --packages "$RUNNER_TEMP/packages"
+          --work "$RUNNER_TEMP/work" --out "$RUNNER_TEMP/dist" --cache "$RUNNER_TEMP/sdk-cache"
+
+      - name: Upload the bundle
+        id: upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ needs.resolve.outputs.name }}
+          path: ${{ runner.temp }}/dist/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 90
+
+      - name: Report the bundle
+        uses: peter-evans/create-or-update-comment@v5
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          comment-id: ${{ needs.resolve.outputs.comment_id }}
+          edit-mode: replace
+          body: |
+            ${{ env.STATUS_MARKER }}
+            ✅ **Bundle ready:** [${{ needs.resolve.outputs.name }}](${{ steps.upload.outputs.artifact-url }}) (download needs a GitHub login; kept for 90 days). Built in [run ${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}).
+
+            The archive inside contains `README.md`; when it lists files you fetch yourself, run `fetch-restricted.sh` / `fetch-restricted.ps1` once after extracting it.
+
+            ${{ needs.resolve.outputs.summary }}
+
+      - name: Close the issue
+        uses: actions/github-script@v9
+        with:
+          script: |
+            await github.rest.issues.update({...context.repo, issue_number: context.issue.number,
+                                             state: 'closed', state_reason: 'completed'});
+
+  report-failure:
+    needs: [resolve, compile, assemble]
+    if: always() && needs.resolve.outputs.ok == 'true' && (needs.compile.result == 'failure' || needs.assemble.result == 'failure')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: peter-evans/create-or-update-comment@v5
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          comment-id: ${{ needs.resolve.outputs.comment_id }}
+          edit-mode: replace
+          body: |
+            ${{ env.STATUS_MARKER }}
+            ❌ **The bundle build failed** in [run ${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) (${{ needs.compile.result == 'failure' && 'compiling the custom core' || 'assembling the bundle' }}). Comment `/rebuild` to try again.
+
+            ${{ needs.resolve.outputs.summary }}

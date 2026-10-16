@@ -6,7 +6,7 @@ Scope (obsolete / deprecated EPs are ignored):
   - Open-source SDKs that must be installed beforehand: OpenVINO, ROCm, Android NDK, Vulkan SDK,
     ONNX Runtime prebuilt packages (used by plugin EP builds)
   - Open-source dependencies whose sources must be prepared before building (shallow git clone):
-    AMDMIGraphX, TIM-VX, zDNN, Compass NPU Driver
+    AMDMIGraphX, TIM-VX, zDNN
 
 Every source is an official direct link or official mirror that requires no account (NVIDIA redist /
 developer.download.nvidia.com, Qualcomm softwarecenter public API, Huawei Cloud Ascend artifactory,
@@ -175,10 +175,12 @@ def github_tags(repo: str) -> list[str]:
 
 def read_submodule(rel: str) -> str:
     """Read a file of a submodule; when the submodule is not checked out (e.g. the CI plan job), fetch the file from
-    GitHub at the commit the superproject records, so the result is the same."""
+    GitHub at the commit the superproject records, so the result is the same. A copy of this script outside the
+    repository (the tools/ of a bundle, see ci/bundle.py) reads the snapshots in submodule-files/ next to it."""
+    for path in (ROOT / rel, Path(__file__).with_name("submodule-files") / rel):
+        if path.exists():
+            return path.read_text(encoding="utf-8")
     path = ROOT / rel
-    if path.exists():
-        return path.read_text(encoding="utf-8")
     try:
         names = subprocess.run(["git", "config", "--file", str(ROOT / ".gitmodules"), "--get-regexp", r"\.path$"],
                                capture_output=True, text=True, cwd=ROOT, check=True).stdout.split()
@@ -519,10 +521,6 @@ COMPONENTS: tuple[Component, ...] = (
               _git_resolver("VeriSilicon/TIM-VX", _latest_tag("VeriSilicon/TIM-VX")), "github.com/VeriSilicon/TIM-VX"),
     Component("zdnn", "IBM Telum plugin EP (libzdnn is dlopen'ed at runtime)", ("linux-s390x",), LATEST,
               _git_resolver("IBM/zDNN", _latest_tag("IBM/zDNN")), "github.com/IBM/zDNN"),
-    Component("compass-npu-driver",
-              "Arm China Zhouyi NPU runtime driver (building the Zhouyi EP also needs the closed-source Compass "
-              "toolchain, which has no public download)", ("linux-x86_64", "linux-aarch64"), "main",
-              _git_resolver("Arm-China/Compass_NPU_Driver", lambda: "main"), "github.com/Arm-China/Compass_NPU_Driver"),
 )
 
 

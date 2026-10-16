@@ -102,7 +102,8 @@ class Inputs:
     """
 
     def __init__(self) -> None:
-        self.ci = git("rev-parse", "HEAD:ci", "HEAD:scripts", "HEAD:.github/workflows/build.yml").split()
+        self.ci = git("rev-parse", "HEAD:ci", "HEAD:scripts", "HEAD:.github/workflows/build.yml",
+                      "HEAD:.github/actions").split()
         self.sdks: dict[tuple, str] = {}
         self.images: dict[str, str] = {}
 

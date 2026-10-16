@@ -100,6 +100,8 @@ class Job:
     platform: str = ""
     os: str = ""
     sdks: dict[str, Path] = field(default_factory=dict)
+    # in-tree EPs of a custom core (variant "custom", the compile mode of bundle requests, see ci/bundle.py)
+    eps: list[str] = field(default_factory=list)
     # (component, platform, pinned version or ""), used by ci/plan.py for the build inputs hash
     needed: set[tuple[str, str, str]] = field(default_factory=set)
 
@@ -312,6 +314,66 @@ def dawn_backends(job: Job) -> list[str]:
             "linux": ["onnxruntime_ENABLE_DAWN_BACKEND_VULKAN=1"]}.get(job.os, [])
 
 
+def webgpu_flags(job: Job) -> list[str]:
+    """WebGPU as an internal EP (static_lib), with the Dawn backends of the target."""
+    backends = dawn_backends(job)
+    return ["--use_webgpu", *(["--cmake_extra_defines", *backends] if backends else [])]
+
+
+def nv_tensorrt_rtx_flags(job: Job) -> list[str]:
+    job.need("cuda", "tensorrt-rtx")
+    # onnxruntime_providers_nv.cmake runs find_package(CUDAToolkit), which does not see --cuda_home
+    return ["--use_nv_tensorrt_rtx", "--tensorrt_rtx_home", job.sdks["tensorrt-rtx"], "--cuda_home", job.sdks["cuda"],
+            "--cmake_extra_defines", f"CUDAToolkit_ROOT={job.sdks['cuda']}"]
+
+
+def openvino_flags(job: Job) -> list[str]:
+    job.need("openvino")  # OpenVINO_DIR / INTEL_OPENVINO_DIR are set by ci/sdk.py
+    return ["--use_openvino", "CPU"]
+
+
+def qnn_flags(job: Job) -> list[str]:
+    job.need("qairt")
+    return ["--use_qnn", "--qnn_home", job.sdks["qairt"]]
+
+
+def migraphx_flags(job: Job) -> list[str]:
+    # built inside the rocm/dev-ubuntu container; ROCm and MIGraphX live in /opt/rocm
+    return ["--use_migraphx", "--migraphx_home", os.environ.get("ROCM_PATH", "/opt/rocm")]
+
+
+def cann_flags(job: Job) -> list[str]:
+    job.need("cann")
+    return ["--use_cann", "--cann_home", job.sdks["cann"]]
+
+
+def vsinpu_flags(job: Job) -> list[str]:
+    tim_vx = build_tim_vx(job)
+    if not job.dry_run:
+        os.environ["TIM_VX_INSTALL"] = str(tim_vx)
+    return ["--use_vsinpu"]
+
+
+# In-tree EP -> build.py arguments, for the custom cores of bundle requests (variant "custom"). TensorRT includes the
+# CUDA EP: ORT's build.py always builds them together.
+CUSTOM_EPS: dict[str, Callable[[Job], list[str]]] = {
+    "xnnpack": lambda job: ["--use_xnnpack"],
+    "webgpu": webgpu_flags,
+    "dml": lambda job: ["--use_dml"],
+    "coreml": macos_flags,
+    "dnnl": lambda job: ["--use_dnnl"],
+    "vitisai": lambda job: ["--use_vitisai"],
+    "cuda": cuda_flags,
+    "tensorrt": tensorrt_flags,
+    "nv-tensorrt-rtx": nv_tensorrt_rtx_flags,
+    "openvino": openvino_flags,
+    "qnn": qnn_flags,
+    "migraphx": migraphx_flags,
+    "cann": cann_flags,
+    "vsinpu": vsinpu_flags,
+}
+
+
 def all_builtin_flags(job: Job) -> list[str]:
     """Every built-in EP the target supports.
 
@@ -324,9 +386,7 @@ def all_builtin_flags(job: Job) -> list[str]:
         # the SDKs are only available for the build host platform; x86_64-apple-darwin is cross-compiled on arm64
         return job.triple != "x86_64-apple-darwin" and all(job.platform in sdk.dl.component(n).platforms for n in names)
 
-    flags = ["--use_xnnpack", "--use_webgpu"]  # static_lib: WebGPU as an internal EP
-    if backends := dawn_backends(job):
-        flags += ["--cmake_extra_defines", *backends]
+    flags = ["--use_xnnpack", *webgpu_flags(job)]
     if job.os == "windows":
         flags += ["--use_dml"]
     if job.os == "macos":
@@ -336,10 +396,7 @@ def all_builtin_flags(job: Job) -> list[str]:
     if job.os in ("linux", "windows") and has("cuda", "cudnn", "tensorrt"):
         flags += tensorrt_flags(job)
     if job.os == "linux" and has("cann"):
-        job.need("cann")
-        flags += ["--use_cann", "--cann_home", job.sdks["cann"]]
-        if "--use_cuda" in flags and not job.dry_run:
-            allow_cann_with_cuda(ROOT / "onnxruntime")
+        flags += cann_flags(job)
     return flags
 
 
@@ -383,9 +440,14 @@ def ort_variant(job: Job, src: Path) -> tuple[list[str], Callable[[Job, Path], N
         return flags, None
     if v == "all":
         return all_builtin_flags(job), None
+    if v == "custom":
+        unknown = sorted(set(job.eps) - CUSTOM_EPS.keys())
+        if unknown or not job.eps:
+            raise SystemExit(f"variant custom needs --eps from {sorted(CUSTOM_EPS)} (unknown: {unknown})")
+        eps = [ep for ep in job.eps if not (ep == "cuda" and "tensorrt" in job.eps)]  # TensorRT brings the CUDA EP
+        return [flag for ep in eps for flag in CUSTOM_EPS[ep](job)], None
     if v == "qnn":
-        job.need("qairt")
-        return ["--use_qnn", "--qnn_home", job.sdks["qairt"]], None
+        return qnn_flags(job), None
     if v == "cuda":
         return tensorrt_flags(job), None
     if v == "cuda-plugin":
@@ -397,28 +459,19 @@ def ort_variant(job: Job, src: Path) -> tuple[list[str], Callable[[Job, Path], N
         return flags, \
             lambda j, b: stage_shared_libs(j, b, ["onnxruntime_providers_cuda"])
     if v == "nv-tensorrt-rtx":
-        job.need("cuda", "tensorrt-rtx")
-        # onnxruntime_providers_nv.cmake runs find_package(CUDAToolkit), which does not see --cuda_home
-        return ["--use_nv_tensorrt_rtx", "--tensorrt_rtx_home", job.sdks["tensorrt-rtx"], "--cuda_home", job.sdks["cuda"],
-                "--cmake_extra_defines", f"CUDAToolkit_ROOT={job.sdks['cuda']}"], None
+        return nv_tensorrt_rtx_flags(job), None
     if v == "webgpu-plugin":
         names = ["onnxruntime_providers_webgpu"] + (["dxcompiler"] if job.os == "windows" else [])  # same as the official package
         backends = dawn_backends(job)
         return ["--use_webgpu", "shared_lib", "--wgsl_template", "static",
                 *(["--cmake_extra_defines", *backends] if backends else [])], \
             lambda j, b: stage_shared_libs(j, b, names)
-    if v == "openvino":  # OpenVINO_DIR / INTEL_OPENVINO_DIR are set by ci/sdk.py
-        job.need("openvino")
-        return ["--use_openvino", "CPU"], None
-    if v == "migraphx":  # built inside the rocm/dev-ubuntu container; ROCm and MIGraphX live in /opt/rocm
-        return ["--use_migraphx", "--migraphx_home", os.environ.get("ROCM_PATH", "/opt/rocm")], None
+    if v == "openvino":
+        return openvino_flags(job), None
+    if v == "migraphx":
+        return migraphx_flags(job), None
     if v == "vsinpu":
-        tim_vx = build_tim_vx(job)
-        if not job.dry_run:
-            os.environ["TIM_VX_INSTALL"] = str(tim_vx)
-        return ["--use_vsinpu"], \
-            lambda j, b: (install_ort(j, b), copy_files(j, ["lib/libtim-vx.so*"], tim_vx, j.stage / "lib"),
-                          stage_license(j, "TIM-VX", j.sdks["tim-vx"], ["LICENSE"]))
+        return vsinpu_flags(job), None
     if v == "android":  # same EP set as the official Android AAR
         job.need("android-ndk")
         sdk_path = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT") or ""
@@ -444,6 +497,8 @@ def ort_variant(job: Job, src: Path) -> tuple[list[str], Callable[[Job, Path], N
 def build_ort(job: Job) -> None:
     src = ORT_SOURCES[job.recipe]
     flags, stager = ort_variant(job, src)
+    if "--use_cann" in flags and "--use_cuda" in flags and not job.dry_run:
+        allow_cann_with_cuda(src)
     build_dir = job.work / "build"
     base = [python(), src / "tools/ci_build/build.py", "--config", "Release", "--update", "--build", "--parallel",
             "--skip_tests", "--skip_submodule_sync", "--compile_no_warning_as_error",
@@ -499,6 +554,9 @@ def build_ort(job: Job) -> None:
         bundle_vendor_runtime(job, ["qnn"])
     if "--use_nv_tensorrt_rtx" in flags:
         bundle_vendor_runtime(job, ["nv-tensorrt-rtx"])
+    if "--use_vsinpu" in flags:  # TIM-VX (MIT), built from source by build_tim_vx
+        copy_files(job, ["lib/libtim-vx.so*"], job.work / "tim-vx-install", job.stage / "lib")
+        stage_license(job, "TIM-VX", job.sdks["tim-vx"], ["LICENSE"])
 
 
 def install_ort(job: Job, config_dir: Path) -> None:
@@ -939,6 +997,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--stage", type=Path, required=True, help="staging directory (input of ci/package.py)")
     ap.add_argument("--sdk-root", type=Path, required=True, help="directory where third-party SDKs are extracted")
     ap.add_argument("--cuda-major", default="13", choices=("12", "13"))
+    ap.add_argument("--eps", default="", help="comma-separated in-tree EPs of --variant custom: " + ", ".join(CUSTOM_EPS))
     ap.add_argument("--cuda-archs", default=os.environ.get("CUDA_ARCHITECTURES", DEFAULT_CUDA_ARCHS),
                     help="CMAKE_CUDA_ARCHITECTURES (defaults to the CUDA_ARCHITECTURES environment variable)")
     ap.add_argument("--dry-run", action="store_true")
@@ -950,7 +1009,8 @@ def main(argv: list[str]) -> int:
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8")
     job = Job(args.recipe, args.variant, args.triple, args.work.resolve(), args.stage.resolve(),
-              args.sdk_root.resolve(), args.cuda_major, args.cuda_archs, args.dry_run)
+              args.sdk_root.resolve(), args.cuda_major, args.cuda_archs, args.dry_run,
+              eps=[e for e in args.eps.split(",") if e])
     if args.cache_info:
         if cache := build_cache(job):
             with args.cache_info.open("a", encoding="utf-8") as f:

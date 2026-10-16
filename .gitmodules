@@ -43,11 +43,6 @@
 	url = https://github.com/onnxruntime/onnxruntime-qnn.git
 	shallow = true
 	branch = main
-[submodule "eps/vendor/arm-china-compass-onnxruntime"]
-	path = eps/vendor/arm-china-compass-onnxruntime
-	url = https://github.com/Arm-China/Compass_Onnxruntime.git
-	branch = rel-1.22.0
-	shallow = true
 [submodule "eps/vendor/intel-onnxruntime-openvino"]
 	path = eps/vendor/intel-onnxruntime-openvino
 	url = https://github.com/intel/onnxruntime.git

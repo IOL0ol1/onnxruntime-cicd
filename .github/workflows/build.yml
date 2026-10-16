@@ -22,6 +22,7 @@ on:
     branches: [main]
     paths:
       - ".github/workflows/build.yml"
+      - ".github/actions/**"
       - "ci/**"
       - "scripts/**"
       - ".gitmodules"
@@ -106,136 +107,23 @@ jobs:
       run:
         shell: bash
     steps:
-      - name: Enable long paths (Windows)
-        if: runner.os == 'Windows'
-        run: git config --system core.longpaths true
-
       - uses: actions/checkout@v7
 
-      - name: Free disk space (Linux)
-        if: runner.os == 'Linux' && matrix.reuse_run == ''
-        uses: jlumbroso/free-disk-space@v2
+      - uses: ./.github/actions/build-entry
         with:
-          android: ${{ !matrix.keep_android_sdk }}  # the Android builds use the preinstalled SDK
-          large-packages: false  # removing them with apt takes minutes and frees little that the builds need
-
-      # The runners have 16 GB of RAM and a 4 GB swap file; linking the LTO WebAssembly builds and some EP builds needs
-      # more, and running out of memory shuts the runner down. Under sustained memory pressure systemd-oomd also kills
-      # whole cgroups, which can take the runner service with it; leave out-of-memory handling to the kernel.
-      - name: Add swap and stop systemd-oomd (Linux)
-        if: runner.os == 'Linux' && matrix.reuse_run == ''
-        run: |
-          { sudo fallocate -l 16G /swapfile-ci && sudo chmod 600 /swapfile-ci && sudo mkswap /swapfile-ci > /dev/null &&
-            sudo swapon /swapfile-ci; } || echo "::warning::could not add swap"
-          sudo systemctl stop systemd-oomd.socket systemd-oomd.service || true
-          swapon --show
-
-      - name: Check out required submodules
-        if: matrix.reuse_run == ''
-        run: |
-          for path in ${{ matrix.submodules }}; do
-            git submodule update --init --depth 1 "$path"
-            git -C "$path" submodule update --init --recursive --depth 1
-          done
-
-      # qcom/build_and_test.py of onnxruntime-qnn creates its venv with python3.10 on Linux hosts
-      - uses: actions/setup-python@v7
-        if: matrix.recipe == 'ep-qnn' && runner.os == 'Linux' && matrix.reuse_run == ''
-        with:
-          python-version: "3.10"
-
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-
-      - name: Install build tools
-        if: matrix.reuse_run == ''
-        # jinja2 / MarkupSafe: Dawn's code generator falls back to these when its own fetched copies come back empty
-        run: python -m pip install --upgrade "cmake==${CMAKE_VERSION}" ninja jinja2 markupsafe
-
-      - name: Install system packages (Linux)
-        if: runner.os == 'Linux' && matrix.apt != '' && matrix.docker == '' && matrix.reuse_run == ''
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ${{ matrix.apt }}
-
-      - name: Set up MSVC environment (Windows)
-        if: runner.os == 'Windows' && matrix.reuse_run == ''
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: ${{ matrix.msvc_arch }}
+          recipe: ${{ matrix.recipe }}
+          variant: ${{ matrix.variant }}
+          triple: ${{ matrix.triple }}
+          cuda-major: ${{ matrix.cuda_major }}
+          submodules: ${{ matrix.submodules }}
+          docker: ${{ matrix.docker }}
+          apt: ${{ matrix.apt }}
+          msvc-arch: ${{ matrix.msvc_arch }}
           # The image also ships the VS 2022 toolset: CUDA 12 does not accept the VS 2026 compiler (MSVC 14.5x), and the
           # constexpr <cmath> comparisons of its STL clash with the HIP device overloads when building MIGraphX
-          toolset: ${{ (matrix.cuda_major == '12' || matrix.recipe == 'ep-amdgpu') && '14.44' || '' }}
-
-      - name: Remove Git Bash link.exe (it shadows the MSVC linker)
-        if: runner.os == 'Windows'
-        run: rm -f /usr/bin/link.exe
-
-      - name: Set paths
-        run: |
-          {
-            echo "WORK_DIR=${RUNNER_TEMP}/work"
-            echo "STAGE_DIR=${RUNNER_TEMP}/stage"
-            echo "SDK_ROOT=${RUNNER_TEMP}/sdk"
-            echo "DIST_DIR=${RUNNER_TEMP}/dist"
-            # Default for `cmake --build` without --parallel (an explicit bare --parallel ignores it); a Makefile
-            # build would otherwise run serially. Linux only: with the Xcode generator it adds a second -jobs option,
-            # which xcodebuild rejects.
-            if [ "$RUNNER_OS" = "Linux" ]; then echo "CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)"; fi
-          } >> "$GITHUB_ENV"
-
-      # Long-running, open-source build steps (see build_cache in ci/build.py) are reused across runs. The key hashes
-      # their inputs, so an update gets a new key; only complete results are saved.
-      - name: Build cache key
-        id: cache
-        if: matrix.docker == '' && matrix.reuse_run == ''
-        run: >-
-          python ci/build.py --recipe "${{ matrix.recipe }}" --variant "${{ matrix.variant }}" --triple "${{ matrix.triple }}"
-          --cuda-major "${{ matrix.cuda_major }}" --work "$WORK_DIR" --stage "$STAGE_DIR" --sdk-root "$SDK_ROOT"
-          --cache-info "$GITHUB_OUTPUT"
-
-      - name: Restore build cache
-        id: restore
-        if: steps.cache.outputs.key != ''
-        uses: actions/cache/restore@v6
-        with:
-          key: ${{ steps.cache.outputs.key }}
-          path: ${{ steps.cache.outputs.path }}
-
-      - name: Build
-        if: matrix.docker == '' && matrix.reuse_run == ''
-        run: >-
-          python ci/build.py --recipe "${{ matrix.recipe }}" --variant "${{ matrix.variant }}" --triple "${{ matrix.triple }}"
-          --cuda-major "${{ matrix.cuda_major }}" --work "$WORK_DIR" --stage "$STAGE_DIR" --sdk-root "$SDK_ROOT"
-
-      # Saved even when a later build step fails, as long as the cached step itself finished
-      - name: Check build cache
-        id: cache-check
-        if: always() && steps.cache.outputs.key != '' && steps.restore.outputs.cache-hit != 'true'
-        run: if [ -f "${{ steps.cache.outputs.path }}/${{ steps.cache.outputs.marker }}" ]; then echo "save=true" >> "$GITHUB_OUTPUT"; fi
-
-      - name: Save build cache
-        if: always() && steps.cache-check.outputs.save == 'true'
-        uses: actions/cache/save@v6
-        with:
-          key: ${{ steps.cache.outputs.key }}
-          path: ${{ steps.cache.outputs.path }}
-
-      - name: Build (container ${{ matrix.docker }})
-        if: matrix.docker != '' && matrix.reuse_run == ''
-        run: |
-          docker run --rm \
-            -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" -v "$RUNNER_TEMP:$RUNNER_TEMP" -w "$GITHUB_WORKSPACE" \
-            -e CUDA_ARCHITECTURES -e PYTHONUTF8 -e PYTHONIOENCODING -e CMAKE_VERSION -e CMAKE_POLICY_VERSION_MINIMUM \
-            -e CMAKE_BUILD_PARALLEL_LEVEL -e GITHUB_TOKEN -e PIP_ROOT_USER_ACTION=ignore \
-            "${{ matrix.docker }}" bash -c '
-              set -euo pipefail
-              apt-get update && apt-get install -y --no-install-recommends python3-pip python3-venv git patch ${{ matrix.apt }}
-              git config --global --add safe.directory "*"
-              python3 -m pip install --break-system-packages "cmake==${CMAKE_VERSION}" ninja
-              python3 ci/build.py --recipe "${{ matrix.recipe }}" --variant "${{ matrix.variant }}" \
-                --triple "${{ matrix.triple }}" --work "'"$WORK_DIR"'" --stage "'"$STAGE_DIR"'" --sdk-root "'"$SDK_ROOT"'"
-            '
-          sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP" "$GITHUB_WORKSPACE"
+          msvc-toolset: ${{ (matrix.cuda_major == '12' || matrix.recipe == 'ep-amdgpu') && '14.44' || '' }}
+          keep-android-sdk: ${{ matrix.keep_android_sdk }}
+          reuse: ${{ matrix.reuse_run != '' }}
 
       # Inputs unchanged since an earlier run (see add_reuse in ci/plan.py): repackage its package instead of building
       - name: Download the package of run ${{ matrix.reuse_run }}

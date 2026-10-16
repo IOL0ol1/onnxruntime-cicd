@@ -49,7 +49,6 @@ ENV_VARS: dict[str, dict[str, str]] = {
     "vulkan-sdk": {"VULKAN_SDK": ""},
     "tim-vx": {"TIM_VX_SRC": ""},
     "zdnn": {"ZDNN_SRC": ""},
-    "compass-npu-driver": {"COMPASS_NPU_DRIVER_SRC": ""},
 }
 # directories to add to PATH
 PATH_DIRS = {"cuda": "bin", "rocm": "bin", "vulkan-sdk": "bin"}
