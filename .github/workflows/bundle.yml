@@ -129,6 +129,9 @@ jobs:
     name: ${{ matrix.package }} · ${{ matrix.triple }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 360
+    # issues / issue_comment are low-trust triggers, which get read-only caches by default; the ccache and MIGraphX
+    # build caches must be saved. Only collaborators trigger this workflow, and resolve validated the request.
+    cache-mode: write
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.resolve.outputs.builds) }}
