@@ -44,9 +44,49 @@ BUILD_FILES = ("ci/build.py", "ci/sdk.py", "ci/package.py", "scripts", ".github/
 CUDA_DEPENDENT = {"cuda", "cudnn", "tensorrt", "tensorrt-rtx"}
 
 
+CORE = "onnxruntime"  # package name of the core libraries
+# core platform -> (recipe, variant) of ci/build.py
+CORE_RECIPES = {"desktop": ("ort", "custom"), "arm64x": ("ort", "arm64x"), "android": ("ort", "android"),
+                "apple": ("ort-apple", "default"), "s390x": ("ort", "s390x")}
+
+
+def matrix() -> dict:
+    return json.loads((ROOT / "ci" / "matrix.json").read_text(encoding="utf-8"))
+
+
 def entries() -> list[dict]:
-    """The build recipe entries of ci/matrix.json, with defaults."""
-    return [{**DEFAULTS, **e} for e in json.loads((ROOT / "ci" / "matrix.json").read_text(encoding="utf-8"))["include"]]
+    """The plugin EP package entries of ci/matrix.json, with defaults."""
+    return [{**DEFAULTS, **e} for e in matrix()["plugins"]]
+
+
+def cores() -> dict[str, dict]:
+    """Core recipe per target triple (core_from resolved: the triple whose core is used)."""
+    out = {c["triple"]: c for c in matrix()["cores"]}
+    return {t: {**out[c["core_from"]], "triple": t, "core_from": c["core_from"]} if c.get("core_from") else c
+            for t, c in out.items()}
+
+
+def core_entry(triple: str, eps: list[str], cuda_major: str = "13", wasm_mode: str = "") -> dict:
+    """Build recipe entry of the core of a bundle: the core recipe of the target with the selected in-tree EPs (the
+    WebAssembly build mode on wasm32), the packages and container its EPs need, and heavy if one of them is."""
+    core = cores()[triple]
+    caps = core["eps"]
+    if core["platform"] == "wasm":
+        recipe, variant, eps = "ort", core["wasm_modes"][wasm_mode]["variant"], []
+    else:
+        recipe, variant = CORE_RECIPES[core["platform"]]
+    apt, docker = set(core.get("apt", "").split()), ""
+    heavy, experimental = bool(core.get("heavy")), bool(core.get("experimental"))
+    for ep in eps:
+        req = caps[ep]
+        apt |= set(req.get("apt", "").split())
+        docker = docker or req.get("docker", "")
+        heavy = heavy or bool(req.get("heavy"))
+        experimental = experimental or bool(req.get("experimental"))
+    return {**DEFAULTS, "package": CORE, "recipe": recipe, "variant": variant,
+            "triple": core.get("core_from") or triple, "runner": core["runner"], "submodules": "onnxruntime",
+            "cuda_major": cuda_major or "13", "eps": ",".join(eps), "apt": " ".join(sorted(apt)), "docker": docker,
+            "heavy": heavy, "experimental": experimental, "keep_android_sdk": bool(core.get("keep_android_sdk"))}
 
 
 def msvc_arch(triple: str, runner: str) -> str:
@@ -138,6 +178,8 @@ def build_entry(e: dict, inputs: Inputs) -> dict:
         # compiler caching (ccache in the Actions cache, 10 GB per repository) for the long builds only: CUDA and
         # MIGraphX; container builds are left out
         "ccache": not e["docker"] and ("cuda" in sdks or (e["recipe"] == "ep-amdgpu" and e["variant"] != "dml")),
+        # cores of different EP sets share their ccache directory (at least the third-party code is the same)
+        "ccache_key": f"{CORE}-{e['triple']}-cuda{e['cuda_major']}" if e["package"] == CORE else f"{name}-{e['triple']}",
         "hash": digest,
         "artifact": f"pkg-{name}-{e['triple']}-{digest}",
     }
@@ -160,7 +202,9 @@ def find_artifact(name: str) -> dict | None:
 
 def main() -> int:
     inputs = Inputs()
-    for e in entries():
+    default_cores = [core_entry(t, [ep for ep in ("xnnpack",) if ep in c["eps"]], wasm_mode="cpu")
+                     for t, c in cores().items() if not c.get("core_from")]
+    for e in default_cores + entries():
         b = build_entry(e, inputs)
         found = find_artifact(b["artifact"])
         print(f"{b['id']:60} {b['runner']:18} ccache={str(b['ccache']):5} {b['hash']} "

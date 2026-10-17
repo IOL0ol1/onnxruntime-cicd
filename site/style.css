@@ -118,29 +118,31 @@ table.eps tr.active th .ep { color: var(--accent); }
 .vendor { display: block; font-weight: 400; font-size: 0.8rem; color: var(--muted); }
 table.summary th, table.summary td { border-bottom: 1px solid var(--border); padding: 4px 6px; text-align: left; }
 
-.chips { display: flex; flex-wrap: wrap; gap: 6px; }
-.chip {
+.toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 0 0 10px; }
+.choices { display: flex; flex-wrap: wrap; gap: 6px; }
+.choice {
   display: inline-flex;
   align-items: center;
   gap: 6px;
   font: inherit;
   font-size: 0.85rem;
   border: 1px solid var(--border);
-  border-radius: 999px;
-  padding: 3px 10px;
+  border-radius: 8px;
+  padding: 4px 10px;
   background: var(--chip-off);
   color: var(--text);
   cursor: pointer;
 }
-.chip .form { font-size: 0.75rem; color: var(--muted); }
-.chip .pkg { font-weight: 600; }
-.chip .tag { font-size: 0.72rem; border-radius: 4px; padding: 0 4px; background: var(--surface); color: var(--muted); }
-.chip .tag.warn { color: var(--warn); }
-.chip.core.on { background: var(--accent-soft); border-color: var(--accent); }
-.chip.plugin.on { background: var(--plugin-soft); border-color: var(--plugin); }
-.chip.on .form { color: var(--text); }
-.chip.off { opacity: 0.45; cursor: not-allowed; }
-.chip:focus-visible, .button:focus-visible, select:focus-visible, input:focus-visible {
+.choice .label { font-weight: 600; }
+.choice .tag, .tag { font-size: 0.72rem; border-radius: 4px; padding: 0 4px; background: var(--surface); color: var(--muted); }
+.tag.warn { color: var(--warn); }
+.choice.off.on { background: var(--surface); border-color: var(--muted); }
+.choice.core.on { background: var(--accent-soft); border-color: var(--accent); }
+.choice.plugin.on { background: var(--plugin-soft); border-color: var(--plugin); }
+.choice:disabled { opacity: 0.4; cursor: not-allowed; }
+.ep-note { margin: 6px 0 0; font-size: 0.85rem; color: var(--muted); }
+.modes { display: grid; gap: 4px; }
+.choice:focus-visible, .button:focus-visible, select:focus-visible, input:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }

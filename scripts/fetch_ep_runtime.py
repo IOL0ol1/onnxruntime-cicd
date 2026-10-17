@@ -188,9 +188,7 @@ EPS = {
 }
 # (recipe, variant) in BUILD_INFO.json -> EPs whose closed-source runtime files the package does not bundle
 # (the QNN and TensorRT RTX packages already contain theirs)
-PACKAGE_EPS = {
-    ("ort", "cuda"): ["cuda", "tensorrt"], ("ort", "cuda-plugin"): ["cuda"], ("ep-tensorrt", "default"): ["tensorrt"],
-}
+PACKAGE_EPS = {("ort", "cuda-plugin"): ["cuda"], ("ep-tensorrt", "default"): ["tensorrt"]}
 
 
 # ---------------------------------------------------------------------------
@@ -376,10 +374,8 @@ def main(argv: list[str]) -> int:
     else:
         recipe, _, variant = info.get("recipe", "/").partition("/")
         names = PACKAGE_EPS.get((recipe, variant or "default"), [])
-        if (recipe, variant) == ("ort", "default") and target == "x86_64-pc-windows-msvc":
-            names = ["vitisai"]  # the default Windows x64 package includes the Vitis AI bridge
-        if (recipe, variant) == ("ort", "all"):  # the EP set depends on the target; follow the SDKs it was built with
-            names = [ep for ep in ("cuda", "tensorrt", "cann") if ep in info.get("third_party_sdks", {})]
+        if recipe == "ort" and info.get("eps"):  # a core: the in-tree EPs it was built with (BUILD_INFO "eps")
+            names = [ep for ep in ("cuda", "tensorrt", "vitisai", "cann") if ep in info["eps"].split(",")]
         eps = parse_eps(names)
     if not eps:
         print("nothing to do: no closed-source SDK files are needed")

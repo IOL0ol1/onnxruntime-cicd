@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Bundle requests: turn a configuration from the configurator page (site/) into one ready-to-use package.
 
-A bundle is one core (a prebuilt core package, or a custom core compiled with the selected in-tree EPs) plus plugin
-EP packages, merged into one bin/ lib/ include/ tree, with the redistributable third-party runtimes they need, a
+A bundle is composed EP by EP: one core library with the in-tree EPs compiled into it plus the plugin EP
+packages of the other EPs, merged into one bin/ lib/ include/ tree, with the redistributable third-party runtimes they need, a
 CMake package (lib/cmake/onnxruntime-bundle), plugins.json, an example, and fetch-restricted.(sh|ps1) for the
 third-party files whose licenses do not allow redistributing them (headers and import libraries of the NVIDIA and
 Qualcomm SDKs, the Vitis AI runtime, the CANN toolkit).
@@ -50,8 +50,8 @@ catalog = _load("ci_catalog", ROOT / "ci" / "catalog.py")
 build = catalog.build
 plan_mod = catalog.plan
 
-CONFIG_SCHEMA = 2
-CUSTOM_CORE = "onnxruntime-custom"  # package name of a compiled core
+CONFIG_SCHEMA = 3
+CORE = plan_mod.CORE  # package name of the core
 CUDA_EPS = {"cuda", "tensorrt", "nv-tensorrt-rtx"}
 
 
@@ -77,77 +77,76 @@ def parse_issue(body: str) -> dict:
     return config
 
 
-def custom_entry(triple: str, eps: list[str], cuda_major: str) -> dict:
-    """Build recipe entry of a custom core: the runner of the target's core builds, with the packages and container of
-    the matrix entries that build those EPs."""
-    entries = [e for e in catalog.entries() if e["triple"] == triple and e["recipe"] == "ort"
-               and e["variant"] not in ("cuda-plugin", "webgpu-plugin", "arm64x")]
-    base = next((e for e in entries if e["package"] == "onnxruntime-all"), None) or \
-        next(e for e in entries if e["package"] == "onnxruntime")
-    apt, docker, heavy = set(base["apt"].split()), "", bool(base["heavy"])
-    for ep in eps:
-        carrier = next(e for e in entries if ep in catalog.core_eps(e))
-        apt |= set(carrier["apt"].split())
-        docker = docker or carrier["docker"]
-        heavy = heavy or bool(carrier["heavy"])
-    return {**plan_mod.DEFAULTS, "package": CUSTOM_CORE, "recipe": "ort", "variant": "custom", "triple": triple,
-            "runner": base["runner"], "submodules": "onnxruntime", "cuda_major": cuda_major, "eps": ",".join(eps),
-            "apt": " ".join(sorted(apt)), "docker": docker, "heavy": heavy}
-
-
 def make_plan(config: dict, cat: dict) -> dict:
-    """Validate a configuration against the catalog and work out what the bundle consists of (without the builds;
-    see plan_builds)."""
+    """Validate a configuration (every EP with "core" or "plugin") against the catalog and work out what the bundle
+    consists of: the core with the in-tree EPs, and the plugin EP packages (without the builds; see plan_builds)."""
     if config.get("schema") != CONFIG_SCHEMA:
         raise RequestError(f"unsupported configuration schema {config.get('schema')!r} (expected {CONFIG_SCHEMA}); "
                            "reload the configurator page and create a new request")
     triple = config.get("triple")
-    if triple not in cat["triples"]:
+    platform = cat["platforms"].get(triple)
+    if not platform:
         raise RequestError(f"unknown target triple {triple!r}")
-    items = {(it["package"], it["triple"]): it for it in cat["items"]}
+    choices = dict(config.get("eps") or {})
+    names = cat["eps"]
+    if bad := [ep for ep in choices if ep not in names or ep == "cpu"]:
+        raise RequestError(f"unknown EPs {', '.join(bad)}")
+    if bad := [f"{ep}={form}" for ep, form in choices.items() if form not in ("core", "plugin")]:
+        raise RequestError(f"every EP must be \"core\" or \"plugin\": {', '.join(bad)}")
 
-    def get(name: str, kind: str) -> dict:
-        it = items.get((name, triple))
-        if not it or it["kind"] != kind:
-            raise RequestError(f"{name} is not a {kind} package for {triple}")
-        return it
+    wasm_mode = ""
+    if platform["platform"] == "wasm":
+        wasm_mode = config.get("wasm_mode") or ""
+        if wasm_mode not in platform["wasm_modes"]:
+            raise RequestError(f"select a WebAssembly build mode: {', '.join(platform['wasm_modes'])}")
+        if core := [ep for ep, form in choices.items() if form == "core"]:
+            raise RequestError(f"the WebAssembly build mode decides the EPs of the core, not {', '.join(core)}")
 
-    core_name, compile_eps = config.get("core"), list(dict.fromkeys(config.get("compile") or []))
-    if bool(core_name) == bool(compile_eps):
-        raise RequestError("select either a prebuilt core package or the in-tree EPs of a custom core")
-    plugins = [get(p, "plugin") for p in dict.fromkeys(config.get("plugins") or [])]
-    core = get(core_name, "core") if core_name else None
-    if compile_eps:
-        allowed = cat["compile"].get(triple)
-        if not allowed:
-            raise RequestError(f"custom cores cannot be compiled for {triple}")
-        for ep in list(compile_eps):
-            compile_eps += [r for r in cat["requires"].get(ep, []) if r not in compile_eps]
-        if bad := [ep for ep in compile_eps if ep not in allowed]:
-            raise RequestError(f"{', '.join(bad)} cannot be compiled for {triple} (possible: {', '.join(allowed)})")
-        compile_eps = [ep for ep in cat["eps"] if ep in compile_eps]
-        core_provides = ["onnxruntime"] + [f"onnxruntime_providers_{catalog.PROVIDER_LIBS[ep]}"
-                                           for ep in compile_eps if ep in catalog.PROVIDER_LIBS]
-        core_eps = {"cpu": "builtin", **{ep: "provider" if ep in catalog.PROVIDER_LIBS else "builtin" for ep in compile_eps}}
-    else:
-        core_provides, core_eps = core["provides"], core["eps"]
+    core_eps = [ep for ep in names if choices.get(ep) == "core"]
+    if bad := [ep for ep in core_eps if ep not in platform["core_eps"]]:
+        raise RequestError(f"{', '.join(names[ep]['name'] for ep in bad)} cannot be compiled into the core for {triple}")
+    for ep in core_eps:
+        if missing := [r for r in cat["requires"].get(ep, []) if choices.get(r) != "core"]:
+            raise RequestError(f"{names[ep]['name']} in the core needs {', '.join(names[r]['name'] for r in missing)} "
+                               "in the core as well")
 
+    plugin_eps = [ep for ep in names if choices.get(ep) == "plugin"]
+    needs_cuda = bool(CUDA_EPS & set(core_eps)) or any(
+        p["cuda_major"] for p in cat["plugins"] if p["triple"] == triple and p["ep"] in plugin_eps)
+    cuda_major = str(config.get("cuda_major") or "") if needs_cuda else ""
+    if needs_cuda and cuda_major not in ("12", "13"):
+        raise RequestError("select the CUDA major version (12 or 13)")
+    for ep in core_eps:
+        if needs_cuda and ep in CUDA_EPS and platform["core_eps"][ep]["cuda"] and \
+                cuda_major not in platform["core_eps"][ep]["cuda"]:
+            raise RequestError(f"{names[ep]['name']} in the core is built with CUDA "
+                               f"{' / '.join(platform['core_eps'][ep]['cuda'])} for {triple}, not CUDA {cuda_major}")
+    plugins = []
+    for ep in plugin_eps:
+        options = [p for p in cat["plugins"] if p["triple"] == triple and p["ep"] == ep]
+        if not options:
+            raise RequestError(f"{names[ep]['name']} has no plugin EP package for {triple}")
+        matching = [p for p in options if not p["cuda_major"] or p["cuda_major"] == cuda_major]
+        if not matching:
+            raise RequestError(f"the {names[ep]['name']} plugin EP for {triple} is built with CUDA "
+                               f"{' / '.join(sorted(p['cuda_major'] for p in options))}, not CUDA {cuda_major}")
+        plugins.append(matching[0])
+
+    core_forms = {"cpu": "builtin"}
+    if wasm_mode:
+        core_forms.update({ep: "builtin" for ep in platform["wasm_modes"][wasm_mode]["eps"]})
+    core_forms.update({ep: platform["core_eps"][ep]["form"] for ep in core_eps})
+    core_provides = ["onnxruntime"] + [f"onnxruntime_providers_{catalog.PROVIDER_LIBS[ep]}" for ep in core_eps
+                                       if ep in catalog.PROVIDER_LIBS]
     owner: dict[str, str] = {}
-    for name, libs in [(core_name or CUSTOM_CORE, core_provides)] + [(p["package"], p["provides"]) for p in plugins]:
+    for name, libs in [(CORE, core_provides)] + [(p["package"], p["provides"]) for p in plugins]:
         for lib in libs:
             if lib in owner:
-                raise RequestError(f"{name} and {owner[lib]} both contain {lib}; select only one of them")
+                raise RequestError(f"{name} and {owner[lib]} both contain {lib}")
             owner[lib] = name
 
-    majors = {it["cuda_major"] for it in [core, *plugins] if it and it["cuda_major"]}
-    if compile_eps and CUDA_EPS & set(compile_eps):
-        majors.add(str(config.get("cuda_major") or (sorted(majors)[-1] if majors else "13")))
-    if len(majors) > 1:
-        raise RequestError(f"the selection mixes CUDA {' and '.join(sorted(majors))}; select packages of one CUDA version")
-    cuda_major = majors.pop() if majors else ""
-
     eps: dict[str, list[str]] = {}  # EP -> "<form> (<package>)"
-    for name, forms in [(core_name or CUSTOM_CORE, core_eps)] + [(p["package"], p["eps"]) for p in plugins]:
+    for name, forms in [(CORE, core_forms)] + [(p["package"], p["eps"]) for p in plugins]:
         for ep, form in forms.items():
             eps.setdefault(ep, []).append(f"{form} ({name})")
     dev = bool(config.get("dev", True))
@@ -164,18 +163,17 @@ def make_plan(config: dict, cat: dict) -> dict:
     components = sorted({c for ep in eps for c in cat["third_party"].get(ep, {}).get("components", [])})
 
     entries = {(e["package"], e["triple"]): e for e in catalog.entries()}
-    packages = ([{"package": core_name, "kind": "core", "entry": entries[(core_name, triple)]}] if core else
-                [{"package": CUSTOM_CORE, "kind": "core", "entry": custom_entry(triple, compile_eps, cuda_major or "13")}])
+    packages = [{"package": CORE, "kind": "core", "entry": plan_mod.core_entry(triple, core_eps, cuda_major, wasm_mode)}]
     packages += [{"package": p["package"], "kind": "plugin", "entry": entries[(p["package"], triple)]} for p in plugins]
-    normalized = {"schema": CONFIG_SCHEMA, "triple": triple, "core": core_name, "compile": compile_eps or None,
-                  "plugins": [p["package"] for p in plugins], "cuda_major": cuda_major or None, "dev": dev,
+    normalized = {"schema": CONFIG_SCHEMA, "triple": triple, "eps": {ep: choices[ep] for ep in names if ep in choices},
+                  "cuda_major": cuda_major or None, "wasm_mode": wasm_mode or None, "dev": dev,
                   "fetch": sorted({f.split(":")[0] for f in fetch}) if wanted is not None else None}
     return {
         "config": normalized,
         "source": cat["source"],
         "triple": triple,
-        "core": core,
-        "compile": {"eps": compile_eps, "cuda_major": cuda_major or "13"} if compile_eps else None,
+        "core": {"eps": core_eps, "forms": core_forms, "wasm_mode": wasm_mode or None,
+                 "core_from": platform.get("core_from")},
         "plugins": plugins,
         "packages": packages,
         "eps": eps,
@@ -205,17 +203,23 @@ def plan_builds(plan: dict, reuse: bool = True) -> None:
 def summary(plan: dict) -> str:
     """Markdown description of a plan for the request issue."""
     repo = os.environ.get("GITHUB_REPOSITORY") or "IOL0ol1/onnxruntime-cicd"
+    core = plan["core"]
     lines = [f"**Target:** `{plan['triple']}`  ",
              f"**Recipes:** commit [{plan['source']['id']}]({plan['source']['url']})  "]
     if plan["cuda_major"]:
         lines.append(f"**CUDA:** {plan['cuda_major']}.x  ")
-    lines += ["", "| Package | Build |", "|---|---|"]
+    lines += ["", "| Package | Contents | Build |", "|---|---|---|"]
     for p in plan["packages"]:
-        name = p["package"] + (f" ({', '.join(plan['compile']['eps'])})" if p["package"] == CUSTOM_CORE else "")
+        if p["kind"] == "core":
+            what = ", ".join(plan_ep_name(ep) for ep in core["forms"])
+            what += f" (WebAssembly mode {core['wasm_mode']})" if core["wasm_mode"] else ""
+            what += f" (the {core['core_from']} core)" if core["core_from"] else ""
+        else:
+            what = ", ".join(plan_ep_name(ep) for ep in next(x for x in plan["plugins"] if x["package"] == p["package"])["eps"])
         b, r = p.get("build", {}), p.get("reuse")
         how = (f"reused from [run {r['run']}](https://github.com/{repo}/actions/runs/{r['run']})" if r else
                f"built on `{b['runner']}`{' in ' + b['docker'] if b.get('docker') else ''}" if b else "")
-        lines.append(f"| `{name}` | {how} |")
+        lines.append(f"| `{p['package']}` | {what} | {how} |")
     lines += ["", "| EP | Provided as |", "|---|---|"]
     lines += [f"| {plan_ep_name(ep)} | {'; '.join(forms)} |" for ep, forms in plan["eps"].items()]
     if plan["bundle_runtime"]:

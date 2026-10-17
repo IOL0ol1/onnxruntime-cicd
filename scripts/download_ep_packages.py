@@ -495,7 +495,7 @@ COMPONENTS: tuple[Component, ...] = (
     Component("hexagon-sdk", "Qualcomm QNN (only needed for custom HTP ops)", ("linux-x86_64",), "default", resolve_hexagon,
               "softwarecenter.qualcomm.com public download API", optional=True),
     # The default version matches the CI of the intel/onnxruntime ovep-develop branch
-    Component("openvino", "Intel OpenVINO (in-tree + Intel fork)",
+    Component("openvino", "Intel OpenVINO",
               ("linux-x86_64", "linux-aarch64", "windows-x86_64", "macos-arm64"), "2026.2.1", resolve_openvino,
               "storage.openvinotoolkit.org"),
     Component("cann", "Huawei CANN", ("linux-x86_64", "linux-aarch64"), LATEST, resolve_cann,

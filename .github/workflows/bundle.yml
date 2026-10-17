@@ -157,7 +157,7 @@ jobs:
           msvc-toolset: ${{ matrix.msvc_toolset }}
           keep-android-sdk: ${{ matrix.keep_android_sdk }}
           ccache: ${{ matrix.ccache }}
-          ccache-key: ${{ matrix.id }}
+          ccache-key: ${{ matrix.ccache_key }}
 
       - name: Package
         env:

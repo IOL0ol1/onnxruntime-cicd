@@ -20,8 +20,7 @@ onnxruntime-cicd/
 │   │   ├── onnxruntime-ep-amdgpu/       # AMD plugin EPs: AMDGPU / MIGraphX / DirectML
 │   │   └── onnxruntime-ep-mlx/          # Apple MLX plugin EP
 │   ├── vendor/                          # EP sources or forks maintained by hardware vendors
-│   │   ├── nvidia-tensorrt-rtx-ep/      # NVIDIA TensorRT RTX plugin EP
-│   │   └── intel-onnxruntime-openvino/  # Intel fork, ovep-develop branch (OpenVINO EP development line)
+│   │   └── nvidia-tensorrt-rtx-ep/      # NVIDIA TensorRT RTX plugin EP
 │   └── community/                       # third-party / community plugin EPs
 │       ├── onnxruntime-ep-iree/         # IREE (MLIR compiler) plugin EP
 │       ├── onnxruntime-ep-telum/        # IBM Telum (IBM Z AI accelerator) plugin EP
@@ -58,7 +57,7 @@ git submodule update --remote --depth 1
 git submodule update --init --depth 1 eps/official/onnxruntime-ep-tensorrt
 ```
 
-> The main repository and the two forks (`onnxruntime-qnn`, `intel-onnxruntime-openvino`) are full ONNX Runtime source trees and therefore large. `.gitmodules` sets `shallow = true`. On Windows, run `git config --global core.longpaths true` first.
+> The main repository and `onnxruntime-qnn` (a fork) are full ONNX Runtime source trees and therefore large. `.gitmodules` sets `shallow = true`. On Windows, run `git config --global core.longpaths true` first.
 
 ## Submodules
 
@@ -70,7 +69,6 @@ git submodule update --init --depth 1 eps/official/onnxruntime-ep-tensorrt
 | `eps/official/onnxruntime-ep-amdgpu` | [onnxruntime/onnxruntime-ep-amdgpu](https://github.com/onnxruntime/onnxruntime-ep-amdgpu) | `main` | AMD GPU / Instinct (AMDGPU, MIGraphX), Windows DX12 (DirectML) | AMD | Requires ORT ≥ 1.24; plugin versions of MIGraphX / DirectML |
 | `eps/official/onnxruntime-ep-mlx` | [onnxruntime/onnxruntime-ep-mlx](https://github.com/onnxruntime/onnxruntime-ep-mlx) | `main` | Apple Silicon (MLX) | Community (moved into the onnxruntime organization) | PyPI package `onnxruntime-ep-mlx`; requires ORT ≥ 1.29 |
 | `eps/vendor/nvidia-tensorrt-rtx-ep` | [NVIDIA/TensorRT-RTX-EP-ABI](https://github.com/NVIDIA/TensorRT-RTX-EP-ABI) | `main` | NVIDIA RTX GPU (TensorRT-RTX) | NVIDIA | Plugin TensorRT RTX EP; PyPI package `onnxruntime-ep-nv-tensorrt-rtx` |
-| `eps/vendor/intel-onnxruntime-openvino` | [intel/onnxruntime](https://github.com/intel/onnxruntime) | `ovep-develop` | Intel CPU / iGPU / dGPU / NPU (OpenVINO) | Intel | OpenVINO EP development line, regularly synced with upstream; the official plugin package `onnxruntime-ep-openvino` is binary-only |
 | `deps/amdmigraphx` | [ROCm/AMDMIGraphX](https://github.com/ROCm/AMDMIGraphX) | `develop` | MIGraphX itself, for the AMD plugin EPs | AMD | Built from source because the AMD plugin EPs follow its `develop` API; a submodule so that its version only changes with an update, which keeps the MIGraphX build cache valid |
 | `eps/community/onnxruntime-ep-iree` | [iree-org/onnxruntime-ep-iree](https://github.com/iree-org/onnxruntime-ep-iree) | `main` | CPU / HIP / CUDA / Vulkan through IREE | IREE community | Plugin EP |
 | `eps/community/onnxruntime-ep-telum` | [IBM/onnxruntime-ep-telum](https://github.com/IBM/onnxruntime-ep-telum) | `main` | IBM Telum (on-chip AI accelerator of IBM Z, zDNN) | IBM | Plugin EP; requires ORT ≥ 1.24.1 |
@@ -87,7 +85,7 @@ Sources live in `onnxruntime/onnxruntime/core/providers/<directory>`.
 | TensorRT | `tensorrt` | Stable | Plugin version: `eps/official/onnxruntime-ep-tensorrt` |
 | NVIDIA TensorRT RTX | `nv_tensorrt_rtx` | Stable | Plugin version: `eps/vendor/nvidia-tensorrt-rtx-ep` |
 | DirectML | `dml` | Sustained engineering | New feature work moved to Windows ML; plugin version: `onnxruntime-ep-amdgpu/src/directx` |
-| Intel OpenVINO | `openvino` | Stable | Development line: `eps/vendor/intel-onnxruntime-openvino`; plugin binary package `onnxruntime-ep-openvino` |
+| Intel OpenVINO | `openvino` | Stable | Development line: the `ovep-develop` branch of [intel/onnxruntime](https://github.com/intel/onnxruntime) (not included: the main repository has the same EP); plugin binary package `onnxruntime-ep-openvino` |
 | Qualcomm QNN | `qnn` | In-tree version (provider bridge, 1.x) | New plugin EP: `eps/official/onnxruntime-qnn` |
 | Apple CoreML | `coreml` | Preview | |
 | Android NNAPI | `nnapi` | Stable | |
@@ -146,7 +144,7 @@ python scripts/download_ep_packages.py --with-optional                          
 | `tensorrt-rtx` | TensorRT RTX (in-tree + plugin) | 1.6 (the plugin's CMake requires ≥ 1.6 at configure time) | `rtx_sdk/secure/...` direct links listed on the [official TensorRT-RTX page](https://developer.nvidia.com/tensorrt-rtx) (verified to work without login) | — |
 | `qairt` | QNN (in-tree + `onnxruntime-qnn`) | 2.51.0.260929 (from `onnxruntime-qnn/qcom/packages.yml`) | Qualcomm public download API `softwarecenter.qualcomm.com/api/download/...` (instead of QPM, which needs a Qualcomm ID) | sha256 |
 | `hexagon-sdk` (optional) | QNN (only needed for custom HTP ops) | 6.5.0.0 (same source) | Same as above | sha256 |
-| `openvino` | OpenVINO (in-tree + Intel fork) | 2026.2.1 (same as the Intel fork CI) | `storage.openvinotoolkit.org` | sha256 |
+| `openvino` | OpenVINO (in-tree) | 2026.2.1 | `storage.openvinotoolkit.org` | sha256 |
 | `cann` | Huawei CANN | Latest release (currently 9.1.1) | Huawei Cloud Ascend artifactory `ascend.devcloud.huaweicloud.com/artifactory/cann-run` (instead of the official site, which needs a Huawei account) | sha256 |
 | `rocm` | MIGraphX / AMDGPU (in-tree + `onnxruntime-ep-amdgpu`) | Latest TheRock multi-arch package (currently 7.14.1); the Windows MIGraphX CI build installs TheRock's 7.13.0 Python wheels instead | `repo.amd.com/rocm/tarball-multi-arch` | — |
 | `vitisai` | AMD Vitis AI (Ryzen AI NPU) | Latest version of each package | Public AMD PyPI index `pypi.amd.com/simple` | sha256 |
@@ -192,13 +190,13 @@ The packages bundle the third-party runtime libraries whose licenses allow distr
 
 | Bundled in | Component | License |
 |---|---|---|
-| x86_64 `onnxruntime`, `onnxruntime-all` (oneDNN EP) | oneDNN (`dnnl.dll` / `libdnnl.so.3`), built from source | Apache-2.0 |
-| `onnxruntime-vsinpu` | TIM-VX (`libtim-vx.so`), built from source | MIT |
-| Windows `onnxruntime-all`, `onnxruntime-ep-webgpu` | DirectX Shader Compiler (`dxcompiler.dll`), built from source | NCSA |
-| Windows `onnxruntime-all`, `onnxruntime-ep-directml-amd`, `onnxruntime-ep-amdgpu` | DirectML (`DirectML.dll`) | Microsoft DirectML license (redistributable with applications) |
-| `onnxruntime-openvino`, `onnxruntime-openvino-intel` | OpenVINO runtime and device plugins (Windows also oneTBB) | Intel OpenVINO Distribution License: the files listed in its `redist.txt` |
-| `onnxruntime-qnn`, `onnxruntime-ep-qnn` | QAIRT backends and Hexagon skel libraries | Qualcomm AI Stack License (object code, as part of an application) |
-| `onnxruntime-nv-tensorrt-rtx`, `onnxruntime-ep-nv-tensorrt-rtx-*` | TensorRT for RTX and the CUDA runtime (`cudart`) | NVIDIA TensorRT for RTX license, CUDA EULA (Attachment A) |
+| A core with oneDNN | oneDNN (`dnnl.dll` / `libdnnl.so.3`), built from source | Apache-2.0 |
+| A core with VSINPU | TIM-VX (`libtim-vx.so`), built from source | MIT |
+| Windows: a core with WebGPU, `onnxruntime-ep-webgpu` | DirectX Shader Compiler (`dxcompiler.dll`), built from source | NCSA |
+| A core with DirectML, `onnxruntime-ep-directml-amd`, Windows `onnxruntime-ep-amdgpu` | DirectML (`DirectML.dll`) | Microsoft DirectML license (redistributable with applications) |
+| A core with OpenVINO | OpenVINO runtime and device plugins (Windows also oneTBB) | Intel OpenVINO Distribution License: the files listed in its `redist.txt` |
+| A core with QNN, `onnxruntime-ep-qnn` | QAIRT backends and Hexagon skel libraries | Qualcomm AI Stack License (object code, as part of an application) |
+| A core with TensorRT RTX, `onnxruntime-ep-nv-tensorrt-rtx-*` | TensorRT for RTX and the CUDA runtime (`cudart`) | NVIDIA TensorRT for RTX license, CUDA EULA (Attachment A) |
 | `onnxruntime-ep-migraphx-amd`, `onnxruntime-ep-amdgpu` | MIGraphX, built from its develop branch | MIT |
 | `onnxruntime-ep-mlx` | MLX, mlx-c (with fmt, nlohmann/json, gguflib, metal-cpp) | MIT, Apache-2.0 |
 
@@ -226,7 +224,7 @@ Not bundled, so install or fetch them separately:
 ```bash
 # Point it at an extracted package: the EPs, target triple, CUDA major version and the exact SDK
 # versions used by the build are read from BUILD_INFO.json; files go into the package's bin/ (Windows) or lib/
-python scripts/fetch_ep_runtime.py --package-dir onnxruntime-all-<version>-x86_64-pc-windows-msvc
+python scripts/fetch_ep_runtime.py --package-dir onnxruntime-<version>-x86_64-pc-windows-msvc
 
 # Or choose EPs and a target explicitly
 python scripts/fetch_ep_runtime.py --ep cuda tensorrt --target x86_64-unknown-linux-gnu --dest ./runtime
@@ -241,7 +239,7 @@ python scripts/fetch_ep_runtime.py --list
 | `nv-tensorrt-rtx` (in-tree and plugin) | TensorRT-RTX, CUDA | `tensorrt_rtx_*`, `tensorrt_onnxparser_rtx_*`, plus cudart |
 | `qnn` (in-tree QNN EP, `onnxruntime-ep-qnn`) | QAIRT | `Qnn*`, `Genie*` and `HtpPrepare` from the QAIRT directory of the target, plus the Hexagon `libQnnHtpV*Skel.so` / `.cat` files, following the same rules as onnxruntime-qnn's CMake |
 | `vitisai` (Vitis AI bridge in the Windows x64 `onnxruntime` package) | Vitis AI runtime (`voe` wheel) | `onnxruntime_vitisai_ep.dll`, `dyn_dispatch_core.dll`, `aiecompiler_client.dll`, `onnxruntime_vitis_ai_custom_ops.dll` |
-| `cann` (`onnxruntime-all` on Linux) | CANN toolkit | Cannot be reduced to a few files; the vendor installer is run into `<dest>/cann` (source its `set_env.sh` before use) |
+| `cann` (a Linux core with CANN) | CANN toolkit | Cannot be reduced to a few files; the vendor installer is run into `<dest>/cann` (source its `set_env.sh` before use) |
 
 An EP can be suffixed with the parts to fetch: `--ep cuda:dev` extracts the backend's **development files** instead (headers into `include/<backend>/` keeping their directory tree, Windows import libraries into `lib/`), `cuda:runtime+dev` both. The development files exist for `cuda` (CUDA headers including CCCL, cuDNN), `tensorrt`, `nv-tensorrt-rtx`, `qnn` (QAIRT `include/QNN`) and `openvino` (headers and import libraries only; the packages bundle its runtime). The bundles of [bundle requests](#bundles) use this through their `fetch-restricted` script.
 
@@ -249,31 +247,35 @@ Targets: `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-pc-win
 
 ## Build recipes
 
-Every package is built by one entry of [`ci/matrix.json`](ci/matrix.json) (a recipe and variant of [`ci/build.py`](ci/build.py) for one target triple) through the [build steps](.github/actions/build-entry/action.yml) shared by all builds: check out only the submodules the entry needs (shallow), download the third-party SDKs (`ci/sdk.py`), build and stage `bin/ lib/ include/`, and pack it with [`ci/package.py`](ci/package.py) as `<package>-<inputs hash>-<target-triple>.tar.gz/.zip` with a `.sha256` and `BUILD_INFO.json`. Nothing builds them on a schedule: a [bundle request](#bundles) builds the packages it needs, and later requests reuse them (see [Builds on demand and caching](#builds-on-demand-and-caching)).
+Every package is built from [`ci/matrix.json`](ci/matrix.json): the core of a bundle from the core recipe of its target triple with the in-tree EPs the request selected, a plugin EP package from its entry (a recipe and variant of [`ci/build.py`](ci/build.py) for one target triple), through the [build steps](.github/actions/build-entry/action.yml) shared by all builds: check out only the submodules the entry needs (shallow), download the third-party SDKs (`ci/sdk.py`), build and stage `bin/ lib/ include/`, and pack it with [`ci/package.py`](ci/package.py) as `<package>-<inputs hash>-<target-triple>.tar.gz/.zip` with a `.sha256` and `BUILD_INFO.json`. Nothing builds them on a schedule: a [bundle request](#bundles) builds the packages it needs, and later requests reuse them (see [Builds on demand and caching](#builds-on-demand-and-caching)).
 
-### Build matrix
+### Core recipes
 
-83 entries in total; each is a package a bundle request can use. The target platforms follow what each repository's own CI/CD publishes (the ORT v1.30.0 release assets, PyPI wheel tags, and the plugin repositories' workflows).
+`cores` in `ci/matrix.json` has one recipe per target triple: the build platform (the `ci/build.py` variant), the runner and the in-tree EPs a core can be built with there, each with its build requirements (packages, container, the CUDA major versions it was built with, long build, experimental). A bundle's core always contains the CPU EP plus the in-tree EPs the request compiles into it; cores with the same EP set are reused.
+
+| Target | Platform (variant) | In-tree EPs a core can contain |
+|---|---|---|
+| `x86_64-unknown-linux-gnu` | desktop (`custom`) | XNNPACK, WebGPU, CUDA (12/13), TensorRT (12/13), TensorRT RTX (13), oneDNN, OpenVINO, MIGraphX (in the `rocm/dev-ubuntu-24.04:7.2.4-complete` container), Vitis AI, CANN, VSINPU ⚠ (TIM-VX with the x86 simulator driver) |
+| `aarch64-unknown-linux-gnu` | desktop | XNNPACK, WebGPU, CUDA (13), TensorRT (13), CANN |
+| `x86_64-pc-windows-msvc` | desktop | XNNPACK, DirectML, WebGPU, CUDA (12/13), TensorRT (12/13), TensorRT RTX (13), oneDNN, OpenVINO, Vitis AI, QNN |
+| `aarch64-pc-windows-msvc` | desktop | XNNPACK, DirectML, WebGPU, QNN |
+| `aarch64-apple-darwin`, `x86_64-apple-darwin` | desktop (x86_64 cross-compiled on arm64) | XNNPACK, CoreML, WebGPU |
+| `arm64x-pc-windows-msvc`, `arm64ec-pc-windows-msvc` | `arm64x`: an ARM64 pass plus an ARM64EC pass with `--buildasx`, like the official `win-arm64x` package; the ARM64EC target uses the ARM64X core | CPU only |
+| `aarch64-apple-ios`, `aarch64-apple-ios-sim`, `x86_64-apple-ios` | Apple framework (`ort-apple`): a dynamic `onnxruntime.framework` per sysroot/arch with ORT's `build_apple_framework.py`, whose settings get the selected EPs | CoreML, XNNPACK |
+| `aarch64-apple-ios-macabi`, `x86_64-apple-ios-macabi`, `*-apple-tvos*` ⚠, `*-apple-visionos*` ⚠ | Apple framework | CoreML (ORT's settings build XNNPACK for iOS only) |
+| `aarch64-linux-android`, `armv7-linux-androideabi`, `i686-linux-android`, `x86_64-linux-android` | `android` | NNAPI, XNNPACK, WebGPU |
+| `wasm32-unknown-emscripten` | one of five exclusive build modes, the same as ORT's `web.yml`: CPU, JSEP (+ WebNN), WebGPU (+ WebNN), WebGPU with JSPI (+ WebNN), or the static library `libonnxruntime_webassembly.a` | given by the mode |
+| `s390x-unknown-linux-gnu` ⚠ | `s390x`: cross-compiled on x86_64 with the Ubuntu s390x toolchain (MLAS has s390x kernels; ORT's CMake downloads a protoc for the build host) | CPU only |
+
+### Plugin EP packages
+
+`plugins` in `ci/matrix.json`:
 
 | Package | Contents | Target triples |
 |---|---|---|
-| `onnxruntime` | CPU + XNNPACK; plus oneDNN and the Vitis AI bridge on x64; plus CoreML on macOS | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`, `aarch64-apple-darwin`, `x86_64-apple-darwin` |
-| `onnxruntime` (ARM64X) | Same as the official `win-arm64x` package: an ARM64 pass plus an ARM64EC pass with `--buildasx` | `arm64x-pc-windows-msvc` |
-| `onnxruntime` (Apple frameworks) | Dynamic `onnxruntime.framework` per sysroot/arch, built with the official `build_apple_framework.py` settings (CoreML, XNNPACK on iOS) | `aarch64-apple-ios`, `aarch64-apple-ios-sim`, `x86_64-apple-ios`, `aarch64-apple-ios-macabi`, `x86_64-apple-ios-macabi`, `aarch64-apple-tvos` ⚠, `aarch64-apple-tvos-sim` ⚠, `x86_64-apple-tvos` ⚠, `aarch64-apple-visionos` ⚠, `aarch64-apple-visionos-sim` ⚠ |
-| `onnxruntime-all` | Every built-in EP the platform supports. Built-in means linked into the `onnxruntime` library itself (XNNPACK, WebGPU, DirectML, CoreML) or a shared provider that exports only the legacy `GetProvider` bridge entry point (oneDNN, TensorRT, CANN); providers that also export `CreateEpFactories` (CUDA, OpenVINO, QNN, Vitis AI, TensorRT RTX, MIGraphX) and plugin EPs are left out, except the CUDA EP that ships as a mandatory dependency of TensorRT. Linux x64: XNNPACK, WebGPU, oneDNN, TensorRT (+ CUDA 13), CANN. Linux aarch64: XNNPACK, WebGPU, TensorRT (+ CUDA 13), CANN. Windows x64: XNNPACK, WebGPU, DirectML, oneDNN, TensorRT (+ CUDA 13). Windows ARM64: XNNPACK, WebGPU, DirectML. macOS: XNNPACK, WebGPU, CoreML. Provider libraries must not be mixed with another package's `onnxruntime` library (the bridge interface layout depends on the build options) | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`, `aarch64-apple-darwin`, `x86_64-apple-darwin` |
-| `onnxruntime-android` | NNAPI + XNNPACK + WebGPU (same EP set as the official AAR) | `aarch64-linux-android`, `armv7-linux-androideabi`, `i686-linux-android`, `x86_64-linux-android` |
-| `onnxruntime-wasm` / `-wasm-jsep` / `-wasm-webgpu` / `-wasm-webgpu-jspi` | WebAssembly outputs of onnxruntime-web (`.wasm` / `.mjs`), same variants as ORT's `web.yml` | `wasm32-unknown-emscripten` |
-| `onnxruntime-wasm-static` | WebAssembly static library `libonnxruntime_webassembly.a` plus the C/C++ API headers | `wasm32-unknown-emscripten` |
-| `onnxruntime-qnn` | In-tree QNN EP (the official `win-arm64` package still ships it) | `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc` |
-| `onnxruntime-cuda12` | CUDA 12 + TensorRT (the CUDA 13 build is part of `onnxruntime-all`) | `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc` |
 | `onnxruntime-ep-cuda12` | CUDA plugin EP, CUDA 12 | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-pc-windows-msvc` |
 | `onnxruntime-ep-cuda13` | CUDA plugin EP, CUDA 13 | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc` |
-| `onnxruntime-nv-tensorrt-rtx` | TensorRT RTX (in-tree) | `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc` |
 | `onnxruntime-ep-webgpu` | WebGPU plugin EP | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`, `aarch64-apple-darwin` |
-| `onnxruntime-openvino` | OpenVINO (main repository) | `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc` |
-| `onnxruntime-openvino-intel` | OpenVINO (Intel fork `ovep-develop`) | Same as above |
-| `onnxruntime-migraphx` | MIGraphX (built in the `rocm/dev-ubuntu-24.04:7.2.4-complete` container) | `x86_64-unknown-linux-gnu` |
-| `onnxruntime-vsinpu` ⚠ | VeriSilicon VSINPU (TIM-VX with the x86 simulator driver) | `x86_64-unknown-linux-gnu` |
 | `onnxruntime-ep-tensorrt` | TensorRT plugin EP | `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc` |
 | `onnxruntime-ep-nv-tensorrt-rtx-cuda13` | TensorRT RTX plugin EP (NVIDIA), CUDA 13 | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc` ⚠ (cross-compiled on x64) |
 | `onnxruntime-ep-nv-tensorrt-rtx-cuda12` | TensorRT RTX plugin EP (NVIDIA), CUDA 12 | `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc` |
@@ -310,17 +312,17 @@ These jobs are heavy (rocMLIR is an LLVM-based build) and may exceed the 6-hour 
 
 ### Builds on demand and caching
 
-- **Package reuse**: [`ci/plan.py`](ci/plan.py) hashes the inputs of every package build: the entry, the commits of its submodules, the build scripts (`ci/build.py`, `ci/sdk.py`, `ci/package.py`, `scripts/`, the build-entry action), the resolved third-party SDK versions, the Docker image digest and the CUDA architectures. The package artifact is named `pkg-<package>-<triple>-<hash>` and kept for 90 days; a bundle request whose package has the same hash downloads that artifact instead of building it. Changes to the bundle and page code (`ci/bundle.py`, `ci/catalog.py`, `site/`) do not invalidate packages. `python ci/plan.py` lists every entry with its hash and whether an artifact can be reused.
+- **Package reuse**: [`ci/plan.py`](ci/plan.py) hashes the inputs of every package build: the entry, the commits of its submodules, the build scripts (`ci/build.py`, `ci/sdk.py`, `ci/package.py`, `scripts/`, the build-entry action), the resolved third-party SDK versions, the Docker image digest and the CUDA architectures. The package artifact is named `pkg-<package>-<triple>-<hash>` and kept for 90 days; a bundle request whose package has the same hash downloads that artifact instead of building it. Changes to the bundle and page code (`ci/bundle.py`, `ci/catalog.py`, `site/`) do not invalidate packages. Cores of different EP sets of a target share one ccache directory (ccache key per target and CUDA major version), which helps only with the third-party code: ORT adds the `USE_<EP>` definitions of the selected EPs to every ORT source file. `python ci/plan.py` lists every plugin entry and the default core of every target with its hash and whether an artifact can be reused.
 - **Compiler cache**: the CUDA and MIGraphX builds compile through ccache ([`hendrikmuhs/ccache-action`](https://github.com/hendrikmuhs/ccache-action), up to 2 GB per entry). CMake reads `CMAKE_C_COMPILER_LAUNCHER`, `CMAKE_CXX_COMPILER_LAUNCHER` and `CMAKE_CUDA_COMPILER_LAUNCHER` from the environment, so ONNX Runtime, MIGraphX with its dependencies and the EP repositories all use it (not the Visual Studio generator builds, nor container builds). A first build gains nothing; a build after a submodule update recompiles only what changed. The repository has 10 GB of Actions cache; the least recently used entries are evicted, and entries unused for 7 days expire.
 - **MIGraphX on Windows**: the dependencies `rbuild prepare` builds (rocMLIR and others, about 2.5 hours) and the MIGraphX install share one Actions cache entry, keyed by the dependency inputs (MIGraphX's requirement files, the ROCm version, the MSVC toolset, the GPU targets) and the `deps/amdmigraphx` commit. A new MIGraphX commit restores the entry of the same dependency inputs and rebuilds only MIGraphX; an unchanged commit reuses the install, which the `ep-migraphx-amd` and `ep-amdgpu` builds share.
 - **Third-party SDKs** are not cached: they take a few minutes at most, would exceed the cache quota, and caches of a public repository can be restored by pull-request workflows, which the SDK licenses do not allow.
 - **Dependency updates**: Dependabot (`.github/dependabot.yml`) opens weekly pull requests that update the actions and move the submodules to the newest commits of their branches. Merging one builds nothing; the next request that needs an affected package builds it.
 - **CUDA architectures**: the default is `80-real;80-virtual`: SM 8.0 SASS plus a compute_80 PTX that the driver JIT-compiles on newer GPUs (ORT's CMake drops a list that has only `-virtual` entries). GitHub-hosted runners have 4 cores, and every extra CUDA architecture roughly doubles the build time, which easily exceeds the 6-hour job limit. To build several SASS architectures, set the `CUDA_ARCHITECTURES` repository variable and move the heavy builds to larger runners with `HEAVY_RUNNER_MAP`, e.g. `{"ubuntu-24.04": "linux-16core", "windows-2025": "windows-16core"}` (`RUNNER_MAP` replaces runners for every build).
-- **Checking recipes locally**: `python ci/build.py --recipe ort --variant cuda --triple x86_64-unknown-linux-gnu --work w --stage s --sdk-root sdk --dry-run` prints the commands that would run.
+- **Checking recipes locally**: `python ci/build.py --recipe ort --variant custom --eps tensorrt,cuda,openvino --triple x86_64-unknown-linux-gnu --work w --stage s --sdk-root sdk --dry-run` prints the commands that would run.
 
 ## Bundles
 
-A **bundle** is one package for one target triple with exactly the EPs a user selected: one core library plus any plugin EP packages, merged into a single `bin/ lib/ include/` tree together with the third-party runtimes, headers and link files of the selected backends, a CMake package and an example. Bundles are requested from a static configurator page and built by GitHub Actions.
+A **bundle** is one package for one target triple with exactly the EPs a user selected, composed EP by EP: one core library with the in-tree EPs compiled into it plus the plugin EP packages of the other EPs, merged into a single `bin/ lib/ include/` tree together with the third-party runtimes, headers and link files of the selected backends, a CMake package and an example. Bundles are requested from a static configurator page and built by GitHub Actions.
 
 ```
 site/ (GitHub Pages) --prefilled issue--> issue "[bundle] ..." --issues event--> .github/workflows/bundle.yml
@@ -330,15 +332,15 @@ site/ (GitHub Pages) --prefilled issue--> issue "[bundle] ..." --issues event-->
 
 ### Configurator page
 
-[`site/`](site/) is published by [`.github/workflows/pages.yml`](.github/workflows/pages.yml) (set **Settings → Pages → Source** to *GitHub Actions*) together with `catalog.json`, which [`ci/catalog.py`](ci/catalog.py) generates from the build recipes: every package of every target, the EPs it contains and how it provides them. The page is redeployed when it or the recipes change.
+[`site/`](site/) is published by [`.github/workflows/pages.yml`](.github/workflows/pages.yml) (set **Settings → Pages → Source** to *GitHub Actions*) together with `catalog.json`, which [`ci/catalog.py`](ci/catalog.py) generates from the build recipes: per target, the in-tree EPs its core can contain (with their constraints) and the plugin EP packages. The page is redeployed when it or the recipes change.
 
 1. **Target**: platform and architecture (every target triple of the matrix).
-2. **Execution providers**: one row per EP that lists every way to get it on that target:
-   - *built-in* or *provider library* inside a **core package** (`onnxruntime`, `onnxruntime-all`, `onnxruntime-cuda12`, `onnxruntime-qnn`, `onnxruntime-openvino`, ...). Exactly one core is used, so selecting such an option switches the core;
-   - a **plugin EP package** (`onnxruntime-ep-*`), which combines with any core;
-   - **compile**: a custom core built for this request with any combination of the in-tree EPs that the prebuilt cores of that target are built with (for example TensorRT, OpenVINO, QNN and DirectML in one core). This takes up to a few hours.
-
-   Options that conflict with the current selection are disabled with the reason: two packages that contain the same library (the CUDA, QNN and TensorRT RTX EPs exist both as provider libraries and as plugin EPs under the same file name), packages built for different CUDA major versions, EPs that need another one (TensorRT brings the CUDA EP). Switching the core removes plugin EPs that conflict with the new core.
+2. **Execution providers**: one row per EP the target offers, each with **Off / Plugin EP / In core**. CPU is always in the core.
+   - **Plugin EP** adds the EP's plugin EP package (`onnxruntime-ep-*`): a separate library registered at run time, built once per version and reused by every bundle. It is the default for every EP that has one (CUDA, TensorRT, TensorRT RTX, QNN, MIGraphX, DirectML, WebGPU, AMDGPU, MLX, IREE, Telum, Vulkan), also where the plugin is experimental.
+   - **In core** compiles the EP into the core library, as built-in code or as a provider library next to it (OpenVINO, oneDNN, Vitis AI, CANN, XNNPACK, CoreML, NNAPI, VSINPU have only this form; the others where the target's core recipe supports them). When the page opens, the core has XNNPACK where the target supports it.
+   - The page shows only what the target supports and disables options that do not work with the current selection, with the reason: TensorRT in the core brings the CUDA EP into the core (ORT builds them together; moving CUDA out of the core moves TensorRT to its plugin); one CUDA major version per bundle (a selector appears as soon as an EP needs CUDA, and options not built for it are disabled); EPs a target's core cannot contain. Notes explain long builds and untested combinations (MIGraphX in the core builds the whole core in the ROCm container).
+   - WebAssembly offers the five build modes instead (single choice), because they are exclusive builds.
+   - *Select all* puts every EP of the target in its default form; *Reset* goes back to the defaults.
 3. **Options**: whether to include the headers and link files of the backends, and which parts `fetch-restricted` should fetch.
 4. **Request**: the EPs and how each one is provided, which packages take long to build, the third-party components with links to their licenses, and the license acknowledgement. *Create bundle request* opens a prefilled issue (`.github/ISSUE_TEMPLATE/bundle.yml`).
 
@@ -349,7 +351,7 @@ site/ (GitHub Pages) --prefilled issue--> issue "[bundle] ..." --issues event-->
 | Job | Purpose |
 |---|---|
 | `resolve` | [`ci/bundle.py`](ci/bundle.py) `resolve` reads the configuration from the issue, validates it against the catalog (the same rules as the page) and plans every package with [`ci/plan.py`](ci/plan.py): its build job and inputs hash, and the artifact of an earlier run it can reuse. The status comment in the issue shows which packages are reused and which are built. An unexpired bundle with the same configuration and package hashes is linked instead of building it again |
-| `build` | One job per package that cannot be reused, through the shared [build steps](.github/actions/build-entry/action.yml); a custom core is built with `ci/build.py --recipe ort --variant custom --eps ...` on the runner (and container, for MIGraphX) of the matrix entries that build those EPs. Each package is kept as an artifact for 90 days, also when another package of the request fails |
+| `build` | One job per package that cannot be reused, through the shared [build steps](.github/actions/build-entry/action.yml); the core is built from the core recipe of its target with the selected in-tree EPs (`ci/build.py --variant custom --eps ...` on desktop targets), on its runner, with the packages and container its EPs need. Each package is kept as an artifact for 90 days, also when another package of the request fails |
 | `assemble` | Downloads the packages (`gh run download`, checked against their SHA-256), merges them, adds the redistributable third-party runtimes with the SDK versions the packages were built with, writes the CMake package, `plugins.json`, the example, `README.md` and `BUNDLE_INFO.json`, uploads the bundle as an artifact and links it in the issue, which is then closed |
 
 The bundle artifact is kept for 90 days; downloading it needs a GitHub login. It contains `onnxruntime-bundle-<key>-<triple>.zip` (Windows) or `.tar.gz` with:

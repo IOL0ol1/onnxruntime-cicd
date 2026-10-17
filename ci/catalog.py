@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Describe what a bundle request can select: catalog.json for the configurator page (site/) and for ci/bundle.py.
 
-The catalog lists, per target triple, every package the build recipes (ci/matrix.json) can build with the EPs it
-contains, how it provides each one (built into the core library, a shared provider library next to it, or a plugin
-EP library) and the library files it brings, plus the in-tree EPs a custom core can be compiled with. The EP sets of
-the core packages come from the recipes in ci/build.py, so they follow the build matrix by themselves. Packages are
-built on demand by bundle requests (ci/plan.py), so nothing here depends on earlier builds.
+A bundle is composed EP by EP: every EP is either compiled into the core library (built-in, or a shared provider
+library next to it) or added as a plugin EP package. The catalog lists, per target triple, the in-tree EPs its core
+recipe can be built with (ci/matrix.json "cores", with their constraints) and the plugin EP packages (ci/matrix.json
+"plugins"), with the library files they bring. Packages are built on demand by bundle requests (ci/plan.py), so
+nothing here depends on earlier builds.
 
     python ci/catalog.py --out site/catalog.json
 """
@@ -13,9 +13,7 @@ built on demand by bundle requests (ci/plan.py), so nothing here depends on earl
 from __future__ import annotations
 
 import argparse
-import contextlib
 import importlib.util
-import io
 import json
 import os
 import sys
@@ -29,7 +27,7 @@ sys.modules["ci_plan"] = plan
 _pspec.loader.exec_module(plan)
 build = plan.build
 
-SCHEMA = 2
+SCHEMA = 3
 
 # EP -> (display name, vendor). Order is the display order.
 EPS = {
@@ -57,20 +55,13 @@ EPS = {
     "telum": ("Telum", "IBM"),
     "vulkan": ("Vulkan", "Community"),
 }
-# build.py argument -> in-tree EP
-FLAG_EPS = {"--use_xnnpack": "xnnpack", "--use_webgpu": "webgpu", "--use_dml": "dml", "--use_coreml": "coreml",
-            "--use_dnnl": "dnnl", "--use_vitisai": "vitisai", "--use_cuda": "cuda", "--use_tensorrt": "tensorrt",
-            "--use_nv_tensorrt_rtx": "nv-tensorrt-rtx", "--use_openvino": "openvino", "--use_qnn": "qnn",
-            "--use_migraphx": "migraphx", "--use_cann": "cann", "--use_vsinpu": "vsinpu", "--use_nnapi": "nnapi",
-            "--use_jsep": "jsep", "--use_webnn": "webnn"}
 # In-tree EPs built as a shared provider library (onnxruntime_providers_<name>) next to the core library; the
 # others are linked into it. Two packages with the same provider library cannot be combined.
 PROVIDER_LIBS = {"cuda": "cuda", "tensorrt": "tensorrt", "nv-tensorrt-rtx": "nv_tensorrt_rtx", "openvino": "openvino",
                  "qnn": "qnn", "migraphx": "migraphx", "vitisai": "vitisai", "dnnl": "dnnl", "cann": "cann"}
-# The Apple framework builds use ORT's default_full_*_framework_build_settings.json, which enable these
-APPLE_FRAMEWORK_EPS = ["coreml", "xnnpack"]
-# Plugin EP packages: (recipe, variant) -> (EPs, plugin libraries as staged by ci/build.py). The first library is
-# the one to register with RegisterExecutionProviderLibrary.
+# Plugin EP packages: (recipe, variant) -> (EPs, plugin libraries as staged by ci/build.py). The first EP is the
+# one the package provides (the others are backends of it), the first library the one to register with
+# RegisterExecutionProviderLibrary.
 PLUGINS = {
     ("ort", "cuda-plugin"): (["cuda"], ["onnxruntime_providers_cuda"]),
     ("ort", "webgpu-plugin"): (["webgpu"], ["onnxruntime_providers_webgpu"]),
@@ -125,58 +116,55 @@ COMPONENTS = {
     "rocm": {"name": "AMD ROCm", "license": "https://rocm.docs.amd.com/en/latest/about/license.html",
              "system": "install ROCm (Linux /opt/rocm) or the HIP SDK (Windows) yourself"},
 }
-# In-tree EPs a custom core needs together (ORT's build.py builds the CUDA EP with TensorRT)
+# In-tree EPs a core needs together (ORT's build.py builds the CUDA EP with TensorRT)
 REQUIRES = {"tensorrt": ["cuda"]}
-# Recipes whose core libraries a custom compile can reproduce (desktop targets of the main repository)
-COMPILE_TRIPLES = {"x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-pc-windows-msvc",
-                   "aarch64-pc-windows-msvc", "aarch64-apple-darwin", "x86_64-apple-darwin"}
+# EPs compiled into the core when the page opens (where the core can have them); everything else is up to the user
+DEFAULT_CORE_EPS = ["xnnpack"]
+# Explanations the page shows for an EP in the core
+CORE_NOTES = {
+    "tensorrt": "brings the CUDA EP into the core as well (ORT builds them together)",
+    "migraphx": "the core is built in the ROCm container; combinations with other EPs are untested",
+    "vsinpu": "built with the TIM-VX x86 simulator driver",
+    "cann": "the CANN toolkit is installed on your machine by fetch-restricted",
+}
+PLATFORM_NOTES = {
+    "wasm": "WebAssembly builds are one of five exclusive build modes",
+    "apple": "ORT's framework settings: CoreML everywhere, XNNPACK on iOS and its simulator only",
+    "arm64x": "one ARM64X core serves ARM64 and ARM64EC processes",
+    "s390x": "the core is cross-compiled on x86_64",
+}
 
 
 def entries() -> list[dict]:
     return plan.entries()
 
 
-def core_eps(e: dict) -> list[str]:
-    """The EPs of a core package entry, read from its recipe's build.py arguments (dry run, nothing downloaded)."""
-    if e["recipe"] == "ort-apple":
-        return ["cpu", *APPLE_FRAMEWORK_EPS]
-    job = build.Job(e["recipe"], e["variant"], e["triple"], Path("work"), Path("stage"), Path("sdk"), e["cuda_major"],
-                    build.DEFAULT_CUDA_ARCHS, True)
-    with contextlib.redirect_stdout(io.StringIO()):
-        flags, _ = build.ort_variant(job, build.ORT_SOURCES[e["recipe"]])
-    return ["cpu", *dict.fromkeys(FLAG_EPS[f] for f in flags if f in FLAG_EPS)]
+def plugin_item(e: dict) -> dict:
+    """Catalog entry of a plugin EP package for one triple."""
+    eps, libs = PLUGINS[(e["recipe"], e["variant"])]
+    if "windows" not in e["triple"]:  # the AMDGPU EP has a DirectML backend on Windows only
+        eps, libs = [ep for ep in eps if ep != "dml"], [lib for lib in libs if lib != "directx-backend"]
+    sdks = plan.sdks_of(e)
+    return {"package": e["package"], "triple": e["triple"], "kind": "plugin", "ep": eps[0],
+            "eps": {ep: "plugin" for ep in eps}, "provides": libs, "plugin_libs": libs,
+            "cuda_major": e["cuda_major"] if "cuda" in sdks else None,
+            "experimental": bool(e["experimental"]), "heavy": bool(e["heavy"]) or "cuda" in sdks}
 
 
-def item(e: dict) -> dict:
-    """Catalog entry of one package / triple of the build matrix."""
-    plugin = PLUGINS.get((e["recipe"], e["variant"]))
-    if plugin:
-        eps, libs = plugin
-        if "windows" not in e["triple"]:  # the AMDGPU EP has a DirectML backend on Windows only
-            eps, libs = [ep for ep in eps if ep != "dml"], [lib for lib in libs if lib != "directx-backend"]
-        forms = {ep: "plugin" for ep in eps}
-        provides = libs
-    else:
-        eps = core_eps(e)
-        forms = {ep: "provider" if ep in PROVIDER_LIBS else "builtin" for ep in eps}
-        provides = ["onnxruntime"] + [f"onnxruntime_providers_{PROVIDER_LIBS[ep]}" for ep in eps if ep in PROVIDER_LIBS]
-        libs = []
-    return {"package": e["package"], "triple": e["triple"], "kind": "plugin" if plugin else "core",
-            "recipe": f"{e['recipe']}/{e['variant']}", "eps": forms, "provides": provides, "plugin_libs": libs,
-            "cuda_major": e["cuda_major"] if "cuda" in plan.sdks_of(e) else None,
-            "experimental": bool(e["experimental"]), "heavy": bool(e["heavy"]) or "cuda" in plan.sdks_of(e)}
-
-
-def compile_options(items: list[dict]) -> dict:
-    """Per triple: the in-tree EPs a custom core can be built with, i.e. those of the main repository's prebuilt cores
-    for that triple (each of them is known to build there)."""
-    out: dict[str, list[str]] = {}
-    for it in items:
-        recipe, variant = it["recipe"].split("/")
-        if it["kind"] == "core" and recipe == "ort" and it["triple"] in COMPILE_TRIPLES and variant not in ("arm64x",):
-            eps = out.setdefault(it["triple"], [])
-            eps += [ep for ep in it["eps"] if ep in build.CUSTOM_EPS and ep not in eps]
-    return {t: [ep for ep in EPS if ep in eps] for t, eps in sorted(out.items())}
+def platform_item(core: dict) -> dict:
+    """What the core of a triple can contain."""
+    eps = {}
+    for ep, req in core["eps"].items():
+        eps[ep] = {"form": "provider" if ep in PROVIDER_LIBS else "builtin", "cuda": req.get("cuda"),
+                   "experimental": bool(req.get("experimental")), "heavy": bool(req.get("heavy")),
+                   "note": CORE_NOTES.get(ep, "")}
+    item = {"platform": core["platform"], "core_eps": {ep: eps[ep] for ep in EPS if ep in eps},
+            "core_from": core.get("core_from"), "experimental": bool(core.get("experimental")),
+            "note": PLATFORM_NOTES.get(core["platform"], ""),
+            "default_core": [ep for ep in DEFAULT_CORE_EPS if ep in eps]}
+    if core["platform"] == "wasm":
+        item["wasm_modes"] = {m: {"eps": v["eps"]} for m, v in core["wasm_modes"].items()}
+    return item
 
 
 def source() -> dict:
@@ -188,17 +176,20 @@ def source() -> dict:
 
 
 def catalog() -> dict:
-    items = [item(e) for e in entries()]
-    triples = list(dict.fromkeys(it["triple"] for it in items))
+    platforms = {t: platform_item(c) for t, c in plan.cores().items()}
+    plugins = [plugin_item(e) for e in entries()]
+    for p in plugins:
+        if p["triple"] not in platforms:
+            raise SystemExit(f"{p['package']} is built for {p['triple']}, which has no core recipe")
     return {
         "schema": SCHEMA,
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "repository": os.environ.get("GITHUB_REPOSITORY") or "IOL0ol1/onnxruntime-cicd",
         "source": source(),
-        "triples": triples,
+        "triples": list(platforms),
         "eps": {k: {"name": n, "vendor": v} for k, (n, v) in EPS.items()},
-        "items": items,
-        "compile": compile_options(items),
+        "platforms": platforms,
+        "plugins": plugins,
         "requires": REQUIRES,
         "third_party": EP_THIRD_PARTY,
         "components": COMPONENTS,
@@ -212,7 +203,7 @@ def main(argv: list[str]) -> int:
     cat = catalog()
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(cat, indent=1), encoding="utf-8")
-    print(f"{args.out}: {len(cat['items'])} package entries for {len(cat['triples'])} targets "
+    print(f"{args.out}: {len(cat['triples'])} targets, {len(cat['plugins'])} plugin packages "
           f"(commit {cat['source']['id']})")
     return 0
 

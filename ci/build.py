@@ -284,7 +284,6 @@ def vs_generator() -> str:
 
 ORT_SOURCES = {
     "ort": ROOT / "onnxruntime",
-    "ort-intel": ROOT / "eps/vendor/intel-onnxruntime-openvino",
 }
 
 
@@ -304,10 +303,6 @@ def tensorrt_flags(job: Job) -> list[str]:
     flags = cuda_flags(job)
     job.need("tensorrt")
     return flags + ["--use_tensorrt", "--tensorrt_home", job.sdks["tensorrt"]]
-
-
-def macos_flags(job: Job) -> list[str]:
-    return ["--use_coreml"] + (["--osx_arch", "x86_64"] if job.triple == "x86_64-apple-darwin" else [])
 
 
 def dawn_backends(job: Job) -> list[str]:
@@ -355,13 +350,15 @@ def vsinpu_flags(job: Job) -> list[str]:
     return ["--use_vsinpu"]
 
 
-# In-tree EP -> build.py arguments, for the custom cores of bundle requests (variant "custom"). TensorRT includes the
-# CUDA EP: ORT's build.py always builds them together.
+# In-tree EP -> build.py arguments, for the cores of bundle requests (the eps of the core variants: custom, arm64x,
+# android, s390x; the Apple frameworks select coreml / xnnpack in their settings instead). TensorRT includes the CUDA
+# EP: ORT's build.py always builds them together.
 CUSTOM_EPS: dict[str, Callable[[Job], list[str]]] = {
     "xnnpack": lambda job: ["--use_xnnpack"],
     "webgpu": webgpu_flags,
     "dml": lambda job: ["--use_dml"],
-    "coreml": macos_flags,
+    "coreml": lambda job: ["--use_coreml"],
+    "nnapi": lambda job: ["--use_nnapi"],
     "dnnl": lambda job: ["--use_dnnl"],
     "vitisai": lambda job: ["--use_vitisai"],
     "cuda": cuda_flags,
@@ -375,30 +372,24 @@ CUSTOM_EPS: dict[str, Callable[[Job], list[str]]] = {
 }
 
 
-def all_builtin_flags(job: Job) -> list[str]:
-    """Every built-in EP the target supports.
+def eps_flags(job: Job) -> list[str]:
+    """build.py arguments of the selected in-tree EPs (job.eps) of a core."""
+    unknown = sorted(set(job.eps) - CUSTOM_EPS.keys())
+    if unknown:
+        raise SystemExit(f"unknown in-tree EPs {unknown}; known: {', '.join(CUSTOM_EPS)}")
+    eps = [ep for ep in job.eps if not (ep == "cuda" and "tensorrt" in job.eps)]  # TensorRT brings the CUDA EP
+    return [flag for ep in eps for flag in CUSTOM_EPS[ep](job)]
 
-    Built-in means linked into the onnxruntime library itself (XNNPACK, WebGPU as static_lib, DirectML, CoreML) or
-    a shared provider that exports only the legacy bridge entry point GetProvider (oneDNN, TensorRT, CANN).
-    Providers that also export CreateEpFactories (CUDA, OpenVINO, QNN, Vitis AI, NV TensorRT RTX, MIGraphX) and
-    plugin EPs are left out. The one exception is the CUDA EP shipped as a dependency of TensorRT.
-    """
-    def has(*names: str) -> bool:
-        # the SDKs are only available for the build host platform; x86_64-apple-darwin is cross-compiled on arm64
-        return job.triple != "x86_64-apple-darwin" and all(job.platform in sdk.dl.component(n).platforms for n in names)
 
-    flags = ["--use_xnnpack", *webgpu_flags(job)]
-    if job.os == "windows":
-        flags += ["--use_dml"]
-    if job.os == "macos":
-        flags += macos_flags(job)
-    if job.triple.startswith("x86_64") and job.os in ("linux", "windows"):
-        flags += ["--use_dnnl"]
-    if job.os in ("linux", "windows") and has("cuda", "cudnn", "tensorrt"):
-        flags += tensorrt_flags(job)
-    if job.os == "linux" and has("cann"):
-        flags += cann_flags(job)
-    return flags
+def s390x_toolchain(job: Job) -> Path:
+    """CMake toolchain file of the Ubuntu s390x cross compiler (g++-s390x-linux-gnu)."""
+    toolchain = job.work / "s390x-toolchain.cmake"
+    if not job.dry_run:
+        job.work.mkdir(parents=True, exist_ok=True)
+        toolchain.write_text("set(CMAKE_SYSTEM_NAME Linux)\nset(CMAKE_SYSTEM_PROCESSOR s390x)\n"
+                             "set(CMAKE_C_COMPILER s390x-linux-gnu-gcc)\nset(CMAKE_CXX_COMPILER s390x-linux-gnu-g++)\n"
+                             "set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)\n", encoding="utf-8")
+    return toolchain
 
 
 def allow_onnx_printer_on_tvos(src: Path) -> None:
@@ -430,27 +421,23 @@ def allow_cann_with_cuda(src: Path) -> None:
 
 
 def ort_variant(job: Job, src: Path) -> tuple[list[str], Callable[[Job, Path], None] | None]:
-    """Return (extra build.py arguments, custom staging function). A None staging function means cmake --install."""
+    """Return (extra build.py arguments, custom staging function). A None staging function means cmake --install.
+
+    Cores: custom (desktop targets), arm64x, android and s390x take the in-tree EPs of --eps; the wasm variants are
+    the WebAssembly build modes. cuda-plugin and webgpu-plugin build plugin EP packages from the main repository."""
     v = job.variant
-    if v in ("default", "arm64x"):
-        flags = ["--use_xnnpack"] if v == "default" else []
-        if job.triple.startswith("x86_64") and job.os in ("linux", "windows"):
-            flags += ["--use_dnnl", "--use_vitisai"]
-        if job.os == "macos":
-            flags += macos_flags(job)
-        return flags, None
-    if v == "all":
-        return all_builtin_flags(job), None
     if v == "custom":
-        unknown = sorted(set(job.eps) - CUSTOM_EPS.keys())
-        if unknown or not job.eps:
-            raise SystemExit(f"variant custom needs --eps from {sorted(CUSTOM_EPS)} (unknown: {unknown})")
-        eps = [ep for ep in job.eps if not (ep == "cuda" and "tensorrt" in job.eps)]  # TensorRT brings the CUDA EP
-        return [flag for ep in eps for flag in CUSTOM_EPS[ep](job)], None
-    if v == "qnn":
-        return qnn_flags(job), None
-    if v == "cuda":
-        return tensorrt_flags(job), None
+        arch = ["--osx_arch", "x86_64"] if job.triple == "x86_64-apple-darwin" else []  # cross-compiled on arm64
+        return arch + eps_flags(job), None
+    if v == "arm64x":
+        return eps_flags(job), None
+    if v == "android":
+        job.need("android-ndk")
+        sdk_path = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT") or ""
+        return ["--android", "--android_sdk_path", sdk_path, "--android_ndk_path", job.sdks["android-ndk"],
+                "--android_abi", ANDROID_ABI[job.triple], *eps_flags(job)], None
+    if v == "s390x":  # cross-compiled on x86_64; ORT's CMake downloads a protoc for the build host itself
+        return ["--cmake_extra_defines", f"CMAKE_TOOLCHAIN_FILE={s390x_toolchain(job)}", *eps_flags(job)], None
     if v == "cuda-plugin":
         flags = cuda_flags(job) + ["--cmake_extra_defines", "onnxruntime_BUILD_CUDA_EP_AS_PLUGIN=ON"]
         if job.os == "windows":
@@ -459,25 +446,12 @@ def ort_variant(job: Job, src: Path) -> tuple[list[str], Callable[[Job, Path], N
             flags += ["--cmake_extra_defines", "CMAKE_CXX_FLAGS_RELEASE=/O2 /Ob2 /DNDEBUG /bigobj"]
         return flags, \
             lambda j, b: stage_shared_libs(j, b, ["onnxruntime_providers_cuda"])
-    if v == "nv-tensorrt-rtx":
-        return nv_tensorrt_rtx_flags(job), None
     if v == "webgpu-plugin":
         names = ["onnxruntime_providers_webgpu"] + (["dxcompiler"] if job.os == "windows" else [])  # same as the official package
         backends = dawn_backends(job)
         return ["--use_webgpu", "shared_lib", "--wgsl_template", "static",
                 *(["--cmake_extra_defines", *backends] if backends else [])], \
             lambda j, b: stage_shared_libs(j, b, names)
-    if v == "openvino":
-        return openvino_flags(job), None
-    if v == "migraphx":
-        return migraphx_flags(job), None
-    if v == "vsinpu":
-        return vsinpu_flags(job), None
-    if v == "android":  # same EP set as the official Android AAR
-        job.need("android-ndk")
-        sdk_path = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT") or ""
-        return ["--android", "--android_sdk_path", sdk_path, "--android_ndk_path", job.sdks["android-ndk"],
-                "--android_abi", ANDROID_ABI[job.triple], "--use_nnapi", "--use_xnnpack", "--use_webgpu"], None
     if v == "wasm-static":
         return ["--build_wasm_static_lib", "--enable_wasm_simd", "--disable_rtti"], \
             lambda j, b: (copy_files(j, ["**/libonnxruntime_webassembly.a"], b, j.stage / "lib"), stage_ort_headers(j, src))
@@ -576,11 +550,21 @@ def build_ort_apple(job: Job) -> None:
     build_dir = job.work / "build"
     if sysroot.startswith("appletv") and not job.dry_run:
         allow_onnx_printer_on_tvos(src)
-    if sysroot == "macabi" and not job.dry_run:
-        # ORT's build.py turns warnings into errors for Catalyst (unlike iOS / tvOS / visionOS), and the CoreML EP uses
-        # APIs newer than the 14.0 deployment target without availability guards
+    if not job.dry_run:
         data = json.loads(settings.read_text(encoding="utf-8"))
-        data["build_params"]["macabi"].append("--compile_no_warning_as_error")
+        # the in-tree EPs of the core (--eps) instead of the official CoreML + XNNPACK
+        selectable = {"--use_coreml": "coreml", "--use_xnnpack": "xnnpack"}
+        for key, params in data["build_params"].items():
+            data["build_params"][key] = [p for p in params if p not in selectable or selectable[p] in job.eps]
+        unknown = sorted(set(job.eps) - set(selectable.values()))
+        if unknown:
+            raise SystemExit(f"the Apple frameworks support coreml / xnnpack, not {unknown}")
+        data["build_params"]["base"] += [p for p, ep in selectable.items()
+                                         if ep in job.eps and p not in data["build_params"]["base"]]
+        if sysroot == "macabi":
+            # ORT's build.py turns warnings into errors for Catalyst (unlike iOS / tvOS / visionOS), and the CoreML EP
+            # uses APIs newer than the 14.0 deployment target without availability guards
+            data["build_params"]["macabi"].append("--compile_no_warning_as_error")
         settings = job.work / settings.name
         settings.parent.mkdir(parents=True, exist_ok=True)
         settings.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -910,12 +894,7 @@ def build_ep_iree(job: Job) -> None:
 
 def build_ep_telum(job: Job) -> None:
     src, b = ROOT / "eps/community/onnxruntime-ep-telum", job.work / "build"
-    toolchain = job.work / "s390x-toolchain.cmake"
-    if not job.dry_run:
-        job.work.mkdir(parents=True, exist_ok=True)
-        toolchain.write_text("set(CMAKE_SYSTEM_NAME Linux)\nset(CMAKE_SYSTEM_PROCESSOR s390x)\n"
-                             "set(CMAKE_C_COMPILER s390x-linux-gnu-gcc)\nset(CMAKE_CXX_COMPILER s390x-linux-gnu-g++)\n"
-                             "set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)\n", encoding="utf-8")
+    toolchain = s390x_toolchain(job)
     headers = ROOT / "onnxruntime/include/onnxruntime/core/session"  # only the ORT headers are needed
     run(job, ["cmake", "-G", "Ninja", "-S", src, "-B", b, "-DCMAKE_BUILD_TYPE=Release",
               f"-DCMAKE_TOOLCHAIN_FILE={toolchain}", f"-DONNXRUNTIME_INCLUDE_DIR={headers}", "-DTELUM_EP_ENABLE_ZDNN=ON"])
@@ -938,7 +917,7 @@ def build_ep_vulkan(job: Job) -> None:
 
 
 RECIPES: dict[str, Callable[[Job], None]] = {
-    "ort": build_ort, "ort-intel": build_ort, "ort-apple": build_ort_apple,
+    "ort": build_ort, "ort-apple": build_ort_apple,
     "ep-tensorrt": build_ep_tensorrt, "ep-nv-tensorrt-rtx": build_ep_nv_tensorrt_rtx, "ep-amdgpu": build_ep_amdgpu,
     "ep-qnn": build_ep_qnn, "ep-mlx": build_ep_mlx, "ep-iree": build_ep_iree, "ep-telum": build_ep_telum,
     "ep-vulkan": build_ep_vulkan,

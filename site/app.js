@@ -1,21 +1,23 @@
-// Bundle configurator: pick a target, the execution providers and how each one is provided, then create a bundle
-// request issue. The selection rules mirror make_plan in ci/bundle.py, which validates the request again.
+// Bundle configurator: pick a target and, for every execution provider, whether to leave it out, add its plugin EP
+// package, or compile it into the core; then create a bundle request issue. The rules mirror make_plan in
+// ci/bundle.py, which validates the request again.
 "use strict";
 
 // ---------------------------------------------------------------------------
 // Selection logic (no DOM; also loaded by tests under Node)
 // ---------------------------------------------------------------------------
 
+const CUDA_EPS = ["cuda", "tensorrt", "nv-tensorrt-rtx"];
 const PROVIDER_LIBS = {
   cuda: "cuda", tensorrt: "tensorrt", "nv-tensorrt-rtx": "nv_tensorrt_rtx", openvino: "openvino", qnn: "qnn",
   migraphx: "migraphx", vitisai: "vitisai", dnnl: "dnnl", cann: "cann",
 };
-const CUDA_EPS = ["cuda", "tensorrt", "nv-tensorrt-rtx"];
-const CUSTOM_CORE = "onnxruntime-custom";
 
 const PLATFORMS = [
-  ["Windows", (t) => t.includes("-windows-")],
-  ["Linux", (t) => t.endsWith("-linux-gnu")],
+  ["Windows", (t) => /-windows-/.test(t) && !/^arm64(ec|x)-/.test(t)],
+  ["Windows ARM64EC / ARM64X", (t) => /^arm64(ec|x)-/.test(t)],
+  ["Linux", (t) => t.endsWith("-linux-gnu") && !t.startsWith("s390x")],
+  ["Linux on IBM Z", (t) => t.startsWith("s390x")],
   ["macOS", (t) => t.endsWith("-apple-darwin")],
   ["Android", (t) => t.includes("-android")],
   ["iOS", (t) => /-apple-ios$/.test(t) && !t.startsWith("x86_64")],
@@ -29,6 +31,13 @@ const PLATFORMS = [
 ];
 const ARCHS = { x86_64: "x64", aarch64: "ARM64", armv7: "ARMv7", i686: "x86", s390x: "s390x", wasm32: "wasm32",
                 arm64ec: "ARM64EC", arm64x: "ARM64X" };
+const WASM_MODES = {
+  cpu: "CPU only",
+  jsep: "JSEP: WebGPU and WebNN through JavaScript",
+  webgpu: "WebGPU (native) and WebNN",
+  "webgpu-jspi": "WebGPU (native) and WebNN, with JSPI instead of Asyncify",
+  static: "Static library libonnxruntime_webassembly.a (CPU) for linking into your own WebAssembly build",
+};
 
 function platformOf(triple) {
   const p = PLATFORMS.find(([, test]) => test(triple));
@@ -40,160 +49,153 @@ function archOf(triple) {
   return ARCHS[a] || a;
 }
 
-function itemsFor(cat, triple) {
-  return cat.items.filter((it) => it.triple === triple);
+const platformInfo = (cat, triple) => cat.platforms[triple];
+const pluginOptions = (cat, triple, ep) => cat.plugins.filter((p) => p.triple === triple && p.ep === ep);
+
+// The EPs a target offers, in display order: {ep, core: info | null, plugins: [...]}
+function epRows(cat, triple) {
+  const info = platformInfo(cat, triple);
+  return Object.keys(cat.eps)
+    .filter((ep) => ep !== "cpu")
+    .map((ep) => ({ ep, core: info.core_eps[ep] || null, plugins: pluginOptions(cat, triple, ep) }))
+    .filter((r) => r.core || r.plugins.length);
 }
 
-// The libraries a core provides (onnxruntime and its shared provider libraries)
-function coreProvides(sel, cat) {
-  if (sel.core === CUSTOM_CORE) {
-    return ["onnxruntime", ...sel.compile.filter((ep) => PROVIDER_LIBS[ep]).map((ep) => `onnxruntime_providers_${PROVIDER_LIBS[ep]}`)];
-  }
-  const core = findItem(cat, sel.core, sel.triple);
-  return core ? core.provides : [];
+function newSelection(cat, triple) {
+  const info = platformInfo(cat, triple);
+  const choices = {};
+  for (const ep of info.default_core) choices[ep] = "core";
+  return { triple, choices, cudaMajor: "13", wasmMode: info.wasm_modes ? "cpu" : null, dev: true, fetch: null };
 }
 
-function findItem(cat, pkg, triple) {
-  return cat.items.find((it) => it.package === pkg && it.triple === triple);
+function cloneSel(sel) {
+  return { ...sel, choices: { ...sel.choices }, fetch: sel.fetch ? [...sel.fetch] : null };
 }
 
-function coreEps(sel, cat) {
-  if (sel.core === CUSTOM_CORE) {
-    const eps = { cpu: "builtin" };
-    for (const ep of sel.compile) eps[ep] = PROVIDER_LIBS[ep] ? "provider" : "builtin";
-    return eps;
-  }
-  const core = findItem(cat, sel.core, sel.triple);
-  return core ? core.eps : {};
+const coreEps = (sel, cat) => Object.keys(cat.eps).filter((ep) => sel.choices[ep] === "core");
+const pluginEps = (sel, cat) => Object.keys(cat.eps).filter((ep) => sel.choices[ep] === "plugin");
+
+function needsCuda(sel, cat) {
+  return coreEps(sel, cat).some((ep) => CUDA_EPS.includes(ep)) ||
+    pluginEps(sel, cat).some((ep) => pluginOptions(cat, sel.triple, ep).some((p) => p.cuda_major));
+}
+
+// The plugin package of an EP for the selection's CUDA version
+function pluginFor(sel, cat, ep) {
+  const options = pluginOptions(cat, sel.triple, ep);
+  return options.find((p) => !p.cuda_major || p.cuda_major === sel.cudaMajor) || null;
 }
 
 // Validate a selection; returns an error message or "".
 function validate(sel, cat) {
-  if (!sel.core) return "select a core";
-  if (sel.core === CUSTOM_CORE && !sel.compile.length) return "select at least one in-tree EP for the custom core";
-  const owner = {};
-  const parts = [[sel.core, coreProvides(sel, cat)]];
-  for (const p of sel.plugins) {
-    const it = findItem(cat, p, sel.triple);
-    if (!it) return `${p} is not available for ${sel.triple}`;
-    parts.push([p, it.provides]);
+  const info = platformInfo(cat, sel.triple);
+  if (!info) return `unknown target ${sel.triple}`;
+  const name = (ep) => cat.eps[ep].name;
+  if (info.wasm_modes) {
+    if (!info.wasm_modes[sel.wasmMode]) return "select a WebAssembly build mode";
+    if (coreEps(sel, cat).length) return "the WebAssembly build mode decides the EPs of the core";
   }
-  for (const [name, libs] of parts) {
-    for (const lib of libs) {
-      if (owner[lib]) return `${name} and ${owner[lib]} both contain ${lib}`;
-      owner[lib] = name;
+  for (const ep of coreEps(sel, cat)) {
+    if (!info.core_eps[ep]) return `${name(ep)} cannot be compiled into the core for ${sel.triple}`;
+    const missing = (cat.requires[ep] || []).filter((r) => sel.choices[r] !== "core");
+    if (missing.length) return `${name(ep)} in the core needs ${missing.map(name).join(", ")} in the core as well`;
+    const cuda = info.core_eps[ep].cuda;
+    if (CUDA_EPS.includes(ep) && cuda && !cuda.includes(sel.cudaMajor)) {
+      return `${name(ep)} in the core is built with CUDA ${cuda.join(" / ")} for this target, not CUDA ${sel.cudaMajor}`;
     }
   }
-  const majors = cudaMajors(sel, cat);
-  if (majors.size > 1) return `mixes CUDA ${[...majors].sort().join(" and ")}`;
+  const owner = {};
+  const parts = [["onnxruntime", ["onnxruntime", ...coreEps(sel, cat).filter((ep) => PROVIDER_LIBS[ep])
+    .map((ep) => `onnxruntime_providers_${PROVIDER_LIBS[ep]}`)]]];
+  for (const ep of pluginEps(sel, cat)) {
+    const options = pluginOptions(cat, sel.triple, ep);
+    if (!options.length) return `${name(ep)} has no plugin EP package for ${sel.triple}`;
+    const p = pluginFor(sel, cat, ep);
+    if (!p) return `the ${name(ep)} plugin EP is built with CUDA ${options.map((o) => o.cuda_major).join(" / ")}, not CUDA ${sel.cudaMajor}`;
+    parts.push([p.package, p.provides]);
+  }
+  for (const [pkg, libs] of parts) {
+    for (const lib of libs) {
+      if (owner[lib]) return `${pkg} and ${owner[lib]} both contain ${lib}`;
+      owner[lib] = pkg;
+    }
+  }
   return "";
 }
 
-function cudaMajors(sel, cat) {
-  const majors = new Set();
-  const names = sel.core === CUSTOM_CORE ? sel.plugins : [sel.core, ...sel.plugins];
-  for (const n of names) {
-    const it = findItem(cat, n, sel.triple);
-    if (it && it.cuda_major) majors.add(it.cuda_major);
-  }
-  // a custom core follows the CUDA version of the plugins, if any
-  if (sel.core === CUSTOM_CORE && sel.compile.some((ep) => CUDA_EPS.includes(ep)) && !majors.size) majors.add(sel.cudaMajor);
-  return majors;
-}
-
-function cloneSel(sel) {
-  return { ...sel, plugins: [...sel.plugins], compile: [...sel.compile], fetch: sel.fetch ? [...sel.fetch] : null };
-}
-
-// Drop the plugins that conflict with the core (after the core changed); returns them
-function dropConflictingPlugins(sel, cat) {
-  const kept = [], dropped = [];
-  for (const p of sel.plugins) {
-    const trial = cloneSel(sel);
-    trial.plugins = [...kept, p];
-    (validate(trial, cat) ? dropped : kept).push(p);
-  }
-  sel.plugins = kept;
-  return dropped;
-}
-
-// Every way to get each EP on the selected triple: [{ep, kind: "core"|"plugin"|"compile", pkg, form}]
-function options(cat, triple) {
-  const out = {};
-  const add = (ep, opt) => (out[ep] = out[ep] || []).push({ ep, ...opt });
-  for (const it of itemsFor(cat, triple)) {
-    for (const [ep, form] of Object.entries(it.eps)) add(ep, { kind: it.kind, pkg: it.package, form, item: it });
-  }
-  for (const ep of cat.compile[triple] || []) add(ep, { kind: "compile", pkg: CUSTOM_CORE, form: "compile" });
-  const order = Object.keys(cat.eps);
-  return order.filter((ep) => out[ep]).map((ep) => [ep, out[ep]]);
-}
-
-function isSelected(sel, opt) {
-  if (opt.kind === "plugin") return sel.plugins.includes(opt.pkg);
-  if (opt.kind === "compile") return sel.core === CUSTOM_CORE && sel.compile.includes(opt.ep);
-  return sel.core === opt.pkg;
-}
-
-// The selection after clicking an option; {sel, note} or {error}
-function apply(sel, opt, cat) {
+// The selection after setting an EP to "core", "plugin" or null (off); {sel, note} or {error}
+function setChoice(sel, cat, ep, form) {
   const next = cloneSel(sel);
-  let note = "";
-  if (opt.kind === "plugin") {
-    if (next.plugins.includes(opt.pkg)) next.plugins = next.plugins.filter((p) => p !== opt.pkg);
-    else next.plugins.push(opt.pkg);
-  } else if (opt.kind === "compile") {
-    if (next.core !== CUSTOM_CORE) {
-      next.core = CUSTOM_CORE;
-      next.compile = [];
+  const notes = [];
+  const name = (e) => cat.eps[e].name;
+  if (form) next.choices[ep] = form;
+  else delete next.choices[ep];
+  // TensorRT in the core brings the CUDA EP into the core (ORT builds them together)
+  for (const [e, reqs] of Object.entries(cat.requires)) {
+    if (next.choices[e] !== "core") continue;
+    for (const r of reqs) {
+      if (next.choices[r] === "core") continue;
+      if (r === ep) {  // the user moved the required EP out of the core: move the dependent EP out as well
+        const alt = pluginOptions(cat, next.triple, e).length ? "plugin" : null;
+        if (alt) next.choices[e] = alt;
+        else delete next.choices[e];
+        notes.push(`${name(e)} ${alt ? "switched to its plugin EP" : "removed"}: in the core it needs ${name(r)} in the core.`);
+      } else {
+        next.choices[r] = "core";
+        notes.push(`${name(r)} compiled into the core as well: ${name(e)} in the core needs it.`);
+      }
     }
-    if (next.compile.includes(opt.ep)) {
-      // removing an EP also removes the EPs that need it
-      const needs = (ep) => (cat.requires[ep] || []).includes(opt.ep);
-      next.compile = next.compile.filter((ep) => ep !== opt.ep && !needs(ep));
-      if (!next.compile.length) next.core = sel.lastCore || defaultCore(cat, sel.triple);
-    } else {
-      next.compile.push(opt.ep, ...(cat.requires[opt.ep] || []).filter((r) => !next.compile.includes(r)));
-    }
-  } else {
-    if (next.core === opt.pkg) return { sel: next, note };
-    next.core = opt.pkg;
-    next.lastCore = opt.pkg;
-    next.compile = [];
   }
-  if (next.core === CUSTOM_CORE && sel.core !== CUSTOM_CORE) next.lastCore = sel.core;
-  if (opt.kind !== "plugin") {
-    const dropped = dropConflictingPlugins(next, cat);
-    if (dropped.length) note = `Removed ${dropped.join(", ")}: they conflict with the new core.`;
+  // follow the CUDA version the selection can be built with
+  if (needsCuda(next, cat) && validate(next, cat)) {
+    for (const major of ["13", "12"]) {
+      const trial = cloneSel(next);
+      trial.cudaMajor = major;
+      if (major !== next.cudaMajor && !validate(trial, cat)) {
+        next.cudaMajor = major;
+        notes.push(`Switched to CUDA ${major}.`);
+        break;
+      }
+    }
   }
   const err = validate(next, cat);
-  return err ? { error: err } : { sel: next, note };
+  return err ? { error: err } : { sel: next, note: notes.join(" ") };
 }
 
-function defaultCore(cat, triple) {
-  const cores = itemsFor(cat, triple).filter((it) => it.kind === "core");
-  const def = cores.find((it) => it.package === "onnxruntime");
-  return (def || cores[0] || {}).package || "";
-}
-
-function newSelection(cat, triple) {
-  const core = defaultCore(cat, triple);
-  return { triple, core, lastCore: core, compile: [], plugins: [], cudaMajor: "13", dev: true, fetch: null };
+// Every available EP in its default form: the plugin EP where there is one, otherwise compiled into the core
+function selectAll(sel, cat) {
+  let next = cloneSel(sel);
+  for (const row of epRows(cat, sel.triple)) {
+    const form = row.plugins.length ? "plugin" : "core";
+    const r = setChoice(next, cat, row.ep, form);
+    if (r.sel) next = r.sel;
+  }
+  return next;
 }
 
 // Everything the request will contain
 function summarize(sel, cat) {
-  const eps = { ...coreEps(sel, cat) };
-  const sources = {};
-  for (const ep of Object.keys(eps)) sources[ep] = [`${eps[ep]} (${sel.core})`];
-  // packages whose first build takes long (CUDA, MIGraphX, custom cores)
+  const info = platformInfo(cat, sel.triple);
+  const sources = { cpu: ["built-in (core)"] };
   const long = [];
-  if (sel.core === CUSTOM_CORE) long.push(`custom core (${sel.compile.join(", ")})`);
-  else if (findItem(cat, sel.core, sel.triple).heavy) long.push(sel.core);
-  for (const p of sel.plugins) {
-    const it = findItem(cat, p, sel.triple);
-    if (it.heavy) long.push(p);
-    for (const [ep, form] of Object.entries(it.eps)) (sources[ep] = sources[ep] || []).push(`${form} (${p})`);
+  if (info.wasm_modes && info.wasm_modes[sel.wasmMode]) {
+    for (const ep of info.wasm_modes[sel.wasmMode].eps) sources[ep] = ["built-in (core)"];
+  }
+  let coreHeavy = false;
+  for (const ep of coreEps(sel, cat)) {
+    const c = info.core_eps[ep];
+    if (!c) continue;
+    sources[ep] = [`${c.form === "provider" ? "provider library" : "built-in"} (core)`];
+    coreHeavy = coreHeavy || c.heavy;
+  }
+  if (coreHeavy) long.push("the core");
+  const plugins = [];
+  for (const ep of pluginEps(sel, cat)) {
+    const p = pluginFor(sel, cat, ep);
+    if (!p) continue;
+    plugins.push(p);
+    if (p.heavy) long.push(p.package);
+    for (const e of Object.keys(p.eps)) (sources[e] = sources[e] || []).push(`plugin EP (${p.package})`);
   }
   const bundled = new Set(), fetchable = {}, system = new Set();
   for (const ep of Object.keys(sources)) {
@@ -203,24 +205,24 @@ function summarize(sel, cat) {
     if (f.length) fetchable[ep] = { parts: f, components: tp.components || [] };
     (tp.system || []).forEach((s) => system.add(s));
   }
-  const wanted = sel.fetch;
   const fetched = new Set();
-  for (const [ep, f] of Object.entries(fetchable)) if (!wanted || wanted.includes(ep)) f.components.forEach((c) => fetched.add(c));
-  const majors = cudaMajors(sel, cat);
-  return { sources, long, bundled: [...bundled], fetchable, fetched: [...fetched], system: [...system],
-           cudaMajor: majors.size ? [...majors][0] : null };
+  for (const [ep, f] of Object.entries(fetchable)) {
+    if (!sel.fetch || sel.fetch.includes(ep)) f.components.forEach((c) => fetched.add(c));
+  }
+  return { sources, plugins, long, bundled: [...bundled], fetchable, fetched: [...fetched], system: [...system],
+           cudaMajor: needsCuda(sel, cat) ? sel.cudaMajor : null };
 }
 
 function config(sel, cat) {
   const s = summarize(sel, cat);
-  const custom = sel.core === CUSTOM_CORE;
+  const eps = {};
+  for (const ep of Object.keys(cat.eps)) if (sel.choices[ep]) eps[ep] = sel.choices[ep];
   return {
-    schema: 2,
+    schema: 3,
     triple: sel.triple,
-    core: custom ? null : sel.core,
-    compile: custom ? sel.compile : null,
-    plugins: sel.plugins,
+    eps,
     cuda_major: s.cudaMajor,
+    wasm_mode: platformInfo(cat, sel.triple).wasm_modes ? sel.wasmMode : null,
     dev: sel.dev,
     fetch: sel.fetch ? sel.fetch.filter((ep) => s.fetchable[ep]) : null,
   };
@@ -228,15 +230,17 @@ function config(sel, cat) {
 
 function issueUrl(sel, cat) {
   const cfg = config(sel, cat);
-  const what = cfg.core || `custom core (${cfg.compile.join(", ")})`;
-  const title = `[bundle] ${sel.triple}: ${[what, ...cfg.plugins].join(" + ")}`.slice(0, 200);
+  const core = ["cpu", ...coreEps(sel, cat)].map((ep) => cat.eps[ep].name);
+  const parts = [cfg.wasm_mode ? `wasm ${cfg.wasm_mode}` : `core ${core.join("+")}`,
+                 ...pluginEps(sel, cat).map((ep) => `${cat.eps[ep].name} plugin`)];
+  const title = `[bundle] ${sel.triple}: ${parts.join(", ")}`.slice(0, 200);
   const params = new URLSearchParams({ template: "bundle.yml", title, config: JSON.stringify(cfg, null, 1) });
   return `https://github.com/${cat.repository}/issues/new?${params}`;
 }
 
 if (typeof module !== "undefined") {
-  module.exports = { platformOf, archOf, options, apply, validate, newSelection, summarize, config, issueUrl,
-                     isSelected, CUSTOM_CORE };
+  module.exports = { platformOf, archOf, epRows, newSelection, setChoice, selectAll, validate, summarize, config,
+                     issueUrl, pluginFor };
 }
 
 // ---------------------------------------------------------------------------
@@ -244,7 +248,7 @@ if (typeof module !== "undefined") {
 // ---------------------------------------------------------------------------
 
 if (typeof document !== "undefined") {
-  const $ = (sel, root = document) => root.querySelector(sel);
+  const $ = (q, root = document) => root.querySelector(q);
   const h = (tag, attrs = {}, ...children) => {
     const el = document.createElement(tag);
     for (const [k, v] of Object.entries(attrs)) {
@@ -261,25 +265,23 @@ if (typeof document !== "undefined") {
   let sel = null;
   let note = "";
 
-  const FORM_LABEL = { builtin: "built-in", provider: "provider library", plugin: "plugin EP", compile: "compile" };
-
   function store() {
     try {
-      localStorage.setItem("ortb-selection", JSON.stringify(sel));
+      localStorage.setItem("ortb-selection-v3", JSON.stringify(sel));
     } catch (e) { /* storage unavailable */ }
   }
 
   function restore() {
     try {
-      const saved = JSON.parse(localStorage.getItem("ortb-selection") || "null");
-      if (saved && cat.triples.includes(saved.triple) && !validate(saved, cat)) return saved;
+      const saved = JSON.parse(localStorage.getItem("ortb-selection-v3") || "null");
+      if (saved && cat.platforms[saved.triple] && !validate(saved, cat)) return saved;
     } catch (e) { /* ignore */ }
     return null;
   }
 
-  function setTriple(triple) {
-    sel = newSelection(cat, triple);
-    note = "";
+  function update(next, msg = "") {
+    sel = next;
+    note = msg;
     render();
   }
 
@@ -287,69 +289,88 @@ if (typeof document !== "undefined") {
     const platforms = [...new Set(cat.triples.map(platformOf))];
     const current = platformOf(sel.triple);
     const archs = cat.triples.filter((t) => platformOf(t) === current);
+    const info = platformInfo(cat, sel.triple);
     return h("section", { class: "card" },
       h("h2", {}, "1. Target"),
       h("div", { class: "row" },
         h("label", {}, "Platform",
-          h("select", { onchange: (e) => setTriple(cat.triples.find((t) => platformOf(t) === e.target.value)) },
+          h("select", { onchange: (e) => update(newSelection(cat, cat.triples.find((t) => platformOf(t) === e.target.value))) },
             platforms.map((p) => h("option", { value: p, selected: p === current }, p)))),
         h("label", {}, "Architecture",
-          h("select", { onchange: (e) => setTriple(e.target.value) },
+          h("select", { onchange: (e) => update(newSelection(cat, e.target.value)) },
             archs.map((t) => h("option", { value: t, selected: t === sel.triple }, archOf(t))))),
-        h("code", { class: "triple" }, sel.triple)));
+        h("code", { class: "triple" }, sel.triple)),
+      info.note || info.experimental ? h("p", { class: "hint" }, info.note,
+        info.experimental ? h("span", { class: "tag warn" }, " experimental target: builds may fail") : null) : null);
   }
 
-  function chip(opt) {
-    const selected = isSelected(sel, opt);
+  function choiceButton(row, form, label, detail, tags) {
+    const selected = (sel.choices[row.ep] || null) === form;
     let disabled = "";
-    if (!selected) {
-      const r = apply(sel, opt, cat);
+    if (form === "plugin" && !row.plugins.length) disabled = "no plugin EP package for this target";
+    else if (form === "core" && !row.core) disabled = "cannot be compiled into the core for this target";
+    else if (!selected) {
+      const r = setChoice(sel, cat, row.ep, form);
       if (r.error) disabled = r.error;
     }
-    const pkgLabel = opt.kind === "compile" ? "custom core" : opt.pkg.replace(/^onnxruntime-/, "");
-    const cls = ["chip", selected && "on", disabled && "off", opt.kind === "plugin" ? "plugin" : "core",
-                 opt.item && opt.item.experimental && "exp"].filter(Boolean).join(" ");
-    const title = disabled ? `Not available with the current selection: ${disabled}` :
-      opt.kind === "plugin" ? `Plugin EP package ${opt.pkg}; can be combined with any core` :
-      opt.kind === "compile" ? "Compile a custom core with this in-tree EP (takes up to a few hours)" :
-      `Core package ${opt.pkg}; selecting it replaces the current core`;
     return h("button", {
-      type: "button", class: cls, title, "aria-pressed": selected ? "true" : "false", disabled: !!disabled,
+      type: "button", class: `choice ${form || "off"}${selected ? " on" : ""}`, disabled: !!disabled,
+      "aria-pressed": selected ? "true" : "false",
+      title: disabled ? `Not available: ${disabled}` : detail,
       onclick: () => {
-        const r = apply(sel, opt, cat);
-        if (r.error) return;
-        sel = r.sel;
-        note = r.note;
-        render();
+        const r = setChoice(sel, cat, row.ep, form);
+        if (!r.error) update(r.sel, r.note);
       },
-    }, h("span", { class: "form" }, FORM_LABEL[opt.form] || opt.form), h("span", { class: "pkg" }, pkgLabel),
-       opt.item && opt.item.cuda_major ? h("span", { class: "tag" }, `CUDA ${opt.item.cuda_major}`) : null,
-       (opt.item && opt.item.heavy) || opt.kind === "compile" ? h("span", { class: "tag" }, "long build") : null,
-       opt.item && opt.item.experimental ? h("span", { class: "tag warn" }, "experimental") : null);
+    }, h("span", { class: "label" }, label), tags.filter(Boolean).map((t) => h("span", { class: `tag${t.warn ? " warn" : ""}` }, t.text)));
   }
 
   function renderEps() {
-    const rows = options(cat, sel.triple).map(([ep, opts]) => {
-      const info = cat.eps[ep];
-      const active = opts.some((o) => isSelected(sel, o));
-      return h("tr", { class: active ? "active" : "" },
-        h("th", { scope: "row" }, h("span", { class: "ep" }, info.name), h("span", { class: "vendor" }, info.vendor)),
-        h("td", {}, h("div", { class: "chips" }, opts.map(chip))));
+    const info = platformInfo(cat, sel.triple);
+    if (info.wasm_modes) {
+      return h("section", { class: "card" },
+        h("h2", {}, "2. WebAssembly build mode"),
+        h("p", { class: "hint" }, "WebAssembly builds are exclusive build modes, so the EPs come with the mode: choose one."),
+        h("div", { class: "modes" }, Object.keys(info.wasm_modes).map((m) =>
+          h("label", { class: "check" },
+            h("input", { type: "radio", name: "wasm-mode", checked: sel.wasmMode === m,
+                         onchange: () => update({ ...cloneSel(sel), wasmMode: m }) }),
+            ` ${WASM_MODES[m] || m}`))));
+    }
+    const rows = epRows(cat, sel.triple).map((row) => {
+      const p = row.plugins.length ? (pluginFor(sel, cat, row.ep) || row.plugins[0]) : null;
+      const c = row.core;
+      const ep = cat.eps[row.ep];
+      return h("tr", { class: sel.choices[row.ep] ? "active" : "" },
+        h("th", { scope: "row" }, h("span", { class: "ep" }, ep.name), h("span", { class: "vendor" }, ep.vendor)),
+        h("td", {}, h("div", { class: "choices" },
+          choiceButton(row, null, "Off", "Leave this EP out", []),
+          choiceButton(row, "plugin", "Plugin EP",
+            p ? `Add the plugin EP package ${p.package} (a separate library you register at run time)` : "",
+            [p && { text: p.package.replace(/^onnxruntime-/, "") },
+             row.plugins.length > 1 && row.plugins.some((o) => o.cuda_major) && { text: `CUDA ${row.plugins.map((o) => o.cuda_major).join("/")}` },
+             p && p.heavy && { text: "long build" }, p && p.experimental && { text: "experimental", warn: true }]),
+          choiceButton(row, "core", "In core",
+            c ? `Compile into the core library (${c.form === "provider" ? "provider library next to it" : "built-in"})${c.note ? ": " + c.note : ""}` : "",
+            [c && { text: c.form === "provider" ? "provider library" : "built-in" },
+             c && c.cuda && { text: `CUDA ${c.cuda.join("/")}` },
+             c && c.heavy && { text: "long build" }, c && c.experimental && { text: "experimental", warn: true }])),
+          c && c.note && sel.choices[row.ep] === "core" ? h("p", { class: "ep-note" }, c.note) : null));
     });
-    const custom = sel.core === CUSTOM_CORE;
-    const cudaCompile = custom && sel.compile.some((ep) => CUDA_EPS.includes(ep));
-    const pluginMajors = new Set(sel.plugins.map((p) => findItem(cat, p, sel.triple).cuda_major).filter(Boolean));
+    const cuda = needsCuda(sel, cat);
     return h("section", { class: "card" },
       h("h2", {}, "2. Execution providers"),
       h("p", { class: "hint" },
-        "Every row lists the ways to get an EP: inside a core package (built-in, or a provider library next to the core), ",
-        "as a plugin EP package, or compiled into a custom core. Exactly one core is used; plugin EPs combine with any core. ",
-        "Options that conflict with the current selection are disabled; hover them for the reason."),
-      h("p", { class: "current" }, "Core: ",
-        h("strong", {}, custom ? `custom core with ${sel.compile.join(", ")} (compiled for this request)` : sel.core),
-        cudaCompile && !pluginMajors.size ? h("label", { class: "inline" }, " CUDA ",
-          h("select", { onchange: (e) => { sel.cudaMajor = e.target.value; render(); } },
-            ["12", "13"].map((v) => h("option", { value: v, selected: v === sel.cudaMajor }, `${v}.x`)))) : null),
+        "For every EP choose whether to leave it out, add its plugin EP package (a separate library, built once and ",
+        "reused by every bundle), or compile it into the core library. CPU is always in the core. Options that do not ",
+        "work with the current selection are disabled; hover them for the reason."),
+      h("div", { class: "toolbar" },
+        h("button", { type: "button", class: "button", onclick: () => update(selectAll(sel, cat), "Selected every EP this target offers (plugin EPs where there are any).") }, "Select all"),
+        h("button", { type: "button", class: "button", onclick: () => update(newSelection(cat, sel.triple)) }, "Reset"),
+        cuda ? h("label", { class: "inline" }, "CUDA ",
+          h("select", { onchange: (e) => {
+            const trial = { ...cloneSel(sel), cudaMajor: e.target.value };
+            update(trial, validate(trial, cat) ? `Not possible with CUDA ${e.target.value}: ${validate(trial, cat)}` : "");
+          } }, ["12", "13"].map((v) => h("option", { value: v, selected: v === sel.cudaMajor }, `${v}.x`)))) : null),
       note ? h("p", { class: "note", role: "status" }, note) : null,
       h("div", { class: "table-wrap" }, h("table", { class: "eps" }, h("tbody", {}, rows))));
   }
@@ -359,15 +380,14 @@ if (typeof document !== "undefined") {
     return h("section", { class: "card" },
       h("h2", {}, "3. Options"),
       h("label", { class: "check" },
-        h("input", { type: "checkbox", checked: sel.dev, onchange: (e) => { sel.dev = e.target.checked; render(); } }),
+        h("input", { type: "checkbox", checked: sel.dev, onchange: (e) => update({ ...cloneSel(sel), dev: e.target.checked }) }),
         " Headers and link files of the backends (the bundle includes those it may redistribute; fetch-restricted downloads the others)"),
       fetchEps.length ? h("fieldset", {},
         h("legend", {}, "Fetched on your machine by fetch-restricted"),
         fetchEps.map((ep) => h("label", { class: "check" },
           h("input", { type: "checkbox", checked: !sel.fetch || sel.fetch.includes(ep), onchange: (e) => {
             const all = fetchEps.filter((x) => !sel.fetch || sel.fetch.includes(x));
-            sel.fetch = e.target.checked ? [...new Set([...all, ep])] : all.filter((x) => x !== ep);
-            render();
+            update({ ...cloneSel(sel), fetch: e.target.checked ? [...new Set([...all, ep])] : all.filter((x) => x !== ep) });
           } }),
           ` ${cat.eps[ep].name}: ${s.fetchable[ep].parts.map((p) => p.split(":")[1] === "dev" ? "headers / import libraries" : "runtime").join(", ")}`))) : null);
   }
@@ -385,8 +405,8 @@ if (typeof document !== "undefined") {
       h("div", { class: "table-wrap" }, h("table", { class: "summary" },
         h("thead", {}, h("tr", {}, h("th", {}, "EP"), h("th", {}, "Provided as"))), h("tbody", {}, rows))),
       h("p", {}, "Every package is built for the request unless an earlier request built it from the same sources in ",
-        "the last 90 days. ", s.long.length ? `First builds of ${s.long.join(", ")} take up to a few hours.`
-          : "This selection builds in well under an hour."),
+        "the last 90 days (a core is reused for the same set of EPs). ",
+        s.long.length ? `First builds of ${s.long.join(", ")} take up to a few hours.` : "This selection builds in about an hour or less."),
       s.bundled.length ? h("p", {}, "Bundled third-party runtimes: ", s.bundled.map((c) => comp(c).name).join(", "), ".") : null,
       s.fetched.length ? h("p", {}, "Downloaded on your machine by fetch-restricted: ",
         s.fetched.map((c) => `${comp(c).name} (${comp(c).fetched})`).join("; "), ".") : null,
@@ -399,7 +419,7 @@ if (typeof document !== "undefined") {
       h("label", { class: "check ack" },
         h("input", { type: "checkbox", id: "ack", checked: ack, onchange: () => render() }),
         licenses.length ? " I have read these licenses and accept them for the bundled and fetched files."
-          : " I understand that the bundle is built from this repository's packages under their licenses."),
+          : " I understand that the bundle is built from this repository's sources under their licenses."),
       err ? h("p", { class: "error", role: "alert" }, err) : null,
       h("div", { class: "actions" },
         h("a", { class: `button primary${err || !ack ? " disabled" : ""}`, href: err || !ack ? undefined : issueUrl(sel, cat),
@@ -417,9 +437,8 @@ if (typeof document !== "undefined") {
   function render() {
     store();
     const s = summarize(sel, cat);
-    const app = $("#app");
     const focus = document.activeElement && document.activeElement.id;
-    app.replaceChildren(renderTarget(), renderEps(), renderOptions(s), renderSummary(s));
+    $("#app").replaceChildren(renderTarget(), renderEps(), renderOptions(s), renderSummary(s));
     if (focus && document.getElementById(focus)) document.getElementById(focus).focus();
   }
 
