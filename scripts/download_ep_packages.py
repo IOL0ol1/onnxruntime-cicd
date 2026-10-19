@@ -2,14 +2,14 @@
 """Download external SDKs and dependencies that EP builds need but cannot fetch automatically at build time.
 
 Scope (obsolete / deprecated EPs are ignored):
-  - Closed-source SDKs: CUDA, cuDNN, TensorRT, TensorRT-RTX, QAIRT (QNN), CANN, Vitis AI runtime
+  - Closed-source SDKs: CUDA, cuDNN, TensorRT, TensorRT-RTX, QAIRT (QNN), DirectML, CANN, Vitis AI runtime
   - Open-source SDKs that must be installed beforehand: OpenVINO, ROCm, Android NDK, Vulkan SDK,
     ONNX Runtime prebuilt packages (used by plugin EP builds)
   - Open-source dependencies whose sources must be prepared before building (shallow git clone):
     TIM-VX, zDNN
 
 Every source is an official direct link or official mirror that requires no account (NVIDIA redist /
-developer.download.nvidia.com, Qualcomm softwarecenter public API, Huawei Cloud Ascend artifactory,
+developer.download.nvidia.com, Qualcomm softwarecenter public API, api.nuget.org, Huawei Cloud Ascend artifactory,
 repo.amd.com, pypi.amd.com, storage.openvinotoolkit.org, dl.google.com, sdk.lunarg.com, GitHub Releases).
 
 Only the Python standard library is required (git components also need git). Examples:
@@ -458,6 +458,45 @@ def resolve_vulkan_sdk(ctx: Context, version: str) -> Resolved:
                     note="provides glslc (the Vulkan plugin EP compiles its shaders with it)")
 
 
+NUGET = "https://api.nuget.org/v3-flatcontainer"
+
+
+def resolve_directml(ctx: Context, version: str) -> Resolved:
+    if not ctx.platform.startswith("windows"):
+        _unsupported()
+    if version == LATEST:
+        version = latest(http_json(f"{NUGET}/microsoft.ai.directml/index.json")["versions"])
+    name = f"microsoft.ai.directml.{version}.nupkg"
+    return Resolved(version, [FileItem(f"{NUGET}/microsoft.ai.directml/{version}/{name}", name)],
+                    note="NuGet package (a zip): DirectML.dll in bin/<arch>-win/, headers in include/")
+
+
+# platform -> wheel platform tag of iree-base-compiler (its cp312-abi3 wheels serve every Python version)
+IREE_WHEEL_TAGS = {"linux-x86_64": "manylinux_2_27_x86_64", "linux-aarch64": "manylinux_2_27_aarch64",
+                   "windows-x86_64": "win_amd64", "macos-arm64": "macosx_13_0_universal2"}
+
+
+def resolve_iree_compiler(ctx: Context, version: str) -> Resolved:
+    tag = IREE_WHEEL_TAGS.get(ctx.platform) or _unsupported()
+    if version == "default":  # the version the IREE plugin EP is built and tested with
+        reqs = read_submodule("eps/community/onnxruntime-ep-iree/requirements-dev.txt")
+        version = re.search(r"^iree-base-compiler==(\S+)", reqs, re.M).group(1)
+    elif version == LATEST:
+        version = http_json("https://pypi.org/pypi/iree-base-compiler/json")["info"]["version"]
+    try:  # releases are on PyPI, release candidates only on the IREE GitHub releases
+        assets = [(u["filename"], u["url"], u["digests"]["sha256"])
+                  for u in http_json(f"https://pypi.org/pypi/iree-base-compiler/{version}/json")["urls"]]
+    except urllib.error.HTTPError:
+        release = http_json(f"https://api.github.com/repos/iree-org/iree/releases/tags/iree-{version}")
+        assets = [(a["name"], a["browser_download_url"], (a.get("digest") or "").removeprefix("sha256:") or None)
+                  for a in release["assets"]]
+    wheel = next((a for a in assets if re.fullmatch(rf"iree_base_compiler-{re.escape(version)}-cp\d+-abi3-.*{tag}.*\.whl",
+                                                    a[0])), None) or _unsupported(f"no iree-base-compiler {version} wheel")
+    license_url = "https://raw.githubusercontent.com/iree-org/iree/main/LICENSE"  # the wheel has no license text
+    return Resolved(version, [FileItem(wheel[1], wheel[0], wheel[2]), FileItem(license_url, "LICENSE")],
+                    note="the compiler library is iree/compiler/_mlir_libs/*IREECompiler.* in the wheel")
+
+
 def _git_resolver(repo: str, default_ref: Callable[[], str]) -> Callable[[Context, str], Resolved]:
     def resolve(ctx: Context, version: str) -> Resolved:
         ref = default_ref() if version == LATEST else version
@@ -498,6 +537,11 @@ COMPONENTS: tuple[Component, ...] = (
     Component("openvino", "Intel OpenVINO",
               ("linux-x86_64", "linux-aarch64", "windows-x86_64", "macos-arm64"), "2026.2.1", resolve_openvino,
               "storage.openvinotoolkit.org"),
+    # The default version matches onnxruntime/packages.config and the AMD plugin EPs
+    Component("directml", "DirectML (in-tree + onnxruntime-ep-amdgpu)", ("windows-x86_64", "windows-arm64", "windows-arm64x"),
+              "1.15.4", resolve_directml, "api.nuget.org (Microsoft.AI.DirectML)"),
+    Component("iree-compiler", "IREE plugin EP (the compiler library it loads at run time)", tuple(IREE_WHEEL_TAGS),
+              "default", resolve_iree_compiler, "pypi.org / github.com/iree-org/iree releases (iree-base-compiler)"),
     Component("cann", "Huawei CANN", ("linux-x86_64", "linux-aarch64"), LATEST, resolve_cann,
               "ascend.devcloud.huaweicloud.com artifactory (official Huawei Cloud mirror)"),
     Component("rocm", "AMD MIGraphX / AMDGPU (in-tree + onnxruntime-ep-amdgpu)", ("linux-x86_64", "windows-x86_64"), LATEST,

@@ -21,7 +21,7 @@ from pathlib import Path
 
 import plan
 
-SCHEMA = 4
+SCHEMA = 5
 
 # EP -> (display name, vendor). Order is the display order.
 EPS = {
@@ -72,41 +72,54 @@ PLUGINS = {
     ("ep-vulkan", "default"): (["vulkan"], ["onnxruntime_vulkan_ep"]),
 }
 
-# Third-party components a bundle needs for an EP. "bundle": the bundle job adds the component's runtime files (its
-# license allows redistributing them with an application); "fetch": fetch-restricted.(sh|ps1) in the bundle downloads
-# these parts on the user's machine (runtime, or dev = headers and import libraries); "system": installed by the user.
-# The other runtimes (DirectML, OpenVINO, QAIRT, TensorRT RTX, oneDNN, MIGraphX, ...) are already in the packages.
+# Third-party files a bundle needs for an EP, besides the open-source components the packages build from source and
+# contain (oneDNN, TIM-VX, DXC, MIGraphX, MLX, ...):
+#   "optional": runtimes the bundle may contain; the request chooses whether the assemble job adds them or the bundle's
+#               fetch-restricted.(sh|ps1) downloads them on the user's machine. These are vendor runtimes whose licenses
+#               allow redistributing them with an application, and large open-source libraries. "size_mb" estimates
+#               them (unpacked).
+#   "fetch":    files whose licenses do not allow redistributing them, always downloaded by fetch-restricted
+#               (dev = headers and import libraries)
+#   "system":   installed by the user
 EP_THIRD_PARTY = {
-    "cuda": {"bundle": ["cuda"], "fetch": ["cuda:dev"], "components": ["cuda", "cudnn"]},
-    "tensorrt": {"bundle": ["tensorrt"], "fetch": ["tensorrt:dev"], "components": ["cuda", "tensorrt"]},
-    "nv-tensorrt-rtx": {"fetch": ["nv-tensorrt-rtx:dev"], "components": ["cuda", "tensorrt-rtx"]},
-    "qnn": {"fetch": ["qnn:dev"], "components": ["qairt"]},
-    "openvino": {"fetch": ["openvino:dev"], "components": ["openvino"]},
+    "cuda": {"optional": ["cuda"], "size_mb": 2300, "fetch": ["cuda:dev"], "components": ["cuda", "cudnn"]},
+    "tensorrt": {"optional": ["tensorrt"], "size_mb": 2500, "fetch": ["tensorrt:dev"], "components": ["cuda", "tensorrt"]},
+    "nv-tensorrt-rtx": {"optional": ["nv-tensorrt-rtx"], "size_mb": 200, "fetch": ["nv-tensorrt-rtx:dev"],
+                        "components": ["cuda", "tensorrt-rtx"]},
+    "qnn": {"optional": ["qnn"], "size_mb": 200, "fetch": ["qnn:dev"], "components": ["qairt"]},
+    "openvino": {"optional": ["openvino"], "size_mb": 200, "fetch": ["openvino:dev"], "components": ["openvino"]},
+    "dml": {"optional": ["dml"], "size_mb": 20, "fetch": ["dml:dev"], "components": ["directml"]},
+    "iree": {"optional": ["iree"], "size_mb": 200, "components": ["iree-compiler"]},
     "vitisai": {"fetch": ["vitisai:runtime"], "components": ["vitisai"]},
     "cann": {"fetch": ["cann:runtime"], "components": ["cann"]},
     "migraphx": {"system": ["rocm"]},
     "amdgpu": {"system": ["rocm"]},
 }
+# What the parts of a component are: "runtime" (its runtime files), "dev" (headers and import libraries), "system"
 COMPONENTS = {
     "cuda": {"name": "NVIDIA CUDA Toolkit", "license": "https://docs.nvidia.com/cuda/eula/index.html",
-             "bundled": "runtime libraries", "fetched": "headers and import libraries"},
+             "runtime": "runtime libraries", "dev": "headers and import libraries"},
     "cudnn": {"name": "NVIDIA cuDNN", "license": "https://docs.nvidia.com/deeplearning/cudnn/latest/reference/eula.html",
-              "bundled": "runtime libraries", "fetched": "headers and import libraries"},
+              "runtime": "runtime libraries", "dev": "headers and import libraries"},
     "tensorrt": {"name": "NVIDIA TensorRT", "license": "https://docs.nvidia.com/deeplearning/tensorrt/latest/reference/sla.html",
-                 "bundled": "runtime libraries", "fetched": "headers and import libraries"},
+                 "runtime": "runtime libraries", "dev": "headers and import libraries"},
     "tensorrt-rtx": {"name": "NVIDIA TensorRT for RTX",
                      "license": "https://docs.nvidia.com/deeplearning/tensorrt-rtx/latest/reference/sla.html",
-                     "bundled": "runtime libraries", "fetched": "headers and import libraries"},
+                     "runtime": "runtime libraries", "dev": "headers and import libraries"},
     "qairt": {"name": "Qualcomm AI Runtime (QAIRT)",
               "license": "https://www.qualcomm.com/developer/software/qualcomm-ai-engine-direct-sdk",
-              "bundled": "runtime libraries", "fetched": "headers (the license allows object code only)"},
+              "runtime": "runtime libraries", "dev": "headers (the license allows object code only)"},
     "openvino": {"name": "Intel OpenVINO",
                  "license": "https://www.intel.com/content/www/us/en/developer/articles/license/end-user-license-agreement.html",
-                 "bundled": "runtime files listed in its redist.txt", "fetched": "headers and import libraries"},
+                 "runtime": "runtime files listed in its redist.txt", "dev": "headers and import libraries"},
+    "directml": {"name": "Microsoft DirectML", "license": "https://www.nuget.org/packages/Microsoft.AI.DirectML",
+                 "runtime": "DirectML.dll", "dev": "DirectML.h and the import library"},
+    "iree-compiler": {"name": "IREE compiler", "license": "https://github.com/iree-org/iree/blob/main/LICENSE",
+                      "runtime": "the compiler library the IREE EP loads at run time"},
     "vitisai": {"name": "AMD Vitis AI runtime (Ryzen AI)", "license": "https://ryzenai.docs.amd.com/en/latest/licenses.html",
-                "fetched": "runtime libraries (redistribution terms not verified)"},
+                "runtime": "runtime libraries (redistribution terms not verified)"},
     "cann": {"name": "Huawei CANN toolkit", "license": "https://www.hiascend.com/software/cann",
-             "fetched": "the toolkit, installed by its vendor installer (not redistributable)"},
+             "runtime": "the toolkit, installed by its vendor installer (not redistributable)"},
     "rocm": {"name": "AMD ROCm", "license": "https://rocm.docs.amd.com/en/latest/about/license.html",
              "system": "install ROCm (Linux /opt/rocm) or the HIP SDK (Windows) yourself"},
 }
@@ -120,6 +133,20 @@ CORE_NOTES = {
     "migraphx": "the core is built in the ROCm container; combinations with other EPs are untested",
     "vsinpu": "built with the TIM-VX x86 simulator driver",
     "cann": "the CANN toolkit is installed on your machine by fetch-restricted",
+}
+# Linkage choices of in-tree EPs in a desktop core, on the OSes ORT's CI builds them for (windows_webgpu.yml builds Dawn as
+# a shared library, windows_qnn_x64.yml the QNN EP as both library kinds). Only for an EP in the core: a plugin EP is
+# always a separate library, and ORT does not support a shared Dawn with the WebGPU plugin EP
+# (onnxruntime_USE_EP_API_ADAPTERS and onnxruntime_BUILD_DAWN_SHARED_LIBRARY are mutually exclusive). A choice may change
+# the EP's form in the core ("form"); the first choice is the default.
+LINK_OPTIONS = {
+    "webgpu": {"label": "Dawn", "os": ("windows", "linux"), "plugin": "the WebGPU plugin EP always links Dawn statically",
+               "choices": {"static": {"text": "linked into the core library"},
+                           "shared": {"text": "webgpu_dawn library next to the core library"}}},
+    "qnn": {"label": "Linkage", "os": ("windows",), "plugin": "the QNN plugin EP is always a separate library",
+            "choices": {"shared": {"text": "provider library onnxruntime_providers_qnn next to the core library",
+                                   "form": "provider"},
+                        "static": {"text": "linked into the core library", "form": "builtin"}}},
 }
 PLATFORM_NOTES = {
     "wasm": "WebAssembly builds are one of five exclusive build modes",
@@ -148,6 +175,11 @@ def platform_item(core: dict) -> dict:
         eps[ep] = {"form": "provider" if lib else "builtin", "lib": lib, "cuda": req.get("cuda"),
                    "experimental": bool(req.get("experimental")), "heavy": bool(req.get("heavy")),
                    "note": CORE_NOTES.get(ep, "")}
+        opts = LINK_OPTIONS.get(ep)
+        target_os = "windows" if "-windows-" in core["triple"] else "linux" if core["triple"].endswith("-linux-gnu") else ""
+        if opts and core["platform"] == "desktop" and target_os in opts["os"]:
+            eps[ep]["link"] = {"label": opts["label"], "default": next(iter(opts["choices"])), "choices": opts["choices"],
+                               "plugin": opts["plugin"]}
     item = {"platform": core["platform"], "core_eps": {ep: eps[ep] for ep in EPS if ep in eps},
             "core_from": core.get("core_from"), "experimental": bool(core.get("experimental")),
             "note": PLATFORM_NOTES.get(core["platform"], ""),
@@ -165,6 +197,9 @@ def source() -> dict:
 
 
 def catalog() -> dict:
+    for ep, opts in LINK_OPTIONS.items():
+        if tuple(opts["choices"]) != plan.build.LINK_CHOICES[ep]:
+            raise SystemExit(f"LINK_OPTIONS[{ep!r}] does not match ci/build.py LINK_CHOICES")
     platforms = {t: platform_item(c) for t, c in plan.cores().items()}
     plugins = [plugin_item(e) for e in plan.entries()]
     for p in plugins:

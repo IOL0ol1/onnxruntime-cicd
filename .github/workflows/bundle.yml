@@ -6,8 +6,10 @@
 # - ci/bundle.py resolve validates the configuration and plans the packages (ci/plan.py): each one is named after the
 #   hash of its build inputs, and an unexpired artifact with that name from an earlier run is reused; the others are
 #   built by the build matrix and kept for 90 days.
-# - The bundle is uploaded as an artifact (90 days; downloading needs a GitHub login). Third-party files whose licenses
-#   do not allow redistributing them are fetched on the user's machine by fetch-restricted.(sh|ps1) in the bundle.
+# - The bundle is uploaded as an artifact (90 days; downloading needs a GitHub login). The packages contain no vendor
+#   runtimes: the bundle adds the optional third-party runtimes the request chose to bundle, and fetch-restricted.(sh|ps1)
+#   in the bundle downloads the others, and the files whose licenses do not allow redistributing them, on the user's
+#   machine.
 # - Editing the issue rebuilds it; a comment starting with /rebuild rebuilds it without reusing earlier artifacts.
 #
 # Optional repository variables (Settings -> Variables):

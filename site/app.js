@@ -61,12 +61,20 @@ function newSelection(cat, triple) {
   const info = platformInfo(cat, triple);
   const choices = {};
   for (const ep of info.default_core) choices[ep] = "core";
-  return { triple, choices, cudaMajor: "13", wasmMode: info.wasm_modes ? "cpu" : null, dev: true, fetch: null };
+  return { triple, choices, link: {}, cudaMajor: "13", wasmMode: info.wasm_modes ? "cpu" : null, dev: true,
+           fetch: null, bundle: [] };
 }
 
 function cloneSel(sel) {
-  return { ...sel, choices: { ...sel.choices }, fetch: sel.fetch ? [...sel.fetch] : null };
+  return { ...sel, choices: { ...sel.choices }, link: { ...sel.link }, fetch: sel.fetch ? [...sel.fetch] : null,
+           bundle: [...sel.bundle] };
 }
+
+// The linkage choice of an EP in the core (null if it has none), and the form it gives the EP there
+const linkOf = (sel, c, ep) => (c && c.link ? sel.link[ep] || c.link.default : null);
+const coreForm = (sel, c, ep) => (c.link && (c.link.choices[linkOf(sel, c, ep)] || {}).form) || c.form;
+
+const formatSize = (mb) => (mb >= 1000 ? `${(mb / 1000).toFixed(1)} GB` : `${mb} MB`);
 
 const coreEps = (sel, cat) => Object.keys(cat.eps).filter((ep) => sel.choices[ep] === "core");
 const pluginEps = (sel, cat) => Object.keys(cat.eps).filter((ep) => sel.choices[ep] === "plugin");
@@ -95,13 +103,17 @@ function validate(sel, cat) {
     if (!info.core_eps[ep]) return `${name(ep)} cannot be compiled into the core for ${sel.triple}`;
     const missing = (cat.requires[ep] || []).filter((r) => sel.choices[r] !== "core");
     if (missing.length) return `${name(ep)} in the core needs ${missing.map(name).join(", ")} in the core as well`;
-    const cuda = info.core_eps[ep].cuda;
+    const c = info.core_eps[ep];
+    if (c.link && !c.link.choices[linkOf(sel, c, ep)]) return `${name(ep)}: unknown ${c.link.label} choice`;
+    const cuda = c.cuda;
     if (CUDA_EPS.includes(ep) && cuda && !cuda.includes(sel.cudaMajor)) {
       return `${name(ep)} in the core is built with CUDA ${cuda.join(" / ")} for this target, not CUDA ${sel.cudaMajor}`;
     }
   }
   const owner = {};
-  const parts = [["onnxruntime", ["onnxruntime", ...coreEps(sel, cat).map((ep) => info.core_eps[ep].lib).filter(Boolean)]]];
+  const coreLibs = coreEps(sel, cat).filter((ep) => coreForm(sel, info.core_eps[ep], ep) === "provider")
+    .map((ep) => info.core_eps[ep].lib);
+  const parts = [["onnxruntime", ["onnxruntime", ...coreLibs]]];
   for (const ep of pluginEps(sel, cat)) {
     const options = pluginOptions(cat, sel.triple, ep);
     if (!options.length) return `${name(ep)} has no plugin EP package for ${sel.triple}`;
@@ -140,6 +152,14 @@ function setChoice(sel, cat, ep, form) {
         notes.push(`${name(r)} compiled into the core as well: ${name(e)} in the core needs it.`);
       }
     }
+  }
+  // a linkage choice applies to an EP in the core only: a plugin EP is a separate library
+  const coreInfo = platformInfo(cat, next.triple).core_eps;
+  for (const e of Object.keys(next.link)) {
+    if (next.choices[e] === "core") continue;
+    const c = coreInfo[e];
+    if (c && c.link && next.link[e] !== c.link.default && next.choices[e] === "plugin") notes.push(`${name(e)}: ${c.link.plugin}.`);
+    delete next.link[e];
   }
   // follow the CUDA version the selection can be built with
   if (needsCuda(next, cat) && validate(next, cat)) {
@@ -180,7 +200,9 @@ function summarize(sel, cat) {
   for (const ep of coreEps(sel, cat)) {
     const c = info.core_eps[ep];
     if (!c) continue;
-    sources[ep] = [`${c.form === "provider" ? "provider library" : "built-in"} (core)`];
+    const link = linkOf(sel, c, ep);
+    sources[ep] = [`${coreForm(sel, c, ep) === "provider" ? "provider library" : "built-in"} (core` +
+                   `${link ? `; ${c.link.label}: ${link === "shared" ? "dynamic" : "static"}` : ""})`];
     coreHeavy = coreHeavy || c.heavy;
   }
   if (coreHeavy) long.push("the core");
@@ -192,34 +214,50 @@ function summarize(sel, cat) {
     if (p.heavy) long.push(p.package);
     for (const e of Object.keys(p.eps)) (sources[e] = sources[e] || []).push(`plugin EP (${p.package})`);
   }
-  const bundled = new Set(), fetchable = {}, system = new Set();
+  // optional: EPs whose runtimes the bundle may contain (the rest is downloaded by fetch-restricted)
+  const bundled = new Set(), optional = {}, fetchable = {}, system = new Set();
+  let bundleSize = 0;
   for (const ep of Object.keys(sources)) {
     const tp = cat.third_party[ep] || {};
-    if (tp.bundle) (tp.components || []).forEach((c) => bundled.add(c));
-    const f = (tp.fetch || []).filter((x) => sel.dev || !x.endsWith(":dev"));
-    if (f.length) fetchable[ep] = { parts: f, components: tp.components || [] };
+    const comps = tp.components || [];
+    const inBundle = !!tp.optional && sel.bundle.includes(ep);
+    if (tp.optional) optional[ep] = { size: tp.size_mb, components: comps, bundle: inBundle };
+    if (inBundle) {
+      comps.forEach((c) => bundled.add(c));
+      bundleSize += tp.size_mb;
+    }
+    const parts = [...(tp.optional && !inBundle ? tp.optional : []),
+                   ...(tp.fetch || []).filter((x) => sel.dev || !x.endsWith(":dev"))];
+    if (parts.length) fetchable[ep] = { parts, components: comps };
     (tp.system || []).forEach((s) => system.add(s));
   }
-  const fetched = new Set();
+  const fetched = {};  // component -> Set of parts ("runtime", "dev")
   for (const [ep, f] of Object.entries(fetchable)) {
-    if (!sel.fetch || sel.fetch.includes(ep)) f.components.forEach((c) => fetched.add(c));
+    if (sel.fetch && !sel.fetch.includes(ep)) continue;
+    for (const c of f.components) {
+      for (const p of f.parts) (fetched[c] = fetched[c] || new Set()).add(p.endsWith(":dev") ? "dev" : "runtime");
+    }
   }
-  return { sources, plugins, long, bundled: [...bundled], fetchable, fetched: [...fetched], system: [...system],
-           cudaMajor: needsCuda(sel, cat) ? sel.cudaMajor : null };
+  return { sources, plugins, long, bundled: [...bundled], bundleSize, optional, fetchable, fetched,
+           system: [...system], cudaMajor: needsCuda(sel, cat) ? sel.cudaMajor : null };
 }
 
 function config(sel, cat) {
   const s = summarize(sel, cat);
+  const info = platformInfo(cat, sel.triple);
   const eps = {};
   for (const ep of Object.keys(cat.eps)) if (sel.choices[ep]) eps[ep] = sel.choices[ep];
   return {
-    schema: 3,
+    schema: 4,
     triple: sel.triple,
     eps,
     cuda_major: s.cudaMajor,
     wasm_mode: platformInfo(cat, sel.triple).wasm_modes ? sel.wasmMode : null,
     dev: sel.dev,
     fetch: sel.fetch ? sel.fetch.filter((ep) => s.fetchable[ep]) : null,
+    bundle: sel.bundle.filter((ep) => s.optional[ep]),
+    link: Object.fromEntries(coreEps(sel, cat).filter((ep) => (info.core_eps[ep] || {}).link)
+      .map((ep) => [ep, linkOf(sel, info.core_eps[ep], ep)])),
   };
 }
 
@@ -258,13 +296,13 @@ if (typeof document !== "undefined") {
 
   function store() {
     try {
-      localStorage.setItem("ortb-selection-v3", JSON.stringify(sel));
+      localStorage.setItem("ortb-selection-v4", JSON.stringify(sel));
     } catch (e) { /* storage unavailable */ }
   }
 
   function restore() {
     try {
-      const saved = JSON.parse(localStorage.getItem("ortb-selection-v3") || "null");
+      const saved = JSON.parse(localStorage.getItem("ortb-selection-v4") || "null");
       if (saved && cat.platforms[saved.triple] && !validate(saved, cat)) return saved;
     } catch (e) { /* ignore */ }
     return null;
@@ -342,9 +380,14 @@ if (typeof document !== "undefined") {
              p && p.heavy && { text: "long build" }, p && p.experimental && { text: "experimental", warn: true }]),
           choiceButton(row, "core", "In core",
             c ? `Compile into the core library (${c.form === "provider" ? "provider library next to it" : "built-in"})${c.note ? ": " + c.note : ""}` : "",
-            [c && { text: c.form === "provider" ? "provider library" : "built-in" },
+            [c && { text: coreForm(sel, c, row.ep) === "provider" ? "provider library" : "built-in" },
              c && c.cuda && { text: `CUDA ${c.cuda.join("/")}` },
              c && c.heavy && { text: "long build" }, c && c.experimental && { text: "experimental", warn: true }])),
+          c && c.link && sel.choices[row.ep] === "core" ? h("label", { class: "inline" }, `${c.link.label} `,
+            h("select", { onchange: (e) => { const next = cloneSel(sel); next.link[row.ep] = e.target.value; update(next); } },
+              Object.entries(c.link.choices).map(([k, v]) => h("option", { value: k, selected: k === linkOf(sel, c, row.ep) },
+                `${k === "shared" ? "dynamic" : "static"}: ${v.text}`)))) : null,
+          c && c.link && sel.choices[row.ep] === "plugin" ? h("p", { class: "ep-note" }, `${c.link.label}: ${c.link.plugin}`) : null,
           c && c.note && sel.choices[row.ep] === "core" ? h("p", { class: "ep-note" }, c.note) : null));
     });
     const cuda = needsCuda(sel, cat);
@@ -368,11 +411,29 @@ if (typeof document !== "undefined") {
 
   function renderOptions(s) {
     const fetchEps = Object.keys(s.fetchable);
+    const optionalEps = Object.keys(s.optional);
+    const setBundle = (ep, on) => {
+      const next = cloneSel(sel);
+      next.bundle = on ? [...new Set([...next.bundle, ep])] : next.bundle.filter((x) => x !== ep);
+      update(next);
+    };
     return h("section", { class: "card" },
       h("h2", {}, "3. Options"),
       h("label", { class: "check" },
         h("input", { type: "checkbox", checked: sel.dev, onchange: (e) => update({ ...cloneSel(sel), dev: e.target.checked }) }),
         " Headers and link files of the backends (the bundle includes those it may redistribute; fetch-restricted downloads the others)"),
+      optionalEps.length ? h("fieldset", {},
+        h("legend", {}, "Third-party runtimes: in the bundle or downloaded on your machine"),
+        h("p", { class: "hint" }, "Vendor runtimes that may be redistributed with an application, and large open-source ",
+          "libraries. In the bundle they are ready to use; otherwise fetch-restricted downloads them from their vendors. ",
+          "Sizes are estimates (unpacked)."),
+        optionalEps.map((ep) => h("label", { class: "inline" },
+          `${cat.eps[ep].name} (${s.optional[ep].components.map((c) => cat.components[c].name).join(", ")}) `,
+          h("select", { onchange: (e) => setBundle(ep, e.target.value === "bundle") },
+            h("option", { value: "fetch", selected: !s.optional[ep].bundle }, "Download on your machine"),
+            h("option", { value: "bundle", selected: s.optional[ep].bundle },
+              `In the bundle (about ${formatSize(s.optional[ep].size)})`)))),
+        s.bundleSize ? h("p", { class: "hint" }, `In the bundle: about ${formatSize(s.bundleSize)} in total.`) : null) : null,
       fetchEps.length ? h("fieldset", {},
         h("legend", {}, "Fetched on your machine by fetch-restricted"),
         fetchEps.map((ep) => h("label", { class: "check" },
@@ -386,7 +447,7 @@ if (typeof document !== "undefined") {
   function renderSummary(s) {
     const err = validate(sel, cat);
     const comp = (c) => cat.components[c];
-    const licenses = [...new Set([...s.bundled, ...s.fetched])];
+    const licenses = [...new Set([...s.bundled, ...Object.keys(s.fetched)])];
     const cfg = config(sel, cat);
     const ack = $("#ack") && $("#ack").checked;
     const rows = Object.entries(s.sources).map(([ep, srcs]) =>
@@ -398,9 +459,11 @@ if (typeof document !== "undefined") {
       h("p", {}, "Every package is built for the request unless an earlier request built it from the same sources in ",
         "the last 90 days (a core is reused for the same set of EPs). ",
         s.long.length ? `First builds of ${s.long.join(", ")} take up to a few hours.` : "This selection builds in about an hour or less."),
-      s.bundled.length ? h("p", {}, "Bundled third-party runtimes: ", s.bundled.map((c) => comp(c).name).join(", "), ".") : null,
-      s.fetched.length ? h("p", {}, "Downloaded on your machine by fetch-restricted: ",
-        s.fetched.map((c) => `${comp(c).name} (${comp(c).fetched})`).join("; "), ".") : null,
+      s.bundled.length ? h("p", {}, `Bundled third-party runtimes (about ${formatSize(s.bundleSize)}): `,
+        s.bundled.map((c) => comp(c).name).join(", "), ".") : null,
+      Object.keys(s.fetched).length ? h("p", {}, "Downloaded on your machine by fetch-restricted: ",
+        Object.entries(s.fetched).map(([c, parts]) => `${comp(c).name} (${[...parts].map((p) => comp(c)[p]).join(", ")})`)
+          .join("; "), ".") : null,
       s.system.length ? h("p", { class: "warn" }, "Install yourself: ",
         s.system.map((c) => `${comp(c).name}: ${comp(c).system}`).join("; "), ".") : null,
       licenses.length ? h("div", { class: "licenses" },

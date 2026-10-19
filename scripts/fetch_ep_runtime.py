@@ -52,6 +52,7 @@ TARGETS = {
     "arm64ec-pc-windows-msvc": ("windows-arm64x", "windows", "arm64x-windows-msvc"),
     "arm64x-pc-windows-msvc": ("windows-arm64x", "windows", "arm64x-windows-msvc"),
     "aarch64-linux-android": ("linux-x86_64", "android", "aarch64-android"),
+    "aarch64-apple-darwin": ("macos-arm64", "macos", ""),
 }
 
 # Runtime library name patterns (matched against the file name inside the archive)
@@ -95,6 +96,8 @@ class Selection:
     archives: list[str] = field(default_factory=list)       # only download archives whose name starts with one of these
     install: bool = False                                    # run the vendor installer instead of extracting
     dev: list[DevRule] = field(default_factory=list)        # headers / import libraries, keeping their directory tree
+    licenses: list[str] = field(default_factory=list)       # license files besides the ones LICENSE_FILE finds
+    subdir: str = ""                                         # runtime files go to <dest>/<subdir>
 
 
 def _libs(os_name: str, *pairs: tuple[str, str]) -> list[str]:
@@ -102,12 +105,20 @@ def _libs(os_name: str, *pairs: tuple[str, str]) -> list[str]:
     return [rf"(^|/){p[idx]}$" for p in pairs]
 
 
+def _dml_arch(platform: str) -> str:
+    return {"windows-arm64": "arm64", "windows-arm64x": "arm64ec"}.get(platform, "x64")
+
+
+DML_LICENSES = [r"^(LICENSE|LICENSE-CODE|ThirdPartyNotices)\.txt$"]  # at the root of the NuGet package
+OPENVINO_LICENSES = [r"^[^/]+/docs/licensing/[^/]+$", r"/runtime/3rdparty/tbb/TBB-LICENSE$"]
+IREE_COMPILER_LIBS = {"windows": "IREECompiler.dll", "linux": "libIREECompiler.so", "macos": "libIREECompiler.dylib"}
+
 # CUDA library -> redist archive that contains it
 CUDA_ARCHIVES = {"cudart": "cuda_cudart", "cublas": "libcublas", "cufft": "libcufft", "curand": "libcurand",
                  "nvrtc": "cuda_nvrtc", "nvjitlink": "libnvjitlink"}
 
 
-def selections_for(ep: str, os_name: str, qnn_abi: str) -> list[Selection]:
+def selections_for(ep: str, platform: str, os_name: str, qnn_abi: str) -> list[Selection]:
     cuda = lambda *names: Selection("cuda", _libs(os_name, *(CUDA_LIBS[n] for n in names)),
                                     [CUDA_ARCHIVES[n] for n in names])
     if ep == "cuda":
@@ -128,8 +139,18 @@ def selections_for(ep: str, os_name: str, qnn_abi: str) -> list[Selection]:
         return [Selection("vitisai", [r"onnxruntime/capi/[^/]+\.dll$"], ["voe-"])]
     if ep == "cann":
         return [Selection("cann", install=True)]
-    if ep == "openvino":
-        return []  # the packages bundle the OpenVINO runtime
+    if ep == "openvino":  # the files its docs/licensing/redist.txt lists; on Linux oneTBB comes from the system
+        if os_name == "windows":
+            patterns = [r"/runtime/bin/intel64/Release/[^/]+$",
+                        r"/runtime/3rdparty/tbb/bin/(tbb12|tbbmalloc|tbbmalloc_proxy|tbbbind_2_5)\.dll$"]
+        else:
+            patterns = [r"/runtime/lib/intel64/[^/]+$"]
+        return [Selection("openvino", patterns, licenses=OPENVINO_LICENSES)]
+    if ep == "dml":
+        return [Selection("directml", [rf"^bin/{_dml_arch(platform)}-win/DirectML\.dll$"], licenses=DML_LICENSES)]
+    if ep == "iree":  # the EP looks for the compiler in iree/compiler/_mlir_libs/ next to (or above) its library
+        return [Selection("iree-compiler", [rf"^iree/compiler/_mlir_libs/{re.escape(IREE_COMPILER_LIBS[os_name])}$"],
+                          subdir="iree/compiler/_mlir_libs")]
     raise SystemExit(f"unknown EP: {ep}")
 
 
@@ -168,8 +189,12 @@ def dev_selections_for(ep: str, platform: str, os_name: str, cuda_major: str) ->
     if ep == "openvino":
         return [Selection("openvino", dev=[_headers("runtime/include", "include"),
                                            *_import_libs(platform, os_name, r"openvino[\w]*",
-                                                         "runtime/lib/intel64/Release")])]
-    return []  # Vitis AI and CANN have no separate development files
+                                                         "runtime/lib/intel64/Release")], licenses=OPENVINO_LICENSES)]
+    if ep == "dml":
+        return [Selection("directml", dev=[DevRule(r"^include/(?P<rel>[^/]+\.h)$", "include"),
+                                           DevRule(rf"^bin/{_dml_arch(platform)}-win/(?P<rel>DirectML\.lib)$", "lib")],
+                          licenses=DML_LICENSES)]
+    return []  # Vitis AI, CANN and the IREE compiler have no separate development files
 
 
 EPS = {
@@ -179,7 +204,9 @@ EPS = {
     "qnn": "Qualcomm QNN EP (in-tree or plugin): QAIRT backends and Hexagon skel libraries",
     "vitisai": "AMD Vitis AI EP: closed-source backend DLLs from the voe wheel (Windows x64)",
     "cann": "Huawei CANN EP: installs the CANN toolkit (its libraries need the full install and set_env.sh)",
-    "openvino": "Intel OpenVINO EP: development files only (OpenVINO headers and import libraries)",
+    "openvino": "Intel OpenVINO EP: OpenVINO runtime and device plugins (the files its redist.txt lists)",
+    "dml": "DirectML EP (in-tree or the AMD plugin): DirectML.dll from the Microsoft.AI.DirectML NuGet package",
+    "iree": "IREE plugin EP: the IREE compiler library it loads at run time (from the iree-base-compiler wheel)",
 }
 
 
@@ -202,15 +229,16 @@ def _dev_target(path: str, dev: list[tuple[re.Pattern, Path]]) -> Path | None:
 
 
 def extract_selected(archive: Path, patterns: list[re.Pattern], dest: Path, licenses: Path,
-                     dev: list[tuple[re.Pattern, Path]] = ()) -> list[str]:
+                     dev: list[tuple[re.Pattern, Path]] = (), license_patterns: list[re.Pattern] = ()) -> list[str]:
     """Copy matching files from archive: runtime files into dest (flattened), development files to the targets of
     their dev rules (keeping their directory tree), license files into licenses/. Returns the copied names."""
     copied: list[str] = []
     name = archive.name.lower()
-    selected = lambda m: LICENSE_FILE.search(m) or _wanted(m, patterns) or _dev_target(m, dev)
+    is_license = lambda m: LICENSE_FILE.search(m) or any(p.search(m) for p in license_patterns)
+    selected = lambda m: is_license(m) or _wanted(m, patterns) or _dev_target(m, dev)
 
     def store(member: str, data: bytes) -> None:
-        if LICENSE_FILE.search(member):
+        if is_license(member):
             target = licenses / member.replace("/", "__")
         elif _wanted(member, patterns):
             target = dest / Path(member).name
@@ -222,7 +250,7 @@ def extract_selected(archive: Path, patterns: list[re.Pattern], dest: Path, lice
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
 
-    if name.endswith((".zip", ".whl")):
+    if name.endswith((".zip", ".whl", ".nupkg")):
         with zipfile.ZipFile(archive) as zf:
             for info in zf.infolist():
                 if not info.is_dir() and selected(info.filename):
@@ -284,7 +312,7 @@ def pins_from_build_info(sdks: dict[str, str]) -> dict[str, str]:
             for part in version.split("_"):
                 pkg, _, ver = part.rpartition("-")
                 pins[pkg] = ver
-        elif comp in ("cuda", "cudnn", "qairt", "cann", "rocm", "openvino"):
+        elif comp in ("cuda", "cudnn", "qairt", "cann", "rocm", "openvino", "directml", "iree-compiler"):
             pins[comp] = version
     return pins
 
@@ -308,11 +336,13 @@ def merge_selections(sels: list[Selection]) -> dict[str, Selection]:
         cur = merged.get(sel.component)
         if cur is None:
             merged[sel.component] = Selection(sel.component, list(sel.patterns), list(sel.archives), sel.install,
-                                              list(sel.dev))
+                                              list(sel.dev), list(sel.licenses), sel.subdir)
             continue
         cur.install = cur.install or sel.install
         cur.patterns += [p for p in sel.patterns if p not in cur.patterns]
         cur.dev += [r for r in sel.dev if r not in cur.dev]
+        cur.licenses += [p for p in sel.licenses if p not in cur.licenses]
+        cur.subdir = cur.subdir or sel.subdir
         cur.archives = cur.archives + [a for a in sel.archives if a not in cur.archives] \
             if cur.archives and sel.archives else []
     return merged
@@ -387,7 +417,7 @@ def main(argv: list[str]) -> int:
     licenses = args.licenses_dir.resolve() if args.licenses_dir else root / "third_party_licenses"
 
     merged = merge_selections([sel for ep, parts in eps.items() for sel in
-                               (selections_for(ep, os_name, qnn_abi) if "runtime" in parts else []) +
+                               (selections_for(ep, platform, os_name, qnn_abi) if "runtime" in parts else []) +
                                (dev_selections_for(ep, platform, os_name, cuda_major) if "dev" in parts else [])])
     labels = ", ".join(f"{ep}:{'+'.join(sorted(parts))}" for ep, parts in eps.items())
     print(f"target {target}, EPs: {labels}, CUDA {cuda_major}.x, runtime files: {dest}, development files: {root}")
@@ -418,9 +448,15 @@ def main(argv: list[str]) -> int:
         else:
             patterns = [re.compile(p) for p in sel.patterns]
             dev = [(re.compile(r.pattern), root / r.dest) for r in sel.dev]
+            license_patterns = [re.compile(p) for p in sel.licenses]
             new: list[str] = []
             for f in files:
-                new += extract_selected(out / f.filename, patterns, dest, licenses / comp_name, dev)
+                if f.filename.lower().endswith((".txt", "license")):  # a license text next to the archives
+                    (licenses / comp_name).mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(out / f.filename, licenses / comp_name / f.filename)
+                    continue
+                new += extract_selected(out / f.filename, patterns, dest / sel.subdir, licenses / comp_name, dev,
+                                        license_patterns)
             if not new:
                 raise SystemExit(f"no matching files in {comp_name} {resolved.version}")
             entry["files"] = sorted(set(entry.get("files", [])) | set(new))

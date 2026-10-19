@@ -2,10 +2,12 @@
 """Bundle requests: turn a configuration from the configurator page (site/) into one ready-to-use package.
 
 A bundle is composed EP by EP: one core library with the in-tree EPs compiled into it plus the plugin EP
-packages of the other EPs, merged into one bin/ lib/ include/ tree, with the redistributable third-party runtimes they need, a
-CMake package (lib/cmake/onnxruntime-bundle), plugins.json, an example, and fetch-restricted.(sh|ps1) for the
-third-party files whose licenses do not allow redistributing them (headers and import libraries of the NVIDIA and
-Qualcomm SDKs, the Vitis AI runtime, the CANN toolkit).
+packages of the other EPs, merged into one bin/ lib/ include/ tree, with a CMake package (lib/cmake/onnxruntime-bundle),
+plugins.json and an example. The packages contain the open-source components they build from source; the optional
+third-party runtimes (vendor runtimes that may be redistributed with an application, the IREE compiler) are added
+here when the request chooses so. Everything else goes through fetch-restricted.(sh|ps1), which downloads it on the
+user's machine: the optional runtimes the request left out, and the files whose licenses do not allow redistributing
+them (headers and import libraries of the vendor SDKs, the Vitis AI runtime, the CANN toolkit).
 
     python ci/bundle.py resolve --event $GITHUB_EVENT_PATH --plan plan.json --github-output $GITHUB_OUTPUT
     python ci/bundle.py resolve --config config.json --plan plan.json         # check a configuration locally
@@ -39,7 +41,7 @@ import plan as plan_mod
 import sdk
 
 ROOT = Path(__file__).resolve().parent.parent
-CONFIG_SCHEMA = 3
+CONFIG_SCHEMA = 4
 CORE = plan_mod.CORE  # package name of the core
 CUDA_EPS = {"cuda", "tensorrt", "nv-tensorrt-rtx"}
 
@@ -99,6 +101,18 @@ def make_plan(config: dict, cat: dict) -> dict:
             raise RequestError(f"{names[ep]['name']} in the core needs {', '.join(names[r]['name'] for r in missing)} "
                                "in the core as well")
 
+    # linkage choices (ci/catalog.py LINK_OPTIONS) apply to EPs in the core only: a plugin EP is a separate library
+    requested_link = dict(config.get("link") or {})
+    for ep, choice in requested_link.items():
+        opts = platform["core_eps"][ep].get("link") if ep in core_eps else None
+        if not opts:
+            raise RequestError(f"a linkage choice for {names[ep]['name'] if ep in names else ep} applies only when "
+                               f"it is compiled into the core of a target that offers one")
+        if choice not in opts["choices"]:
+            raise RequestError(f"{names[ep]['name']}: {opts['label']} must be one of {', '.join(opts['choices'])}")
+    link = {ep: requested_link.get(ep, info["link"]["default"]) for ep in core_eps
+            if (info := platform["core_eps"][ep]).get("link")}
+
     plugin_eps = [ep for ep in names if choices.get(ep) == "plugin"]
     needs_cuda = bool(CUDA_EPS & set(core_eps)) or any(
         p["cuda_major"] for p in cat["plugins"] if p["triple"] == triple and p["ep"] in plugin_eps)
@@ -124,8 +138,10 @@ def make_plan(config: dict, cat: dict) -> dict:
     core_forms = {"cpu": "builtin"}
     if wasm_mode:
         core_forms.update({ep: "builtin" for ep in platform["wasm_modes"][wasm_mode]["eps"]})
-    core_forms.update({ep: platform["core_eps"][ep]["form"] for ep in core_eps})
-    core_libs = ["onnxruntime"] + [platform["core_eps"][ep]["lib"] for ep in core_eps if platform["core_eps"][ep]["lib"]]
+    for ep in core_eps:
+        info = platform["core_eps"][ep]
+        core_forms[ep] = info["link"]["choices"][link[ep]].get("form", info["form"]) if ep in link else info["form"]
+    core_libs = ["onnxruntime"] + [platform["core_eps"][ep]["lib"] for ep in core_eps if core_forms[ep] == "provider"]
     owner: dict[str, str] = {}
     for name, libs in [(CORE, core_libs)] + [(p["package"], p["libs"]) for p in plugins]:
         for lib in libs:
@@ -136,31 +152,45 @@ def make_plan(config: dict, cat: dict) -> dict:
     eps: dict[str, list[str]] = {}  # EP -> "<form> (<package>)"
     for name, forms in [(CORE, core_forms)] + [(p["package"], p["eps"]) for p in plugins]:
         for ep, form in forms.items():
-            eps.setdefault(ep, []).append(f"{form} ({name})")
+            how = f"; {platform['core_eps'][ep]['link']['label']}: {link[ep]}" if name == CORE and ep in link else ""
+            eps.setdefault(ep, []).append(f"{form} ({name}{how})")
     dev = bool(config.get("dev", True))
-    wanted = config.get("fetch")  # EPs whose restricted parts fetch-restricted gets (default: all)
-    bundle_runtime, fetch, system, fetched, bundled = [], [], [], set(), set()
+    wanted = config.get("fetch")  # EPs whose files fetch-restricted gets (default: all)
+    bundle_eps = set(config.get("bundle") or [])  # EPs whose optional runtimes the bundle contains
+    bundle_runtime, fetch, system, bundled = [], [], [], set()
+    fetched: dict[str, set[str]] = {}  # component -> parts fetch-restricted downloads ("runtime", "dev")
     for ep in eps:
         tp = cat["third_party"].get(ep, {})
-        ep_fetch = [f for f in tp.get("fetch", []) if (dev or not f.endswith(":dev")) and (wanted is None or ep in wanted)]
-        bundle_runtime += [b for b in tp.get("bundle", []) if b not in bundle_runtime]
-        fetch += [f for f in ep_fetch if f not in fetch]
+        comps = tp.get("components", [])
+        optional = tp.get("optional", [])
+        if optional and ep in bundle_eps:
+            bundle_runtime += [o for o in optional if o not in bundle_runtime]
+            bundled |= set(comps)
+            optional = []
+        parts = optional + [f for f in tp.get("fetch", []) if dev or not f.endswith(":dev")]
+        if wanted is not None and ep not in wanted:
+            parts = []
+        fetch += [f for f in parts if f not in fetch]
+        for c in comps:
+            for f in parts:
+                fetched.setdefault(c, set()).add("dev" if f.endswith(":dev") else "runtime")
         system += [s for s in tp.get("system", []) if s not in system]
-        fetched |= set(tp.get("components", [])) if ep_fetch else set()
-        bundled |= set(tp.get("components", [])) if tp.get("bundle") else set()
     components = sorted({c for ep in eps for c in cat["third_party"].get(ep, {}).get("components", [])})
 
     entries = {(e["package"], e["triple"]): e for e in plan_mod.entries()}
-    packages = [{"package": CORE, "kind": "core", "entry": plan_mod.core_entry(triple, core_eps, cuda_major, wasm_mode)}]
+    custom_link = {ep: c for ep, c in link.items() if c != platform["core_eps"][ep]["link"]["default"]}
+    packages = [{"package": CORE, "kind": "core",
+                 "entry": plan_mod.core_entry(triple, core_eps, cuda_major, wasm_mode, custom_link)}]
     packages += [{"package": p["package"], "kind": "plugin", "entry": entries[(p["package"], triple)]} for p in plugins]
     normalized = {"schema": CONFIG_SCHEMA, "triple": triple, "eps": {ep: choices[ep] for ep in names if ep in choices},
-                  "cuda_major": cuda_major or None, "wasm_mode": wasm_mode or None, "dev": dev,
-                  "fetch": sorted({f.split(":")[0] for f in fetch}) if wanted is not None else None}
+                  "cuda_major": cuda_major or None, "wasm_mode": wasm_mode or None, "link": link, "dev": dev,
+                  "fetch": sorted({f.split(":")[0] for f in fetch}) if wanted is not None else None,
+                  "bundle": sorted(ep for ep in eps if ep in bundle_eps and cat["third_party"].get(ep, {}).get("optional"))}
     return {
         "config": normalized,
         "source": cat["source"],
         "triple": triple,
-        "core": {"eps": core_eps, "forms": core_forms, "wasm_mode": wasm_mode or None,
+        "core": {"eps": core_eps, "forms": core_forms, "link": link, "wasm_mode": wasm_mode or None,
                  "core_from": platform.get("core_from")},
         "plugins": plugins,
         "packages": packages,
@@ -168,7 +198,7 @@ def make_plan(config: dict, cat: dict) -> dict:
         "cuda_major": cuda_major or None,
         "bundle_runtime": bundle_runtime,
         "fetch_restricted": fetch,
-        "fetch_components": sorted(fetched),
+        "fetch_components": {c: sorted(fetched[c]) for c in sorted(fetched)},
         "bundled_components": sorted(bundled),
         "system": system,
         "components": {c: cat["components"][c] for c in components + system},
@@ -198,7 +228,8 @@ def summary(plan: dict) -> str:
     lines += ["", "| Package | Contents | Build |", "|---|---|---|"]
     for p in plan["packages"]:
         if p["kind"] == "core":
-            what = ", ".join(plan_ep_name(ep) for ep in core["forms"])
+            what = ", ".join(plan_ep_name(ep) + (f" ({core['link'][ep]} linkage)" if ep in core["link"] else "")
+                             for ep in core["forms"])
             what += f" (WebAssembly mode {core['wasm_mode']})" if core["wasm_mode"] else ""
             what += f" (the {core['core_from']} core)" if core["core_from"] else ""
         else:
@@ -209,8 +240,9 @@ def summary(plan: dict) -> str:
         lines.append(f"| `{p['package']}` | {what} | {how} |")
     lines += ["", "| EP | Provided as |", "|---|---|"]
     lines += [f"| {plan_ep_name(ep)} | {'; '.join(forms)} |" for ep, forms in plan["eps"].items()]
-    if plan["bundle_runtime"]:
-        lines += ["", f"Bundled third-party runtimes: {', '.join(plan['bundle_runtime'])} (redistributable)."]
+    if plan["bundled_components"]:
+        names = ", ".join(plan["components"][c]["name"] for c in plan["bundled_components"])
+        lines += ["", f"Bundled third-party runtimes: {names} (under their own licenses)."]
     if plan["fetch_restricted"]:
         lines += [f"Fetched by `fetch-restricted` on your machine: {', '.join(plan['fetch_restricted'])}."]
     if plan["system"]:
@@ -611,11 +643,12 @@ def readme(plan: dict, info: dict) -> str:
     if plan["fetch_restricted"]:
         script = "fetch-restricted.ps1" if windows else "./fetch-restricted.sh"
         lines += ["", "## Files you fetch yourself", "",
-                  "These licenses do not allow redistributing the following files, so run the script once (it needs "
-                  "Python 3) to download them from the vendors and put them into this bundle:", "",
+                  "The following files are not in this bundle (their licenses do not allow redistributing them, or the "
+                  "request chose to download them), so run the script once (it needs Python 3) to download them from "
+                  "their vendors and put them into this bundle:", "",
                   f"    {script}", ""]
-        lines += [f"- {plan['components'][c]['name']}: {plan['components'][c]['fetched']} "
-                  f"({plan['components'][c]['license']})" for c in plan["fetch_components"]]
+        lines += [f"- {plan['components'][c]['name']}: {', '.join(plan['components'][c][p] for p in parts)} "
+                  f"({plan['components'][c]['license']})" for c, parts in plan["fetch_components"].items()]
     if plan["system"]:
         lines += ["", "## Install yourself", ""]
         lines += [f"- {plan['components'][s]['name']}: {plan['components'][s]['system']}" for s in plan["system"]]
@@ -697,20 +730,20 @@ def cmd_assemble(args: argparse.Namespace) -> int:
             "conflicts": conflicts, "fetch_restricted": fetch_info}
     (stage / "BUNDLE_INFO.json").write_text(json.dumps(info, indent=2), encoding="utf-8")
 
-    # redistributable vendor runtimes (CUDA, cuDNN, TensorRT), with the versions the packages were built with
+    # the optional runtimes the request bundles, with the versions the packages were built with
     if plan["bundle_runtime"]:
         import fetch_ep_runtime as fetch  # scripts/ is on sys.path (ci/sdk.py)
         argv = ["--package-dir", str(stage), "--ep", *plan["bundle_runtime"], "--target", triple,
                 "--cuda-major", plan["cuda_major"] or "13", "--cache", str(args.cache), "--yes"]
         if fetch.main(argv) != 0:
-            raise SystemExit("bundling the vendor runtimes failed")
+            raise SystemExit("bundling the third-party runtimes failed")
 
     if plan["fetch_restricted"]:
         tools = stage / "tools"
         tools.mkdir(exist_ok=True)
         for script in ("fetch_ep_runtime.py", "download_ep_packages.py"):
             shutil.copy2(ROOT / "scripts" / script, tools / script)
-        if any(f.startswith("qnn:") for f in plan["fetch_restricted"]):  # QAIRT's version and checksum
+        if any(f.split(":")[0] == "qnn" for f in plan["fetch_restricted"]):  # QAIRT's version and checksum
             rel = "eps/official/onnxruntime-qnn/qcom/packages.yml"
             snapshot = tools / "submodule-files" / rel
             snapshot.parent.mkdir(parents=True, exist_ok=True)
@@ -753,7 +786,7 @@ def main(argv: list[str]) -> int:
     a.add_argument("--packages", type=Path, required=True, help="directory with <package>/<archive> for every package")
     a.add_argument("--work", type=Path, required=True)
     a.add_argument("--out", type=Path, required=True)
-    a.add_argument("--cache", type=Path, default=ROOT / "packages", help="download cache of the vendor runtimes")
+    a.add_argument("--cache", type=Path, default=ROOT / "packages", help="download cache of the third-party runtimes")
     args = ap.parse_args(argv)
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):

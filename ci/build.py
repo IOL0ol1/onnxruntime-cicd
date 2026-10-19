@@ -19,6 +19,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shlex
 import shutil
 import subprocess
@@ -99,13 +100,19 @@ class Job:
     platform: str = ""
     os: str = ""
     sdks: dict[str, Path] = field(default_factory=dict)
-    # in-tree EPs of a custom core (variant "custom", the compile mode of bundle requests, see ci/bundle.py)
+    # in-tree EPs of a core (--eps, see ci/bundle.py); "<ep>:<choice>" selects a linkage other than the default
+    # (LINK_CHOICES), which ends up in link
     eps: list[str] = field(default_factory=list)
+    link: dict[str, str] = field(default_factory=dict)
     # (component, platform, pinned version or ""), used by ci/plan.py for the build inputs hash
     needed: set[tuple[str, str, str]] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         self.platform, self.os = TRIPLES[self.triple]
+        self.link = dict(e.split(":", 1) for e in self.eps if ":" in e)
+        self.eps = [e.split(":", 1)[0] for e in self.eps]
+        if bad := [f"{ep}:{c}" for ep, c in self.link.items() if c not in LINK_CHOICES.get(ep, ())]:
+            raise SystemExit(f"unknown linkage {bad}; known: {LINK_CHOICES}")
 
     def need(self, *names: str, pins: dict[str, str] | None = None) -> None:
         names = tuple(n for n in names if n not in self.sdks)  # each SDK is prepared once per job
@@ -195,22 +202,16 @@ def stage_license(job: Job, name: str, base: Path, patterns: list[str]) -> None:
         print(f"warning: no license text of {name} found in {base}", file=sys.stderr, flush=True)
 
 
-def bundle_vendor_runtime(job: Job, eps: list[str]) -> None:
-    """Bundle the runtime libraries of vendor SDKs whose licenses allow distributing them as part of an application
-    (QAIRT, TensorRT for RTX with the CUDA runtime), with the license texts. scripts/fetch_ep_runtime.py selects the
-    files; the archives are already in the SDK download cache. CUDA libraries beyond cudart, cuDNN and TensorRT are
-    redistributable too, but take several GB; bundles add them (ci/bundle.py)."""
+def record_sdk_version(job: Job, component: str, version: str) -> None:
+    """Record the version of a third-party component the build used in sdk-versions.json (written by ci/sdk.py for the
+    SDKs it prepares), which ci/package.py copies into BUILD_INFO.json."""
     if job.dry_run:
-        print(f"[dry-run] bundle vendor runtime for {', '.join(eps)}")
         return
-    import fetch_ep_runtime as fetch  # scripts/ is on sys.path (ci/sdk.py)
-    versions = json.loads((job.sdk_root / "sdk-versions.json").read_text(encoding="utf-8"))
-    pins = [f"{k}={v}" for k, v in fetch.pins_from_build_info(versions).items()]
-    dest = job.stage / ("bin" if job.os == "windows" else "lib")
-    args = ["--ep", *eps, "--target", job.triple, "--cuda-major", job.cuda_major, "--dest", str(dest),
-            "--cache", str(job.sdk_root / "_downloads"), "--licenses-dir", str(job.stage / "third_party_licenses")]
-    if fetch.main(args + (["--pin", *pins] if pins else [])) != 0:
-        raise SystemExit(f"bundling the {', '.join(eps)} runtime failed")
+    path = job.sdk_root / "sdk-versions.json"
+    versions = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    versions[component] = version
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(versions, indent=2), encoding="utf-8")
 
 
 def set_origin_rpath(job: Job, lib_dir: Path, extra: str = "/opt/rocm/lib") -> None:
@@ -228,32 +229,21 @@ def set_origin_rpath(job: Job, lib_dir: Path, extra: str = "/opt/rocm/lib") -> N
             run(job, [patchelf, "--set-rpath", f"$ORIGIN:{extra}", f])
 
 
-def bundle_openvino(job: Job) -> None:
-    """The OpenVINO runtime with its device plugins, next to the OpenVINO provider. The prebuilt runtime is under the
-    Intel OpenVINO Distribution License, which allows redistributing the files its docs/licensing/redist.txt lists
-    (Windows: runtime/bin/intel64/Release and oneTBB; Linux: runtime/lib/intel64, oneTBB comes from the system) together
-    with that license."""
-    ov = job.sdks["openvino"]
-    if job.os == "windows":
-        tbb = [f"runtime/3rdparty/tbb/bin/{n}.dll" for n in ("tbb12", "tbbmalloc", "tbbmalloc_proxy", "tbbbind_2_5")]
-        copy_files(job, ["runtime/bin/intel64/Release/*", *tbb], ov, job.stage / "bin")
+def record_directml(job: Job) -> None:
+    """Record the version of the Microsoft.AI.DirectML NuGet package the build restored. Like the other vendor runtimes
+    that may only be redistributed with an application (CUDA, TensorRT, QAIRT, OpenVINO, ...), DirectML is not packaged:
+    a bundle adds that version or its fetch-restricted script downloads it (ci/bundle.py)."""
+    if job.dry_run:  # the resolve job has no submodules checked out
+        return
+    if job.recipe == "ep-amdgpu":
+        path = ROOT / "eps/official/onnxruntime-ep-amdgpu/src/directx/CMakeLists.txt"
+        pattern = r"install_nuget_package\(Microsoft\.AI\.DirectML\s+([^)\s]+)\)"
     else:
-        copy_files(job, ["runtime/lib/intel64/*"], ov, job.stage / "lib")
-    stage_license(job, "OpenVINO", ov, [f"docs/licensing/{n}" for n in (
-        "EULA.txt", "redist.txt", "readme.txt", "LICENSE", "Apache_license.txt", "runtime-third-party-programs.txt",
-        "onetbb_third-party-programs.txt", "onednn_third-party-programs.txt")] + ["runtime/3rdparty/tbb/TBB-LICENSE"])
-
-
-def bundle_directml(job: Job, build_dir: Path) -> None:
-    """DirectML.dll from the Microsoft.AI.DirectML NuGet package the build restored (redistributable with applications)."""
-    arch = {"x86_64": "x64", "aarch64": "arm64"}.get(job.triple.split("-")[0], "x64")
-    copy_files(job, [f"**/Microsoft.AI.DirectML*/bin/{arch}-win/DirectML.dll"], build_dir, job.stage / "bin")
-    # the interface for developers: DirectML.h and the import library (the license covers the whole package)
-    stage_dev_files(job, [f"**/Microsoft.AI.DirectML*/bin/{arch}-win/DirectML.lib"], build_dir, job.stage / "lib")
-    stage_dev_files(job, ["**/Microsoft.AI.DirectML*/include/*.h"], build_dir, job.stage / "include")
-    stage_license(job, "DirectML", build_dir, ["**/Microsoft.AI.DirectML*/LICENSE.txt",
-                                               "**/Microsoft.AI.DirectML*/LICENSE-CODE.txt",
-                                               "**/Microsoft.AI.DirectML*/ThirdPartyNotices.txt"])
+        path, pattern = ROOT / "onnxruntime/packages.config", r'id="Microsoft\.AI\.DirectML"\s+version="([^"]+)"'
+    if m := re.search(pattern, path.read_text(encoding="utf-8")):
+        record_sdk_version(job, "directml", m.group(1))
+    else:
+        raise SystemExit(f"the Microsoft.AI.DirectML version is not found in {path}")
 
 
 def stage_ort_headers(job: Job, src: Path) -> None:
@@ -300,9 +290,10 @@ def dawn_backends(job: Job) -> list[str]:
 
 
 def webgpu_flags(job: Job) -> list[str]:
-    """WebGPU as an internal EP (static_lib), with the Dawn backends of the target."""
-    backends = dawn_backends(job)
-    return ["--use_webgpu", *(["--cmake_extra_defines", *backends] if backends else [])]
+    """WebGPU as an internal EP (static_lib), with the Dawn backends of the target. Dawn is linked into the core library
+    unless the core links it as a shared library (webgpu:shared, the build of ORT's windows_webgpu.yml)."""
+    defines = dawn_backends(job) + (["onnxruntime_BUILD_DAWN_SHARED_LIBRARY=ON"] if job.link.get("webgpu") == "shared" else [])
+    return ["--use_webgpu", *(["--cmake_extra_defines", *defines] if defines else [])]
 
 
 def nv_tensorrt_rtx_flags(job: Job) -> list[str]:
@@ -318,8 +309,10 @@ def openvino_flags(job: Job) -> list[str]:
 
 
 def qnn_flags(job: Job) -> list[str]:
+    """The QNN EP as a provider library (shared_lib, the default) or linked into the core library (qnn:static)."""
     job.need("qairt")
-    return ["--use_qnn", "--qnn_home", job.sdks["qairt"]]
+    kind = "static_lib" if job.link.get("qnn") == "static" else "shared_lib"
+    return ["--use_qnn", kind, "--qnn_home", job.sdks["qairt"]]
 
 
 def migraphx_flags(job: Job) -> list[str]:
@@ -359,6 +352,8 @@ CUSTOM_EPS: dict[str, Callable[[Job], list[str]]] = {
     "cann": cann_flags,
     "vsinpu": vsinpu_flags,
 }
+# Linkage choices of in-tree EPs (the default first; ci/catalog.py LINK_OPTIONS offers them in the page)
+LINK_CHOICES = {"webgpu": ("static", "shared"), "qnn": ("shared", "static")}
 
 
 def eps_flags(job: Job) -> list[str]:
@@ -510,14 +505,11 @@ def build_ort(job: Job) -> None:
         stage_license(job, "DirectXShaderCompiler", build_dir,
                       [f"Release/_deps/dawn-src/third_party/directx-shader-compiler/src/{n}"
                        for n in ("LICENSE.TXT", "ThirdPartyNotices.txt")])
+    if job.link.get("webgpu") == "shared":  # Dawn (BSD-3-Clause) as a separate library next to the core library
+        stage_shared_libs(job, config_dir, ["webgpu_dawn"])
+        stage_license(job, "Dawn", build_dir, ["Release/_deps/dawn-src/LICENSE"])
     if "--use_dml" in flags:
-        bundle_directml(job, build_dir)
-    if "--use_openvino" in flags:
-        bundle_openvino(job)
-    if "--use_qnn" in flags:
-        bundle_vendor_runtime(job, ["qnn"])
-    if "--use_nv_tensorrt_rtx" in flags:
-        bundle_vendor_runtime(job, ["nv-tensorrt-rtx"])
+        record_directml(job)
     if "--use_vsinpu" in flags:  # TIM-VX (MIT), built from source by build_tim_vx
         copy_files(job, ["lib/libtim-vx.so*"], job.work / "tim-vx-install", job.stage / "lib")
         stage_license(job, "TIM-VX", job.sdks["tim-vx"], ["LICENSE"])
@@ -750,7 +742,6 @@ def build_ep_nv_tensorrt_rtx(job: Job) -> None:
         run(job, ["cmake", "-DBUILD_TESTS=OFF", b])  # build.sh has no --skip_tests; see the Windows branch
         run(job, ["cmake", "--build", b, "--config", "Release"])
     stage_shared_libs(job, b, ["onnxruntime_providers_nv_tensorrt_rtx"])
-    bundle_vendor_runtime(job, ["nv-tensorrt-rtx"])
 
 
 def build_ep_amdgpu(job: Job) -> None:
@@ -776,7 +767,7 @@ def build_ep_amdgpu(job: Job) -> None:
     run(job, cmd, cwd=src)
     stage_shared_libs(job, b / "Release", names)
     if job.os == "windows" and job.variant in ("dml", "amdgpu"):  # the DirectML EP / backend
-        bundle_directml(job, b)
+        record_directml(job)
     if job.variant != "dml":  # MIGraphX (MIT) is built from its develop branch here, so bundle it with its license
         if job.os == "windows":
             copy_files(job, ["bin/migraphx*.dll"], migraphx, job.stage / "bin")
@@ -844,7 +835,6 @@ def build_ep_qnn(job: Job) -> None:
         copy_files(job, ["**/dist/*.whl"], src / "build", job.stage / "python")
     except SystemExit:
         pass
-    bundle_vendor_runtime(job, ["qnn"])
 
 
 def build_ep_mlx(job: Job) -> None:
@@ -867,6 +857,11 @@ def build_ep_mlx(job: Job) -> None:
 
 def build_ep_iree(job: Job) -> None:
     src = ROOT / "eps/community/onnxruntime-ep-iree"
+    # The EP loads the IREE compiler library at run time; it is not packaged (a bundle adds this version or its
+    # fetch-restricted script downloads it, see ci/bundle.py)
+    if not job.dry_run:
+        reqs = (src / "requirements-dev.txt").read_text(encoding="utf-8")
+        record_sdk_version(job, "iree-compiler", re.search(r"^iree-base-compiler==(\S+)", reqs, re.M).group(1))
     if job.os == "windows":
         # The build tree lives in <source>/build/cmake/default and some IREE object paths exceed MAX_PATH (cl.exe
         # fails with C1083), so build from a copy in a short directory

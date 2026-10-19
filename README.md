@@ -70,7 +70,7 @@ git submodule update --init --depth 1 eps/official/onnxruntime-ep-tensorrt
 | `eps/official/onnxruntime-ep-mlx` | [onnxruntime/onnxruntime-ep-mlx](https://github.com/onnxruntime/onnxruntime-ep-mlx) | `main` | Apple Silicon (MLX) | Community (moved into the onnxruntime organization) | PyPI package `onnxruntime-ep-mlx`; requires ORT ≥ 1.29 |
 | `eps/vendor/nvidia-tensorrt-rtx-ep` | [NVIDIA/TensorRT-RTX-EP-ABI](https://github.com/NVIDIA/TensorRT-RTX-EP-ABI) | `main` | NVIDIA RTX GPU (TensorRT-RTX) | NVIDIA | Plugin TensorRT RTX EP; PyPI package `onnxruntime-ep-nv-tensorrt-rtx` |
 | `deps/amdmigraphx` | [ROCm/AMDMIGraphX](https://github.com/ROCm/AMDMIGraphX) | `develop` | MIGraphX itself, for the AMD plugin EPs | AMD | Built from source because the AMD plugin EPs follow its `develop` API; a submodule so that its version only changes with an update, which keeps the MIGraphX build cache valid |
-| `eps/community/onnxruntime-ep-iree` | [iree-org/onnxruntime-ep-iree](https://github.com/iree-org/onnxruntime-ep-iree) | `main` | CPU / HIP / CUDA / Vulkan through IREE | IREE community | Plugin EP |
+| `eps/community/onnxruntime-ep-iree` | [iree-org/onnxruntime-ep-iree](https://github.com/iree-org/onnxruntime-ep-iree) | `main` | CPU / AMD GPU (HIP) / Vulkan through IREE | IREE community | Plugin EP |
 | `eps/community/onnxruntime-ep-telum` | [IBM/onnxruntime-ep-telum](https://github.com/IBM/onnxruntime-ep-telum) | `main` | IBM Telum (on-chip AI accelerator of IBM Z, zDNN) | IBM | Plugin EP; requires ORT ≥ 1.24.1 |
 | `eps/community/onnxruntime-ep-vulkan` | [justinchuby/onnxruntime-ep-vulkan](https://github.com/justinchuby/onnxruntime-ep-vulkan) | `main` | Cross-platform Vulkan compute | Personal project | **Experimental**, written in Rust; its README states that CI is currently red |
 
@@ -150,6 +150,8 @@ python scripts/download_ep_packages.py --with-optional                          
 | `vitisai` | AMD Vitis AI (Ryzen AI NPU) | Latest version of each package | Public AMD PyPI index `pypi.amd.com/simple` | sha256 |
 | `android-ndk` | NNAPI, QNN / XNNPACK on Android | 28.0.13004108 (same as ORT `android.yml`) | `dl.google.com/android/repository` | sha1 |
 | `onnxruntime-sdk` | All plugin EPs (headers and libraries as `ORT_HOME`); `--platform windows-arm64x` selects the `win-arm64x` package | Latest release (currently 1.30.0) | GitHub Releases | sha256 |
+| `directml` | DirectML (in-tree + `onnxruntime-ep-amdgpu`) | 1.15.4 (same as `onnxruntime/packages.config` and the AMD plugin) | `api.nuget.org` (`Microsoft.AI.DirectML`) | — |
+| `iree-compiler` | IREE plugin EP (the compiler library it loads at run time) | The version in the plugin's `requirements-dev.txt` | PyPI, or the IREE GitHub releases for release candidates (`iree-base-compiler`) | sha256 |
 | `vulkan-sdk` | Vulkan plugin EP (provides glslc) | 1.3.296.0 (same as the plugin's CI; glslc output differs between versions) | `sdk.lunarg.com` (official LunarG) | sha256 |
 | `tim-vx` | VeriSilicon VSINPU | Latest tag | git: `github.com/VeriSilicon/TIM-VX` | — |
 | `zdnn` | IBM Telum plugin (`libzdnn` is dlopen'ed at runtime, s390x only) | Latest tag | git: `github.com/IBM/zDNN` | — |
@@ -278,9 +280,10 @@ site/ (GitHub Pages) --prefilled issue--> issue "[bundle] ..." --issues event-->
    - **Plugin EP** adds the EP's plugin EP package (`onnxruntime-ep-*`): a separate library registered at run time, built once per version and reused by every bundle. It is the default for every EP that has one (CUDA, TensorRT, TensorRT RTX, QNN, MIGraphX, DirectML, WebGPU, AMDGPU, MLX, IREE, Telum, Vulkan), also where the plugin is experimental.
    - **In core** compiles the EP into the core library, as built-in code or as a provider library next to it (OpenVINO, oneDNN, Vitis AI, CANN, XNNPACK, CoreML, NNAPI, VSINPU have only this form; the others where the target's core recipe supports them). When the page opens, the core has XNNPACK where the target supports it.
    - The page shows only what the target supports and disables options that do not work with the current selection, with the reason: TensorRT in the core brings the CUDA EP into the core (ORT builds them together; moving CUDA out of the core moves TensorRT to its plugin); one CUDA major version per bundle (a selector appears as soon as an EP needs CUDA, and options not built for it are disabled); EPs a target's core cannot contain. Notes explain long builds and untested combinations (MIGraphX in the core builds the whole core in the ROCm container).
+   - **Linkage** of an EP in the core, on the targets ORT's CI builds it for: WebGPU on Windows and Linux links Dawn statically (default) or as the shared `webgpu_dawn` library next to the core (`onnxruntime_BUILD_DAWN_SHARED_LIBRARY`); QNN on Windows is a provider library `onnxruntime_providers_qnn` (default, `--use_qnn shared_lib`) or linked into the core library (`--use_qnn static_lib`). A plugin EP is always a separate library, and ORT does not support a shared Dawn with the WebGPU plugin EP, so the choice disappears (back to the default) when the EP moves to its plugin. Each linkage builds its own core package.
    - WebAssembly offers the five build modes instead (single choice), because they are exclusive builds.
    - *Select all* puts every EP of the target in its default form; *Reset* goes back to the defaults.
-3. **Options**: whether to include the headers and link files of the backends, and which parts `fetch-restricted` should fetch.
+3. **Options**: whether to include the headers and link files of the backends; for each optional third-party runtime (vendor runtimes that may be redistributed with an application, the IREE compiler) whether the bundle contains it or `fetch-restricted` downloads it, with its estimated size; and which EPs `fetch-restricted` fetches files for.
 4. **Request**: the EPs and how each one is provided, which packages take long to build, the third-party components with links to their licenses, and the license acknowledgement. *Create bundle request* opens a prefilled issue (`.github/ISSUE_TEMPLATE/bundle.yml`).
 
 ### Building a bundle
@@ -291,7 +294,7 @@ site/ (GitHub Pages) --prefilled issue--> issue "[bundle] ..." --issues event-->
 |---|---|
 | `resolve` | [`ci/bundle.py`](ci/bundle.py) `resolve` reads the configuration from the issue, validates it against the catalog (the same rules as the page) and plans every package with [`ci/plan.py`](ci/plan.py): its build job and inputs hash, and the artifact of an earlier run it can reuse. The status comment in the issue shows which packages are reused and which are built. An unexpired bundle with the same configuration and package hashes is linked instead of building it again |
 | `build` | One job per package that cannot be reused, through the shared [build steps](.github/actions/build-entry/action.yml); the core is built from the core recipe of its target with the selected in-tree EPs (`ci/build.py --variant custom --eps ...` on desktop targets), on its runner, with the packages and container its EPs need. Each package is kept as an artifact for 90 days, also when another package of the request fails |
-| `assemble` | Downloads the packages (`gh run download`, checked against their SHA-256), merges them, adds the redistributable third-party runtimes with the SDK versions the packages were built with, writes the CMake package, `plugins.json`, the example, `README.md` and `BUNDLE_INFO.json`, uploads the bundle as an artifact and links it in the issue, which is then closed |
+| `assemble` | Downloads the packages (`gh run download`, checked against their SHA-256), merges them, adds the optional third-party runtimes the request bundles with the versions the packages were built with, writes the CMake package, `plugins.json`, the example, `README.md` and `BUNDLE_INFO.json`, uploads the bundle as an artifact and links it in the issue, which is then closed |
 
 The bundle artifact is kept for 90 days; downloading it needs a GitHub login. It contains `onnxruntime-bundle-<key>-<triple>.zip` (Windows) or `.tar.gz` with:
 
@@ -319,39 +322,37 @@ The CMake package defines `onnxruntime::onnxruntime` and a target per backend wh
 
 ### Third-party files in bundles
 
-The third-party files of a bundle stay under their own licenses, not under the license of the ONNX Runtime binaries; the `ThirdPartyNotices.txt` files in `packages/<package>/` cover the open-source code linked into the binaries.
+The third-party files of a bundle stay under their own licenses, not under the license of the ONNX Runtime binaries; the `ThirdPartyNotices.txt` files in `packages/<package>/` cover the open-source code linked into the binaries. Third-party files come in four groups:
 
-**Bundled runtimes.** Runtimes whose licenses allow distributing them with an application are in the bundle, each with its license texts in `third_party_licenses/<component>/` (the vendor runtimes are also listed in `THIRD_PARTY_RUNTIME.json`):
+**1. Open-source components built from source: always in the bundle.** The packages contain them with their license texts in `third_party_licenses/<component>/`:
 
 | Component | In the bundle with | License |
 |---|---|---|
-| oneDNN (`dnnl.dll` / `libdnnl.so.3`), built from source | oneDNN in the core | Apache-2.0 |
-| TIM-VX (`libtim-vx.so`), built from source | VSINPU in the core | MIT |
-| DirectX Shader Compiler (`dxcompiler.dll`), built from source | WebGPU on Windows (core or plugin) | NCSA |
-| DirectML (`DirectML.dll`) | DirectML (core or plugin), the AMDGPU plugin on Windows | Microsoft DirectML license (redistributable with applications) |
-| OpenVINO runtime and device plugins (Windows also oneTBB) | OpenVINO in the core | Intel OpenVINO Distribution License: the files listed in its `redist.txt` |
-| QAIRT backends and Hexagon skel libraries | QNN (core or plugin) | Qualcomm AI Stack License (object code, as part of an application) |
-| TensorRT for RTX and the CUDA runtime (`cudart`) | TensorRT RTX (core or plugin) | NVIDIA TensorRT for RTX license, CUDA EULA (Attachment A) |
-| CUDA libraries (cudart, cuBLAS, cuFFT, cuRAND, NVRTC, nvJitLink) and cuDNN | CUDA (core or plugin) | CUDA EULA (Attachment A), cuDNN license |
-| TensorRT (plus cudart, cuBLAS, nvJitLink) | TensorRT (core or plugin) | NVIDIA TensorRT license |
-| MIGraphX, built from its develop branch | the MIGraphX or AMDGPU plugin | MIT |
-| MLX, mlx-c (with fmt, nlohmann/json, gguflib, metal-cpp) | the MLX plugin | MIT, Apache-2.0 |
-
-The packages a bundle is made of already contain these runtimes, except the CUDA libraries, cuDNN and TensorRT: they take several GB, so the `assemble` job adds them, with the SDK versions the packages were built with.
-
-**Headers and link files.** The bundle also carries the interface headers and link files (import libraries on Windows; the shared libraries above elsewhere) of the backends whose licenses allow it:
-
-| Backend | Headers | Link files |
-|---|---|---|
-| MIGraphX (MIGraphX and AMDGPU plugins) | `include/migraphx/` | `migraphx*.lib` (Windows) |
-| HIP (AMDGPU plugin) | `include/hip/` | `amdhip64.lib` (Windows); the HIP runtime comes with ROCm |
-| DirectML | `include/DirectML.h` | `DirectML.lib` |
-| MLX | `include/mlx/` (MLX and mlx-c) | the bundled `libmlx*.dylib` |
-| Vulkan (Vulkan plugin) | `include/vulkan/`, `include/vk_video/` | `vulkan-1.lib` (Windows); the loader comes with the graphics driver |
+| oneDNN (`dnnl.dll` / `libdnnl.so.3`) | oneDNN in the core | Apache-2.0 |
+| TIM-VX (`libtim-vx.so`) | VSINPU in the core | MIT |
+| DirectX Shader Compiler (`dxcompiler.dll`) | WebGPU on Windows (core or plugin) | NCSA |
+| MIGraphX, built from its develop branch, with `include/migraphx/` and `migraphx*.lib` (Windows) | the MIGraphX or AMDGPU plugin | MIT |
+| HIP headers (`include/hip/`) and `amdhip64.lib` (Windows); the HIP runtime comes with ROCm | the AMDGPU plugin | MIT |
+| MLX, mlx-c (with fmt, nlohmann/json, gguflib, metal-cpp), with `include/mlx/` | the MLX plugin | MIT, Apache-2.0 |
+| Vulkan headers (`include/vulkan/`, `include/vk_video/`) and `vulkan-1.lib` (Windows); the loader comes with the graphics driver | the Vulkan plugin | Apache-2.0, MIT |
 
 The IREE, zDNN and statically linked Dawn backends of the IREE, Telum and WebGPU plugins have no separate library to link against (ONNX Runtime does not support building the WebGPU plugin EP with Dawn as a shared library: `onnxruntime_USE_EP_API_ADAPTERS` and `onnxruntime_BUILD_DAWN_SHARED_LIBRARY` are mutually exclusive).
 
-**Fetched on the user's machine.** Files whose licenses do not allow redistribution are not in the bundle. When the selection needs any, the bundle contains `fetch-restricted.sh` / `fetch-restricted.ps1` (needs Python 3): it lists the licenses, asks for confirmation (`--yes` skips it) and runs [`scripts/fetch_ep_runtime.py`](scripts/fetch_ep_runtime.py) (copied into `tools/` with `download_ep_packages.py`) on the bundle. The script downloads the exact SDK versions the packages were built with from the vendors' no-account sources and puts every file where the CMake package expects it. The page's *Options* choose whether it fetches the headers and import libraries, and for which EPs.
+**2. Optional runtimes: in the bundle or downloaded, as the request chooses.** Vendor runtimes whose licenses allow redistributing them with an application, and large open-source libraries the packages do not contain. The page offers each one *in the bundle* (the `assemble` job adds it, with its license texts) or *downloaded on your machine* by `fetch-restricted` (the default). Either way it is the version the packages were built with. The sizes are estimates of the unpacked files:
+
+| EP | Runtime files | Size | License |
+|---|---|---|---|
+| CUDA (core or plugin) | cudart, cuBLAS / cuBLASLt, cuFFT, cuRAND, NVRTC, nvJitLink; cuDNN | about 2.3 GB | CUDA EULA (Attachment A), cuDNN license |
+| TensorRT (core or plugin) | `nvinfer*` (with builder resources, lean / dispatch / plugin libraries), `nvonnxparser`; cudart, cuBLAS, nvJitLink | about 2.5 GB | NVIDIA TensorRT license |
+| TensorRT RTX (core or plugin) | `tensorrt_rtx_*`, `tensorrt_onnxparser_rtx_*`; cudart | about 200 MB | NVIDIA TensorRT for RTX license, CUDA EULA |
+| QNN (core or plugin) | QAIRT backends (`Qnn*`, `Genie*`, `HtpPrepare`) and Hexagon skel libraries | about 200 MB | Qualcomm AI Stack License (object code, as part of an application) |
+| OpenVINO (core) | OpenVINO runtime and device plugins (Windows also oneTBB) | about 200 MB | Intel OpenVINO Distribution License: the files listed in its `redist.txt` |
+| DirectML (core, DirectML or AMDGPU plugin on Windows) | `DirectML.dll` from the `Microsoft.AI.DirectML` NuGet package | about 20 MB | Microsoft DirectML license (redistributable with applications) |
+| IREE (plugin) | the IREE compiler library the EP loads at run time (from the `iree-base-compiler` wheel), in `iree/compiler/_mlir_libs/` next to the EP library, where the EP finds it | about 200 MB | Apache-2.0 with LLVM exceptions |
+
+The packages themselves never contain these files, so the public package artifacts redistribute no vendor runtime.
+
+**3. Files whose licenses do not allow redistribution: always downloaded.** When the selection needs any, the bundle contains `fetch-restricted.sh` / `fetch-restricted.ps1` (needs Python 3): it lists the licenses, asks for confirmation (`--yes` skips it) and runs [`scripts/fetch_ep_runtime.py`](scripts/fetch_ep_runtime.py) (copied into `tools/` with `download_ep_packages.py`) on the bundle. The script downloads the exact versions the packages were built with from the vendors' no-account sources and puts every file where the CMake package expects it: these files, and the optional runtimes the request left out. The page's *Options* choose whether it fetches the headers and import libraries, and for which EPs.
 
 | EP | SDK | Fetched |
 |---|---|---|
@@ -360,6 +361,7 @@ The IREE, zDNN and statically linked Dawn backends of the IREE, Telum and WebGPU
 | TensorRT RTX | TensorRT-RTX, CUDA | headers and import libraries |
 | QNN | QAIRT | `include/QNN` headers (the license allows object code only) |
 | OpenVINO (in the core) | OpenVINO | headers and import libraries |
+| DirectML | `Microsoft.AI.DirectML` NuGet package | `DirectML.h`, `DirectMLConfig.h` and `DirectML.lib` |
 | Vitis AI (in the core, Windows x64) | Vitis AI runtime (`voe` wheel; redistribution terms not verified) | `onnxruntime_vitisai_ep.dll`, `dyn_dispatch_core.dll`, `aiecompiler_client.dll`, `onnxruntime_vitis_ai_custom_ops.dll` |
 | CANN (in the core, Linux) | CANN toolkit (not redistributable) | the whole toolkit: its vendor installer is run into `lib/cann` (source its `set_env.sh` before use) |
 
@@ -371,9 +373,9 @@ python scripts/fetch_ep_runtime.py --ep qnn:dev --target aarch64-pc-windows-msvc
 python scripts/fetch_ep_runtime.py --list
 ```
 
-`--ep <ep>[:runtime|dev|runtime+dev]` selects the runtime files (the default), the development files (headers into `include/<backend>/` keeping their directory tree, Windows import libraries into `lib/`), or both. Targets: `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`, `arm64ec-pc-windows-msvc`, `arm64x-pc-windows-msvc`, `aarch64-linux-android`. The script writes `THIRD_PARTY_RUNTIME.json` (versions, sources and extracted files) and copies the license texts into `third_party_licenses/`. Archives are only streamed, never fully unpacked; downloads are cached and verified when the upstream provides a checksum.
+`--ep <ep>[:runtime|dev|runtime+dev]` selects the runtime files (the default), the development files (headers into `include/<backend>/` keeping their directory tree, Windows import libraries into `lib/`), or both. Targets: `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`, `arm64ec-pc-windows-msvc`, `arm64x-pc-windows-msvc`, `aarch64-linux-android`, `aarch64-apple-darwin` (the IREE compiler only). The script writes `THIRD_PARTY_RUNTIME.json` (versions, sources and extracted files) and copies the license texts into `third_party_licenses/`. Archives are only streamed, never fully unpacked; downloads are cached and verified when the upstream provides a checksum.
 
-**Installed by the user.** ROCm (HIP, rocBLAS, MIOpen, ...) for the MIGraphX and AMDGPU EPs: the AMD packages expect it in `/opt/rocm` (Linux) or a HIP SDK / TheRock install (Windows). On Linux the OpenVINO runtime also needs the system oneTBB (`libtbb12`). GPU and NPU drivers are never included. The bundle's README says what its selection needs.
+**4. Installed by the user.** ROCm (HIP, rocBLAS, MIOpen, ...) for the MIGraphX and AMDGPU EPs: the AMD packages expect it in `/opt/rocm` (Linux) or a HIP SDK / TheRock install (Windows). On Linux the OpenVINO runtime also needs the system oneTBB (`libtbb12`). GPU and NPU drivers are never included. The bundle's README says what its selection needs.
 
 ### Checking requests locally
 

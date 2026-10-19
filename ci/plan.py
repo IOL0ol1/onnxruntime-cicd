@@ -60,9 +60,11 @@ def cores() -> dict[str, dict]:
             for t, c in out.items()}
 
 
-def core_entry(triple: str, eps: list[str], cuda_major: str = "13", wasm_mode: str = "") -> dict:
+def core_entry(triple: str, eps: list[str], cuda_major: str = "13", wasm_mode: str = "",
+               link: dict[str, str] | None = None) -> dict:
     """Build recipe entry of the core of a bundle: the core recipe of the target with the selected in-tree EPs (the
-    WebAssembly build mode on wasm32), the packages and container its EPs need, and heavy if one of them is."""
+    WebAssembly build mode on wasm32), the packages and container its EPs need, and heavy if one of them is. link holds
+    the linkage choices other than the defaults, passed to ci/build.py as <ep>:<choice>."""
     core = cores()[triple]
     caps = core["eps"]
     if core["platform"] == "wasm":
@@ -79,7 +81,7 @@ def core_entry(triple: str, eps: list[str], cuda_major: str = "13", wasm_mode: s
         experimental = experimental or bool(req.get("experimental"))
     return {**DEFAULTS, "package": CORE, "recipe": recipe, "variant": variant,
             "triple": core.get("core_from") or triple, "runner": core["runner"], "submodules": "onnxruntime",
-            "cuda_major": cuda_major or "13", "eps": ",".join(eps), "apt": " ".join(sorted(apt)), "docker": docker,
+            "cuda_major": cuda_major or "13", "eps": ",".join(f"{ep}:{link[ep]}" if ep in (link or {}) else ep for ep in eps), "apt": " ".join(sorted(apt)), "docker": docker,
             "heavy": heavy, "experimental": experimental, "keep_android_sdk": bool(core.get("keep_android_sdk"))}
 
 
