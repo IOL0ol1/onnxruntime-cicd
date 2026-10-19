@@ -1,0 +1,50 @@
+[submodule "eps/official/onnxruntime-ep-tensorrt"]
+	path = eps/official/onnxruntime-ep-tensorrt
+	url = https://github.com/onnxruntime/onnxruntime-ep-tensorrt.git
+	shallow = true
+	branch = main
+[submodule "eps/official/onnxruntime-ep-amdgpu"]
+	path = eps/official/onnxruntime-ep-amdgpu
+	url = https://github.com/onnxruntime/onnxruntime-ep-amdgpu.git
+	shallow = true
+	branch = main
+[submodule "eps/official/onnxruntime-ep-mlx"]
+	path = eps/official/onnxruntime-ep-mlx
+	url = https://github.com/onnxruntime/onnxruntime-ep-mlx.git
+	shallow = true
+	branch = main
+[submodule "eps/vendor/nvidia-tensorrt-rtx-ep"]
+	path = eps/vendor/nvidia-tensorrt-rtx-ep
+	url = https://github.com/NVIDIA/TensorRT-RTX-EP-ABI.git
+	shallow = true
+	branch = main
+[submodule "eps/community/onnxruntime-ep-iree"]
+	path = eps/community/onnxruntime-ep-iree
+	url = https://github.com/iree-org/onnxruntime-ep-iree.git
+	shallow = true
+	branch = main
+[submodule "eps/community/onnxruntime-ep-telum"]
+	path = eps/community/onnxruntime-ep-telum
+	url = https://github.com/IBM/onnxruntime-ep-telum.git
+	shallow = true
+	branch = main
+[submodule "eps/community/onnxruntime-ep-vulkan"]
+	path = eps/community/onnxruntime-ep-vulkan
+	url = https://github.com/justinchuby/onnxruntime-ep-vulkan.git
+	shallow = true
+	branch = main
+[submodule "onnxruntime"]
+	path = onnxruntime
+	url = https://github.com/microsoft/onnxruntime.git
+	branch = main
+	shallow = true
+[submodule "eps/official/onnxruntime-qnn"]
+	path = eps/official/onnxruntime-qnn
+	url = https://github.com/onnxruntime/onnxruntime-qnn.git
+	shallow = true
+	branch = main
+[submodule "deps/amdmigraphx"]
+	path = deps/amdmigraphx
+	url = https://github.com/ROCm/AMDMIGraphX.git
+	branch = develop
+	shallow = true

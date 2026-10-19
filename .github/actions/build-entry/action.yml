@@ -1,0 +1,235 @@
+# Builds one package of a bundle request (a plugin EP entry of ci/matrix.json or a core) with ci/build.py and leaves
+# the staged outputs in $STAGE_DIR. The repository must be checked out first.
+#
+# Sets WORK_DIR, STAGE_DIR, SDK_ROOT and DIST_DIR for the following steps of the job.
+
+name: Build entry
+description: Build an ONNX Runtime / EP recipe with ci/build.py and stage its outputs
+
+inputs:
+  recipe:
+    description: ci/build.py recipe
+    required: true
+  variant:
+    description: ci/build.py variant
+    default: default
+  triple:
+    description: target triple
+    required: true
+  cuda-major:
+    description: CUDA major version
+    default: "13"
+  eps:
+    description: comma-separated in-tree EPs of the custom variant
+    default: ""
+  submodules:
+    description: space-separated submodule paths to check out (with their nested submodules)
+    required: true
+  docker:
+    description: container image to build in (Linux)
+    default: ""
+  apt:
+    description: Ubuntu packages to install
+    default: ""
+  msvc-arch:
+    description: MSVC environment architecture (Windows)
+    default: amd64
+  msvc-toolset:
+    description: MSVC toolset version (empty = the newest)
+    default: ""
+  keep-android-sdk:
+    description: keep the preinstalled Android SDK when freeing disk space
+    default: "false"
+  ccache:
+    description: '"true": compile through ccache, kept in the Actions cache (not in containers)'
+    default: "false"
+  ccache-key:
+    description: Actions cache key prefix of the ccache directory
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Enable long paths (Windows)
+      if: runner.os == 'Windows'
+      shell: bash
+      run: git config --system core.longpaths true
+
+    - name: Free disk space (Linux)
+      if: runner.os == 'Linux'
+      uses: jlumbroso/free-disk-space@v2
+      with:
+        android: ${{ inputs.keep-android-sdk != 'true' }}  # the Android builds use the preinstalled SDK
+        large-packages: false  # removing them with apt takes minutes and frees little that the builds need
+
+    # The runners have 16 GB of RAM and a 4 GB swap file; linking the LTO WebAssembly builds and some EP builds needs
+    # more, and running out of memory shuts the runner down. Under sustained memory pressure systemd-oomd also kills
+    # whole cgroups, which can take the runner service with it; leave out-of-memory handling to the kernel.
+    - name: Add swap and stop systemd-oomd (Linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        { sudo fallocate -l 16G /swapfile-ci && sudo chmod 600 /swapfile-ci && sudo mkswap /swapfile-ci > /dev/null &&
+          sudo swapon /swapfile-ci; } || echo "::warning::could not add swap"
+        sudo systemctl stop systemd-oomd.socket systemd-oomd.service || true
+        swapon --show
+
+    - name: Check out required submodules
+      shell: bash
+      env:
+        SUBMODULES: ${{ inputs.submodules }}
+      run: |
+        for path in $SUBMODULES; do
+          git submodule update --init --depth 1 "$path"
+          git -C "$path" submodule update --init --recursive --depth 1
+        done
+
+    # qcom/build_and_test.py of onnxruntime-qnn creates its venv with python3.10 on Linux hosts
+    - uses: actions/setup-python@v7
+      if: inputs.recipe == 'ep-qnn' && runner.os == 'Linux'
+      with:
+        python-version: "3.10"
+
+    - uses: actions/setup-python@v7
+      with:
+        python-version: "3.12"
+
+    - name: Install build tools
+      shell: bash
+      # jinja2 / MarkupSafe: Dawn's code generator falls back to these when its own fetched copies come back empty
+      run: python -m pip install --upgrade "cmake==${CMAKE_VERSION}" ninja jinja2 markupsafe
+
+    - name: Install system packages (Linux)
+      if: runner.os == 'Linux' && inputs.apt != '' && inputs.docker == ''
+      shell: bash
+      env:
+        APT_PACKAGES: ${{ inputs.apt }}
+      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $APT_PACKAGES
+
+    - name: Set up MSVC environment (Windows)
+      if: runner.os == 'Windows'
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: ${{ inputs.msvc-arch }}
+        toolset: ${{ inputs.msvc-toolset }}
+
+    - name: Remove Git Bash link.exe (it shadows the MSVC linker)
+      if: runner.os == 'Windows'
+      shell: bash
+      run: rm -f /usr/bin/link.exe
+
+    - name: Set paths
+      shell: bash
+      run: |
+        {
+          echo "WORK_DIR=${RUNNER_TEMP}/work"
+          echo "STAGE_DIR=${RUNNER_TEMP}/stage"
+          echo "SDK_ROOT=${RUNNER_TEMP}/sdk"
+          echo "DIST_DIR=${RUNNER_TEMP}/dist"
+          # Default for `cmake --build` without --parallel (an explicit bare --parallel ignores it); a Makefile
+          # build would otherwise run serially. Linux only: with the Xcode generator it adds a second -jobs option,
+          # which xcodebuild rejects.
+          if [ "$RUNNER_OS" = "Linux" ]; then echo "CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)"; fi
+        } >> "$GITHUB_ENV"
+
+    # Compiler cache for the long builds (CUDA, MIGraphX). The ccache directory is restored from the newest cache with
+    # the key prefix and saved after the job; CMake reads the compiler launchers from the environment, so every CMake
+    # project of the build (ONNX Runtime, MIGraphX and its dependencies, EP repositories) uses it. The repository has
+    # 10 GB of Actions cache; the least recently used entries are evicted.
+    - name: Set up ccache
+      if: inputs.ccache == 'true' && inputs.docker == ''
+      uses: hendrikmuhs/ccache-action@v1.2
+      with:
+        key: ccache-${{ inputs.ccache-key }}
+        max-size: 2G
+
+    - name: Use ccache for CMake builds
+      if: inputs.ccache == 'true' && inputs.docker == ''
+      shell: bash
+      run: |
+        {
+          echo "CMAKE_C_COMPILER_LAUNCHER=ccache"
+          echo "CMAKE_CXX_COMPILER_LAUNCHER=ccache"
+          echo "CMAKE_CUDA_COMPILER_LAUNCHER=ccache"
+        } >> "$GITHUB_ENV"
+
+    # Long-running, open-source build steps (see build_cache in ci/build.py) are reused across runs. The key hashes
+    # their inputs, so an update gets a new key; only complete results are saved.
+    - name: Build cache key
+      id: cache
+      if: inputs.docker == ''
+      shell: bash
+      env:
+        RECIPE: ${{ inputs.recipe }}
+        VARIANT: ${{ inputs.variant }}
+        TRIPLE: ${{ inputs.triple }}
+        CUDA_MAJOR: ${{ inputs.cuda-major }}
+        EPS: ${{ inputs.eps }}
+      run: >-
+        python ci/build.py --recipe "$RECIPE" --variant "$VARIANT" --triple "$TRIPLE" --cuda-major "$CUDA_MAJOR"
+        --eps "$EPS" --work "$WORK_DIR" --stage "$STAGE_DIR" --sdk-root "$SDK_ROOT" --cache-info "$GITHUB_OUTPUT"
+
+    - name: Restore build cache
+      id: restore
+      if: steps.cache.outputs.key != ''
+      uses: actions/cache/restore@v6
+      with:
+        key: ${{ steps.cache.outputs.key }}
+        restore-keys: ${{ steps.cache.outputs.restore-keys }}
+        path: ${{ steps.cache.outputs.path }}
+
+    - name: Build
+      if: inputs.docker == ''
+      shell: bash
+      env:
+        RECIPE: ${{ inputs.recipe }}
+        VARIANT: ${{ inputs.variant }}
+        TRIPLE: ${{ inputs.triple }}
+        CUDA_MAJOR: ${{ inputs.cuda-major }}
+        EPS: ${{ inputs.eps }}
+      run: >-
+        python ci/build.py --recipe "$RECIPE" --variant "$VARIANT" --triple "$TRIPLE" --cuda-major "$CUDA_MAJOR"
+        --eps "$EPS" --work "$WORK_DIR" --stage "$STAGE_DIR" --sdk-root "$SDK_ROOT"
+
+    # Saved even when a later build step fails, as long as the cached step itself finished
+    - name: Check build cache
+      id: cache-check
+      if: always() && steps.cache.outputs.key != '' && steps.restore.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        CACHE_MARKER: ${{ steps.cache.outputs.marker }}
+      run: if [ -f "$CACHE_MARKER" ]; then echo "save=true" >> "$GITHUB_OUTPUT"; fi
+
+    - name: Save build cache
+      if: always() && steps.cache-check.outputs.save == 'true'
+      uses: actions/cache/save@v6
+      with:
+        key: ${{ steps.cache.outputs.key }}
+        path: ${{ steps.cache.outputs.path }}
+
+    - name: Build (container ${{ inputs.docker }})
+      if: inputs.docker != ''
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.docker }}
+        APT_PACKAGES: ${{ inputs.apt }}
+        RECIPE: ${{ inputs.recipe }}
+        VARIANT: ${{ inputs.variant }}
+        TRIPLE: ${{ inputs.triple }}
+        CUDA_MAJOR: ${{ inputs.cuda-major }}
+        EPS: ${{ inputs.eps }}
+      run: |
+        docker run --rm \
+          -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" -v "$RUNNER_TEMP:$RUNNER_TEMP" -w "$GITHUB_WORKSPACE" \
+          -e CUDA_ARCHITECTURES -e PYTHONUTF8 -e PYTHONIOENCODING -e CMAKE_VERSION -e CMAKE_POLICY_VERSION_MINIMUM \
+          -e CMAKE_BUILD_PARALLEL_LEVEL -e GITHUB_TOKEN -e PIP_ROOT_USER_ACTION=ignore \
+          -e APT_PACKAGES -e RECIPE -e VARIANT -e TRIPLE -e CUDA_MAJOR -e EPS -e WORK_DIR -e STAGE_DIR -e SDK_ROOT \
+          "$IMAGE" bash -c '
+            set -euo pipefail
+            apt-get update && apt-get install -y --no-install-recommends python3-pip python3-venv git patch $APT_PACKAGES
+            git config --global --add safe.directory "*"
+            python3 -m pip install --break-system-packages "cmake==${CMAKE_VERSION}" ninja
+            python3 ci/build.py --recipe "$RECIPE" --variant "$VARIANT" --triple "$TRIPLE" --cuda-major "$CUDA_MAJOR" \
+              --eps "$EPS" --work "$WORK_DIR" --stage "$STAGE_DIR" --sdk-root "$SDK_ROOT"
+          '
+        sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP" "$GITHUB_WORKSPACE"

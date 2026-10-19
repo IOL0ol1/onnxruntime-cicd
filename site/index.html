@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ONNX Runtime Bundles</title>
+  <meta name="description" content="Configure an ONNX Runtime bundle with the execution providers you need and request a build.">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <div class="wrap">
+      <h1>ONNX Runtime Bundles</h1>
+      <p class="lead">Pick a target and the execution providers you need. A bundle request builds one package with the
+        headers, link files and libraries of ONNX Runtime and of every selected backend.</p>
+      <p id="source" class="source">Loading the catalog…</p>
+    </div>
+  </header>
+  <main class="wrap" id="app" aria-live="polite"></main>
+  <footer class="wrap">
+    <p>Built by <a href="https://github.com/IOL0ol1/onnxruntime-cicd">onnxruntime-cicd</a>. Third-party components stay
+      under their vendors' licenses; files that may not be redistributed are downloaded on your machine by the bundle's
+      fetch-restricted script.</p>
+  </footer>
+  <script src="app.js"></script>
+</body>
+</html>

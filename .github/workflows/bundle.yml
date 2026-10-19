@@ -1,0 +1,273 @@
+# Bundle requests: an issue created from the configurator page (GitHub Pages, site/) with the bundle form
+# (.github/ISSUE_TEMPLATE/bundle.yml) builds one package with the selected EPs and links it in the issue.
+# This is the only workflow that builds ONNX Runtime and the EPs: every package is built on demand.
+#
+# - Only collaborators trigger builds: issues and /rebuild comments of anyone else are ignored.
+# - ci/bundle.py resolve validates the configuration and plans the packages (ci/plan.py): each one is named after the
+#   hash of its build inputs, and an unexpired artifact with that name from an earlier run is reused; the others are
+#   built by the build matrix and kept for 90 days.
+# - The bundle is uploaded as an artifact (90 days; downloading needs a GitHub login). Third-party files whose licenses
+#   do not allow redistributing them are fetched on the user's machine by fetch-restricted.(sh|ps1) in the bundle.
+# - Editing the issue rebuilds it; a comment starting with /rebuild rebuilds it without reusing earlier artifacts.
+#
+# Optional repository variables (Settings -> Variables):
+#   RUNNER_MAP          JSON that replaces default runners, e.g. {"ubuntu-24.04": "linux-8core"}
+#   HEAVY_RUNNER_MAP    JSON that replaces runners only for long builds such as CUDA / QNN
+#   CUDA_ARCHITECTURES  CMAKE_CUDA_ARCHITECTURES (default 80-real;80-virtual)
+#   MIGRAPHX_GPU_TARGETS  GPU_TARGETS of the Windows MIGraphX source build (default gfx1100;gfx1101;gfx1102;gfx1200;gfx1201)
+
+name: bundle
+
+on:
+  issues:
+    types: [opened, edited, reopened]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  issues: write  # status comment, closing the issue
+  actions: read  # package artifacts of earlier runs
+
+concurrency:
+  group: bundle-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: utf-8
+  # ORT drops a list that has only -virtual entries, so keep at least one real architecture
+  CUDA_ARCHITECTURES: ${{ vars.CUDA_ARCHITECTURES || '80-real;80-virtual' }}
+  MIGRAPHX_GPU_TARGETS: ${{ vars.MIGRAPHX_GPU_TARGETS }}
+  CMAKE_VERSION: "4.2.3"
+  # CMake 4 removed compatibility with cmake_minimum_required(VERSION < 3.5), still used by some ORT dependencies
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+  STATUS_MARKER: "<!-- onnxruntime-bundle-status -->"
+
+jobs:
+  resolve:
+    if: >-
+      startsWith(github.event.issue.title, '[bundle]') && !github.event.issue.pull_request && (
+        (github.event_name == 'issues' &&
+         contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association)) ||
+        (github.event_name == 'issue_comment' && startsWith(github.event.comment.body, '/rebuild') &&
+         contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)))
+    runs-on: ubuntu-24.04
+    outputs:
+      ok: ${{ steps.resolve.outputs.ok }}
+      key: ${{ steps.resolve.outputs.key }}
+      name: ${{ steps.resolve.outputs.name }}
+      summary: ${{ steps.resolve.outputs.summary }}
+      existing_url: ${{ steps.resolve.outputs.existing_url }}
+      builds: ${{ steps.resolve.outputs.builds }}
+      has_builds: ${{ steps.resolve.outputs.has_builds }}
+      comment_id: ${{ steps.status.outputs.comment-id }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Resolve the request
+        id: resolve
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RUNNER_MAP: ${{ vars.RUNNER_MAP }}
+          HEAVY_RUNNER_MAP: ${{ vars.HEAVY_RUNNER_MAP }}
+          REBUILD: ${{ github.event_name == 'issue_comment' }}
+        run: >-
+          python ci/bundle.py resolve --event "$GITHUB_EVENT_PATH" --plan "$RUNNER_TEMP/plan/plan.json"
+          --github-output "$GITHUB_OUTPUT" $( [ "$REBUILD" = true ] && echo --no-reuse )
+
+      - name: Find the status comment
+        id: find
+        uses: peter-evans/find-comment@v4
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          comment-author: github-actions[bot]
+          body-includes: ${{ env.STATUS_MARKER }}
+
+      - name: Report the plan
+        id: status
+        uses: peter-evans/create-or-update-comment@v5
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          comment-id: ${{ steps.find.outputs.comment-id }}
+          edit-mode: replace
+          body: |
+            ${{ env.STATUS_MARKER }}
+            ${{ steps.resolve.outputs.ok != 'true' && format('❌ **This request cannot be built:** {0}', steps.resolve.outputs.error) || '' }}
+            ${{ steps.resolve.outputs.ok == 'true' && steps.resolve.outputs.existing_url != '' && format('✅ **This bundle was built before:** [{0}]({1}) (download needs a GitHub login; comment `/rebuild` to build it again)', steps.resolve.outputs.name, steps.resolve.outputs.existing_url) || '' }}
+            ${{ steps.resolve.outputs.ok == 'true' && steps.resolve.outputs.existing_url == '' && format('⏳ **Building** `{0}` in [run {1}]({2}/{3}/actions/runs/{1}). Packages that are not reused take up to a few hours (CUDA, MIGraphX).', steps.resolve.outputs.name, github.run_id, github.server_url, github.repository) || '' }}
+
+            ${{ steps.resolve.outputs.summary }}
+
+      - name: Close the issue (the bundle exists)
+        if: steps.resolve.outputs.existing_url != ''
+        uses: actions/github-script@v9
+        with:
+          script: |
+            await github.rest.issues.update({...context.repo, issue_number: context.issue.number,
+                                             state: 'closed', state_reason: 'completed'});
+
+      - name: Fail on an invalid request
+        if: steps.resolve.outputs.ok != 'true'
+        run: exit 1
+
+      - uses: actions/upload-artifact@v7
+        if: steps.resolve.outputs.ok == 'true' && steps.resolve.outputs.existing_url == ''
+        with:
+          name: bundle-plan-${{ steps.resolve.outputs.key }}
+          path: ${{ runner.temp }}/plan/plan.json
+          retention-days: 7
+
+  # The packages that no earlier run built with the same inputs
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.ok == 'true' && needs.resolve.outputs.existing_url == '' && needs.resolve.outputs.has_builds == 'true'
+    name: ${{ matrix.package }} · ${{ matrix.triple }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    # issues / issue_comment are low-trust triggers, which get read-only caches by default; the ccache and MIGraphX
+    # build caches must be saved. Only collaborators trigger this workflow, and resolve validated the request.
+    cache-mode: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.resolve.outputs.builds) }}
+    env:
+      GITHUB_TOKEN: ${{ github.token }}  # authenticated GitHub API requests (the anonymous rate limit is easily hit)
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/build-entry
+        with:
+          recipe: ${{ matrix.recipe }}
+          variant: ${{ matrix.variant }}
+          eps: ${{ matrix.eps }}
+          triple: ${{ matrix.triple }}
+          cuda-major: ${{ matrix.cuda_major }}
+          submodules: ${{ matrix.submodules }}
+          docker: ${{ matrix.docker }}
+          apt: ${{ matrix.apt }}
+          msvc-arch: ${{ matrix.msvc_arch }}
+          msvc-toolset: ${{ matrix.msvc_toolset }}
+          keep-android-sdk: ${{ matrix.keep_android_sdk }}
+          ccache: ${{ matrix.ccache }}
+          ccache-key: ${{ matrix.ccache_key }}
+
+      - name: Package
+        env:
+          PACKAGE: ${{ matrix.package }}
+          TRIPLE: ${{ matrix.triple }}
+          HASH: ${{ matrix.hash }}
+          SUBMODULES: ${{ matrix.submodules }}
+          CUDA_MAJOR: ${{ matrix.cuda_major }}
+          RECIPE: ${{ matrix.recipe }}/${{ matrix.variant }}
+          EPS: ${{ matrix.eps }}
+        run: >-
+          python ci/package.py --stage "$STAGE_DIR" --name "$PACKAGE" --triple "$TRIPLE" --version "$HASH"
+          --source $SUBMODULES --sdk-versions "$SDK_ROOT/sdk-versions.json" --out "$DIST_DIR"
+          --extra "cuda_architectures=${CUDA_ARCHITECTURES}" "cuda_major=$CUDA_MAJOR" "recipe=$RECIPE" "eps=$EPS"
+          "inputs_hash=$HASH"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ runner.temp }}/dist/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 90
+
+  assemble:
+    needs: [resolve, build]
+    if: >-
+      always() && needs.resolve.outputs.ok == 'true' && needs.resolve.outputs.existing_url == '' &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      # CUDA / cuDNN / TensorRT downloads and the bundle itself take several GB
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v2
+        with:
+          large-packages: false
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: bundle-plan-${{ needs.resolve.outputs.key }}
+          path: ${{ runner.temp }}/plan
+
+      - name: Download the packages
+        run: python ci/bundle.py download --plan "$RUNNER_TEMP/plan/plan.json" --dest "$RUNNER_TEMP/packages"
+
+      - name: Assemble the bundle
+        env:
+          BUNDLE_ISSUE_URL: ${{ github.event.issue.html_url }}
+          BUNDLE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: >-
+          python ci/bundle.py assemble --plan "$RUNNER_TEMP/plan/plan.json" --packages "$RUNNER_TEMP/packages"
+          --work "$RUNNER_TEMP/work" --out "$RUNNER_TEMP/dist" --cache "$RUNNER_TEMP/sdk-cache"
+
+      - name: Upload the bundle
+        id: upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ needs.resolve.outputs.name }}
+          path: ${{ runner.temp }}/dist/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 90
+
+      - name: Report the bundle
+        uses: peter-evans/create-or-update-comment@v5
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          comment-id: ${{ needs.resolve.outputs.comment_id }}
+          edit-mode: replace
+          body: |
+            ${{ env.STATUS_MARKER }}
+            ✅ **Bundle ready:** [${{ needs.resolve.outputs.name }}](${{ steps.upload.outputs.artifact-url }}) (download needs a GitHub login; kept for 90 days). Built in [run ${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}).
+
+            The archive inside contains `README.md`; when it lists files you fetch yourself, run `fetch-restricted.sh` / `fetch-restricted.ps1` once after extracting it.
+
+            ${{ needs.resolve.outputs.summary }}
+
+      - name: Close the issue
+        uses: actions/github-script@v9
+        with:
+          script: |
+            await github.rest.issues.update({...context.repo, issue_number: context.issue.number,
+                                             state: 'closed', state_reason: 'completed'});
+
+  report-failure:
+    needs: [resolve, build, assemble]
+    # a build that hits the 6-hour job limit is "cancelled"; a run that a newer request of the issue cancelled is not
+    # reported (cancelled()), so that it does not overwrite the newer run's status
+    if: >-
+      !cancelled() && needs.resolve.outputs.ok == 'true' &&
+      (contains(fromJSON('["failure","cancelled"]'), needs.build.result) || needs.assemble.result == 'failure')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: peter-evans/create-or-update-comment@v5
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          comment-id: ${{ needs.resolve.outputs.comment_id }}
+          edit-mode: replace
+          body: |
+            ${{ env.STATUS_MARKER }}
+            ❌ **The bundle build failed** in [run ${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) (${{ needs.build.result == 'cancelled' && 'a package build hit the 6-hour job limit; packages that did build are kept and reused' || needs.build.result == 'failure' && 'building a package; packages that did build are kept and reused' || 'assembling the bundle' }}). Edit the issue to try again.
+
+            ${{ needs.resolve.outputs.summary }}
