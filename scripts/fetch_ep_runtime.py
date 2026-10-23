@@ -21,12 +21,16 @@ An EP can be suffixed with the parts to fetch: `cuda:runtime` (the default), `cu
 include/<backend>/ and its import libraries into lib/, which the vendors' licenses do not let us redistribute) or
 `cuda:runtime+dev`.
 
-Only the Python standard library is required (.tar.zst archives also need a `tar` with zstd support).
+Only the Python standard library is required. Python 3.14+ reads .tar.zst archives itself; older versions use zstd, a
+libarchive tar (Windows, macOS) or 7-Zip when one is installed, and otherwise download 7-Zip to a temporary directory.
 """
 
 from __future__ import annotations
 
 import argparse
+import atexit
+import contextlib
+import functools
 import json
 import os
 import re
@@ -79,6 +83,18 @@ LICENSE_FILE = re.compile(r"(?i)^[^/]+(/[^/]+)?/(license|eula|notice|acknowledg)
 SKIP_DIRS = re.compile(r"(?i)/(samples?|python|doc|docs|include|targets/[^/]+/lib/stubs|stubs)/")
 SKIP_DEV_DIRS = re.compile(r"(?i)/(samples?|python|doc|docs)/")
 PARTS = ("runtime", "dev")
+
+# 7-Zip (24.01+ unpacks zstd) for hosts without another zstd decompressor: host platform -> files to download
+SEVEN_ZIP_URL = "https://github.com/ip7z/7zip/releases/download/25.01/"
+SEVEN_ZIP = {
+    "windows-x86_64": [("7zr.exe", "27cbe3d5804ad09e90bbcaa916da0d5c3b0be9462d0e0fb6cb54be5ed9030875"),
+                       ("7z2501-x64.exe", "78afa2a1c773caf3cf7edf62f857d2a8a5da55fb0fff5da416074c0d28b2b55f")],
+    "windows-arm64": [("7zr.exe", "27cbe3d5804ad09e90bbcaa916da0d5c3b0be9462d0e0fb6cb54be5ed9030875"),
+                      ("7z2501-arm64.exe", "6365c7c44e217b9c1009e065daf9f9aa37454e64315b4aaa263f7f8f060755dc")],
+    "linux-x86_64": [("7z2501-linux-x64.tar.xz", "4ca3b7c6f2f67866b92622818b58233dc70367be2f36b498eb0bdeaaa44b53f4")],
+    "linux-aarch64": [("7z2501-linux-arm64.tar.xz", "39c5140f02ce4436599303c59a149f654cb1bbc47cdc105a942120d747ae040d")],
+    "macos-arm64": [("7z2501-mac.tar.xz", "26aa75bc262bb10bf0805617b95569c3035c2c590a99f7db55c7e9607b2685e0")],
+}
 
 
 @dataclass
@@ -250,41 +266,110 @@ def extract_selected(archive: Path, patterns: list[re.Pattern], dest: Path, lice
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
 
+    links: dict[str, str] = {}  # runtime library symlinks (name -> target name), made once their targets exist
     if name.endswith((".zip", ".whl", ".nupkg")):
         with zipfile.ZipFile(archive) as zf:
             for info in zf.infolist():
                 if not info.is_dir() and selected(info.filename):
                     store(info.filename, zf.read(info))
-    elif name.endswith(".zst"):  # Python's tarfile cannot read zstd before 3.14; use the system tar
-        listing = subprocess.run(["tar", "--zstd", "-tf", str(archive)], check=True, capture_output=True, text=True).stdout
-        members = [m for m in listing.splitlines() if not m.endswith("/") and selected(m)]
-        with tempfile.TemporaryDirectory() as tmp:
-            if members:
-                subprocess.run(["tar", "--zstd", "-xf", str(archive), "-C", tmp, *members], check=True)
-            for m in members:
-                src = Path(tmp) / m
-                if src.is_symlink() and os.name != "nt" and _wanted(m, patterns):
-                    _symlink(dest, src.name, os.readlink(src), copied)
-                elif src.is_file():
-                    store(m, src.read_bytes())
     else:
-        with tarfile.open(archive, "r|*") as tf:  # streaming: no random access into multi-GB tarballs
+        with _open_tar(archive) as tf:
             for member in tf:
                 if not selected(member.name):
                     continue
-                if member.issym() and os.name != "nt" and _wanted(member.name, patterns):
-                    _symlink(dest, Path(member.name).name, member.linkname, copied)
+                if member.issym() and _wanted(member.name, patterns):
+                    links[Path(member.name).name] = Path(member.linkname).name
                 elif member.isfile():
                     store(member.name, tf.extractfile(member).read())
+    for link in links:
+        _link(dest, link, links, copied)
     return copied
 
 
-def _symlink(dest: Path, name: str, link: str, copied: list[str]) -> None:
+def _link(dest: Path, name: str, links: dict[str, str], copied: list[str]) -> None:
+    """Recreate a library symlink (e.g. libcudart.so.13 -> libcudart.so.13.4.92). Where symlinks cannot be created
+    (Windows without Developer Mode), hard-link or copy the file it resolves to, so that a Linux bundle prepared there
+    still has its SONAME files."""
     dest.mkdir(parents=True, exist_ok=True)
     target = dest / name
     target.unlink(missing_ok=True)
-    target.symlink_to(Path(link).name)  # e.g. libcudart.so.13 -> libcudart.so.13.4.92
+    try:
+        target.symlink_to(links[name])
+    except OSError:
+        real, seen = links[name], {name}
+        while real in links and real not in seen:
+            seen.add(real)
+            real = links[real]
+        if not (dest / real).is_file():
+            return
+        try:
+            os.link(dest / real, target)
+        except OSError:
+            shutil.copy2(dest / real, target)
     copied.append(name)
+
+
+@contextlib.contextmanager
+def _open_tar(archive: Path):
+    """Open a tar archive for streaming (no random access into multi-GB tarballs)."""
+    if not archive.name.lower().endswith(".zst"):
+        with tarfile.open(archive, "r|*") as tf:
+            yield tf
+        return
+    if hasattr(tarfile.TarFile, "zstopen"):  # Python 3.14+
+        with tarfile.open(archive, "r|zst") as tf:
+            yield tf
+        return
+    cmd, prefix = _zstd_decompressor()
+    proc = subprocess.Popen([*cmd, prefix + str(archive)], stdout=subprocess.PIPE)
+    try:
+        with tarfile.open(fileobj=proc.stdout, mode="r|") as tf:
+            yield tf
+        while proc.stdout.read(1 << 20):  # let the decompressor write the end of the stream before checking its status
+            pass
+    finally:
+        proc.stdout.close()
+        code = proc.wait()
+    if code:
+        raise subprocess.CalledProcessError(code, proc.args)
+
+
+@functools.lru_cache(maxsize=None)
+def _zstd_decompressor() -> tuple[list[str], str]:
+    """A command that writes the tar stream of a .tar.zst file to stdout: (arguments, prefix of the archive path)."""
+    if zstd := shutil.which("zstd"):
+        return [zstd, "-dcq"], ""
+    if tar := shutil.which("tar"):  # libarchive's tar copies the entries of an @archive into a new uncompressed one
+        version = subprocess.run([tar, "--version"], capture_output=True, text=True, errors="replace").stdout
+        if "bsdtar" in version and "zstd" in version:
+            return [tar, "-cf", "-", "--format", "pax"], "@"
+    for name in ("7zz", "7z", "7za"):  # p7zip (7z / 7za 16.02) cannot unpack zstd
+        if exe := shutil.which(name):
+            formats = subprocess.run([exe, "i"], capture_output=True, text=True, errors="replace").stdout
+            if re.search(r"(?i)\bzstd\b", formats):
+                return [exe, "x", "-so", "-tzstd"], ""
+    return [str(_download_7zip()), "x", "-so", "-tzstd"], ""
+
+
+def _download_7zip() -> Path:
+    host = dl.detect_platform()
+    if host not in SEVEN_ZIP:
+        raise SystemExit("cannot read .tar.zst archives: install zstd or 7-Zip, or use Python 3.14+")
+    tmp = Path(tempfile.mkdtemp(prefix="7zip-"))
+    atexit.register(shutil.rmtree, tmp, ignore_errors=True)
+    print(f"    no zstd decompressor found, downloading 7-Zip to {tmp}")
+    for filename, sha256 in SEVEN_ZIP[host]:
+        dl.download_file(dl.FileItem(SEVEN_ZIP_URL + filename, filename, sha256), tmp)
+    package = tmp / SEVEN_ZIP[host][-1][0]
+    if package.suffix == ".exe":  # the installer is a 7z archive, which 7zr (7z format only) unpacks
+        subprocess.run([str(tmp / "7zr.exe"), "x", "-y", "-bso0", f"-o{tmp}", str(package), "7z.exe", "7z.dll"],
+                       check=True)
+        return tmp / "7z.exe"
+    exe = tmp / "7zz"
+    with tarfile.open(package) as tf:
+        exe.write_bytes(tf.extractfile("7zz").read())
+    exe.chmod(0o755)
+    return exe
 
 
 def install_cann(run_file: Path, dest: Path) -> Path:
