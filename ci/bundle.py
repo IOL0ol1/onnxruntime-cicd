@@ -3,11 +3,9 @@
 
 A bundle is composed EP by EP: one core library with the in-tree EPs compiled into it plus the plugin EP
 packages of the other EPs, merged into one bin/ lib/ include/ tree, with a CMake package (lib/cmake/onnxruntime-bundle),
-plugins.json and an example. The packages contain the open-source components they build from source; the optional
-third-party runtimes (vendor runtimes that may be redistributed with an application, the IREE compiler) are added
-here when the request chooses so. Everything else goes through fetch-restricted.(sh|ps1), which downloads it on the
-user's machine: the optional runtimes the request left out, and the files whose licenses do not allow redistributing
-them (headers and import libraries of the vendor SDKs, the Vitis AI runtime, the CANN toolkit).
+plugins.json and an example. The packages contain the open-source components they build from source. The files of
+vendor SDKs whose licenses restrict redistribution (runtimes, headers and import libraries) are never in a bundle: its
+fetch-restricted.(sh|ps1) downloads them on the user's machine.
 
     python ci/bundle.py resolve --event $GITHUB_EVENT_PATH --plan plan.json --github-output $GITHUB_OUTPUT
     python ci/bundle.py resolve --config config.json --plan plan.json         # check a configuration locally
@@ -41,7 +39,7 @@ import plan as plan_mod
 import sdk
 
 ROOT = Path(__file__).resolve().parent.parent
-CONFIG_SCHEMA = 4
+CONFIG_SCHEMA = 5
 CORE = plan_mod.CORE  # package name of the core
 CUDA_EPS = {"cuda", "tensorrt", "nv-tensorrt-rtx"}
 
@@ -66,6 +64,36 @@ def parse_issue(body: str) -> dict:
     if not re.search(r"^- \[[xX]\] ", body, re.M):
         raise RequestError("the license acknowledgement is not checked")
     return config
+
+
+def gpu_settings(config: dict, cat: dict, platform: dict, parts: list[dict]) -> dict:
+    """The GPU architectures of a configuration (ci/catalog.py gpu_options) for the packages that compile device code
+    for them (parts: the catalog entries of the core EPs and plugin packages); None where no package does. A setting
+    the configuration leaves out gets its default."""
+    kinds = {k for part in parts for k in part["gpu"]}
+    cuda, amd = cat["gpu"]["cuda"], cat["gpu"]["amd"]
+    out = {"cuda_archs": None, "cuda_ptx": None, "amd_gpu_targets": None}
+    if "cuda" in kinds:
+        archs = config.get("cuda_archs")
+        archs = cuda["default"]["archs"] if archs is None else archs
+        if not isinstance(archs, list) or not archs:
+            raise RequestError("select at least one CUDA GPU architecture")
+        if bad := [str(a) for a in archs if a not in cuda["archs"]]:
+            raise RequestError(f"unknown CUDA architectures {', '.join(bad)} (known: {', '.join(cuda['archs'])})")
+        ptx = config.get("cuda_ptx")
+        out.update(cuda_archs=sorted(set(archs), key=int), cuda_ptx=cuda["default"]["ptx"] if ptx is None else bool(ptx))
+    if "amd" in kinds:
+        targets = config.get("amd_gpu_targets")
+        if targets is None:
+            targets = [t for t in amd["default"] if platform["os"] in amd["targets"][t]["os"]]
+        if not isinstance(targets, list) or not targets:
+            raise RequestError("select at least one AMD GPU target")
+        if bad := [str(t) for t in targets if t not in amd["targets"]]:
+            raise RequestError(f"unknown AMD GPU targets {', '.join(bad)} (known: {', '.join(amd['targets'])})")
+        if bad := [t for t in targets if platform["os"] not in amd["targets"][t]["os"]]:
+            raise RequestError(f"MIGraphX cannot be built for {', '.join(bad)} on {platform['os']}")
+        out["amd_gpu_targets"] = [t for t in amd["targets"] if t in targets]
+    return out
 
 
 def make_plan(config: dict, cat: dict) -> dict:
@@ -124,16 +152,26 @@ def make_plan(config: dict, cat: dict) -> dict:
                 cuda_major not in platform["core_eps"][ep]["cuda"]:
             raise RequestError(f"{names[ep]['name']} in the core is built with CUDA "
                                f"{' / '.join(platform['core_eps'][ep]['cuda'])} for {triple}, not CUDA {cuda_major}")
+    # the version of a plugin EP offered as several packages (ci/catalog.py PLUGIN_VARIANTS)
+    variants = {**cat.get("default_variants", {}), **(config.get("variants") or {})}
     plugins = []
     for ep in plugin_eps:
         options = [p for p in cat["plugins"] if p["triple"] == triple and p["ep"] == ep]
         if not options:
             raise RequestError(f"{names[ep]['name']} has no plugin EP package for {triple}")
+        if offered := sorted({p["variant"] for p in options if p.get("variant")}):
+            if variants.get(ep) not in offered:
+                raise RequestError(f"the {names[ep]['name']} plugin EP for {triple} is one of {', '.join(offered)}, "
+                                   f"not {variants.get(ep)!r}")
+            options = [p for p in options if p.get("variant") == variants[ep]]
+        if any("with_hip" in p for p in options):  # the AMDGPU version, with or without the HIP backend
+            options = [p for p in options if p["with_hip"] == bool(config.get("amd_hip"))]
         matching = [p for p in options if not p["cuda_major"] or p["cuda_major"] == cuda_major]
         if not matching:
             raise RequestError(f"the {names[ep]['name']} plugin EP for {triple} is built with CUDA "
                                f"{' / '.join(sorted(p['cuda_major'] for p in options))}, not CUDA {cuda_major}")
         plugins.append(matching[0])
+    gpu = gpu_settings(config, cat, platform, [platform["core_eps"][ep] for ep in core_eps] + plugins)
 
     core_forms = {"cpu": "builtin"}
     if wasm_mode:
@@ -154,38 +192,38 @@ def make_plan(config: dict, cat: dict) -> dict:
         for ep, form in forms.items():
             how = f"; {platform['core_eps'][ep]['link']['label']}: {link[ep]}" if name == CORE and ep in link else ""
             eps.setdefault(ep, []).append(f"{form} ({name}{how})")
-    dev = bool(config.get("dev", True))
-    wanted = config.get("fetch")  # EPs whose files fetch-restricted gets (default: all)
-    bundle_eps = set(config.get("bundle") or [])  # EPs whose optional runtimes the bundle contains
-    bundle_runtime, fetch, system, bundled = [], [], [], set()
+    # the third-party files: vendor SDK files fetch-restricted downloads, and what the user installs
+    fetch, system = [], []
     fetched: dict[str, set[str]] = {}  # component -> parts fetch-restricted downloads ("runtime", "dev")
     for ep in eps:
-        tp = cat["third_party"].get(ep, {})
+        tp = catalog.third_party_of(cat, ep, platform["os"])
         comps = tp.get("components", [])
-        optional = tp.get("optional", [])
-        if optional and ep in bundle_eps:
-            bundle_runtime += [o for o in optional if o not in bundle_runtime]
-            bundled |= set(comps)
-            optional = []
-        parts = optional + [f for f in tp.get("fetch", []) if dev or not f.endswith(":dev")]
-        if wanted is not None and ep not in wanted:
-            parts = []
-        fetch += [f for f in parts if f not in fetch]
+        fetch += [f for f in tp.get("fetch", []) if f not in fetch]
         for c in comps:
-            for f in parts:
+            for f in tp.get("fetch", []):
                 fetched.setdefault(c, set()).add("dev" if f.endswith(":dev") else "runtime")
         system += [s for s in tp.get("system", []) if s not in system]
-    components = sorted({c for ep in eps for c in cat["third_party"].get(ep, {}).get("components", [])})
+    components = sorted({c for ep in eps for c in catalog.third_party_of(cat, ep, platform["os"]).get("components", [])})
 
     entries = {(e["package"], e["triple"]): e for e in plan_mod.entries()}
-    custom_link = {ep: c for ep, c in link.items() if c != platform["core_eps"][ep]["link"]["default"]}
-    packages = [{"package": CORE, "kind": "core",
-                 "entry": plan_mod.core_entry(triple, core_eps, cuda_major, wasm_mode, custom_link)}]
-    packages += [{"package": p["package"], "kind": "plugin", "entry": entries[(p["package"], triple)]} for p in plugins]
+    build_ep = {ep: platform["core_eps"][ep].get("build_ep", ep) for ep in core_eps}  # EP row -> in-tree EP
+    custom_link = {build_ep[ep]: c for ep, c in link.items() if c != platform["core_eps"][ep]["link"]["default"]}
+    gpu_fields = {"cuda_archs": catalog.cuda_archs_value(gpu["cuda_archs"], gpu["cuda_ptx"]) if gpu["cuda_archs"] else "",
+                  "amd_gpu_targets": ";".join(gpu["amd_gpu_targets"] or [])}
+    core_entry = plan_mod.core_entry(triple, [build_ep[ep] for ep in core_eps], cuda_major, wasm_mode, custom_link)
+    packages = [{"package": CORE, "kind": "core", "entry": {**core_entry, **gpu_fields}}]
+    packages += [{"package": p["package"], "kind": "plugin", "entry": {**entries[(p["package"], triple)], **gpu_fields}}
+                 for p in plugins]
     normalized = {"schema": CONFIG_SCHEMA, "triple": triple, "eps": {ep: choices[ep] for ep in names if ep in choices},
-                  "cuda_major": cuda_major or None, "wasm_mode": wasm_mode or None, "link": link, "dev": dev,
-                  "fetch": sorted({f.split(":")[0] for f in fetch}) if wanted is not None else None,
-                  "bundle": sorted(ep for ep in eps if ep in bundle_eps and cat["third_party"].get(ep, {}).get("optional"))}
+                  "variants": {p["ep"]: p["variant"] for p in plugins if p.get("variant")},
+                  "amd_hip": next((p["with_hip"] for p in plugins if "with_hip" in p), None),
+                  "cuda_major": cuda_major or None, "wasm_mode": wasm_mode or None, "link": link, **gpu}
+    requirements = platform["requirements"] + (platform["wasm_modes"][wasm_mode]["requirements"] if wasm_mode else [])
+    requirements += [r for ep in core_eps for r in platform["core_eps"][ep]["requirements"]]
+    requirements += [r for p in plugins for r in p["requirements"]]
+    if cuda_major:
+        drivers = cat["gpu"]["cuda"]["drivers"][cuda_major]
+        requirements.append(f"{drivers}; {cat['gpu']['cuda']['ptx_note']}" if gpu["cuda_ptx"] else drivers)
     return {
         "config": normalized,
         "source": cat["source"],
@@ -196,10 +234,10 @@ def make_plan(config: dict, cat: dict) -> dict:
         "packages": packages,
         "eps": eps,
         "cuda_major": cuda_major or None,
-        "bundle_runtime": bundle_runtime,
+        "gpu": gpu,
+        "requirements": list(dict.fromkeys(requirements)),
         "fetch_restricted": fetch,
         "fetch_components": {c: sorted(fetched[c]) for c in sorted(fetched)},
-        "bundled_components": sorted(bundled),
         "system": system,
         "components": {c: cat["components"][c] for c in components + system},
     }
@@ -225,6 +263,12 @@ def summary(plan: dict) -> str:
              f"**Recipes:** commit [{plan['source']['id']}]({plan['source']['url']})  "]
     if plan["cuda_major"]:
         lines.append(f"**CUDA:** {plan['cuda_major']}.x  ")
+    gpu = plan["gpu"]
+    if gpu["cuda_archs"]:
+        lines.append(f"**CUDA GPU architectures:** {', '.join('sm_' + a for a in gpu['cuda_archs'])}"
+                     f"{' + PTX of sm_' + gpu['cuda_archs'][-1] if gpu['cuda_ptx'] else ''}  ")
+    if gpu["amd_gpu_targets"]:
+        lines.append(f"**AMD GPU targets:** {', '.join(gpu['amd_gpu_targets'])}  ")
     lines += ["", "| Package | Contents | Build |", "|---|---|---|"]
     for p in plan["packages"]:
         if p["kind"] == "core":
@@ -238,13 +282,14 @@ def summary(plan: dict) -> str:
         how = (f"reused from [run {r['run']}](https://github.com/{plan_mod.REPO}/actions/runs/{r['run']})" if r else
                f"built on `{b['runner']}`{' in ' + b['docker'] if b.get('docker') else ''}" if b else "")
         lines.append(f"| `{p['package']}` | {what} | {how} |")
+    if any(not p.get("reuse") and plan_mod.build.migraphx_staged(p["entry"]["recipe"], p["entry"]["variant"], plan["triple"])
+           for p in plan["packages"] if p["kind"] == "plugin"):
+        lines += ["", "MIGraphX for Windows is built first, in two jobs of its own (its dependencies, then MIGraphX), "
+                      "which the AMD packages reuse from the build cache."]
     lines += ["", "| EP | Provided as |", "|---|---|"]
     lines += [f"| {plan_ep_name(ep)} | {'; '.join(forms)} |" for ep, forms in plan["eps"].items()]
-    if plan["bundled_components"]:
-        names = ", ".join(plan["components"][c]["name"] for c in plan["bundled_components"])
-        lines += ["", f"Bundled third-party runtimes: {names} (under their own licenses)."]
     if plan["fetch_restricted"]:
-        lines += [f"Fetched by `fetch-restricted` on your machine: {', '.join(plan['fetch_restricted'])}."]
+        lines += ["", f"Fetched by `fetch-restricted` on your machine: {', '.join(plan['fetch_restricted'])}."]
     if plan["system"]:
         lines += [f"Install yourself: {', '.join(plan['components'][s]['name'] for s in plan['system'])}."]
     return "\n".join(lines)
@@ -285,11 +330,21 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     args.plan.write_text(json.dumps(plan, indent=1), encoding="utf-8")
     print(plan["summary"])
     builds = [p["build"] for p in plan["packages"] if not p["reuse"]]
+    # the Windows AMD packages need MIGraphX, which bundle.yml builds first in jobs of its own (ci/build.py
+    # build_migraphx): one per target triple and set of GPU targets, whatever the number of packages that use it
+    amd = [b for b in builds if plan_mod.build.migraphx_staged(b["recipe"], b["variant"], b["triple"])]
+    stages = list({(b["triple"], b["amd_gpu_targets"]): {
+        "triple": b["triple"], "runner": b["runner"], "msvc_arch": b["msvc_arch"], "msvc_toolset": b["msvc_toolset"],
+        "amd_gpu_targets": b["amd_gpu_targets"], "submodules": "deps/amdmigraphx", "ccache_key": f"migraphx-{b['triple']}",
+    } for b in amd}.values())
+    builds = [b for b in builds if b not in amd]
     found = plan_mod.find_artifact(plan["name"]) if not args.no_reuse else None
     outputs = {"ok": "true", "key": plan["key"], "name": plan["name"], "summary": plan["summary"],
                "existing_url": f"https://github.com/{plan_mod.REPO}/actions/runs/{found['run']}/artifacts/{found['id']}"
                if found else "",
-               "builds": json.dumps({"include": builds}), "has_builds": "true" if builds else "false"}
+               "builds": json.dumps({"include": builds}), "has_builds": "true" if builds else "false",
+               "migraphx": json.dumps({"include": stages}), "amd_builds": json.dumps({"include": amd}),
+               "has_amd_builds": "true" if amd else "false"}
     if args.github_output:
         write_outputs(args.github_output, outputs)
     return 0
@@ -436,7 +491,6 @@ BACKENDS = [
     ("DirectML::DirectML", "include/DirectML.h", "include", "DirectML.lib", ""),
     ("MIGraphX::migraphx", "include/migraphx", "include", "migraphx_c.lib", "migraphx_c"),
     ("HIP::amdhip64", "include/hip", "include", "amdhip64.lib", ""),
-    ("Vulkan::Vulkan", "include/vulkan/vulkan.h", "include", "vulkan-1.lib", ""),
     ("MLX::mlx", "include/mlx", "include", "", "mlx"),
 ]
 
@@ -627,6 +681,23 @@ exit $LASTEXITCODE
 '''
 
 
+def linux_library_needs(stage: Path) -> dict[str, str | None]:
+    """The newest glibc and libstdc++ (GLIBCXX) symbol versions the ELF files in the bundle's lib/ reference, i.e. the
+    oldest glibc and libstdc++ that can load them."""
+    newest: dict[str, tuple[int, ...]] = {"glibc": (), "glibcxx": ()}
+    for f in sorted((stage / "lib").rglob("*")):
+        if f.is_symlink() or not f.is_file():
+            continue
+        with f.open("rb") as fh:
+            if fh.read(4) != b"\x7fELF":
+                continue
+        data = f.read_bytes()
+        for key, pattern in (("glibc", rb"GLIBC_(\d+(?:\.\d+)+)"), ("glibcxx", rb"GLIBCXX_(\d+(?:\.\d+)+)")):
+            for m in re.finditer(pattern, data):
+                newest[key] = max(newest[key], tuple(int(x) for x in m.group(1).split(b".")))
+    return {k: ".".join(map(str, v)) or None for k, v in newest.items()}
+
+
 def readme(plan: dict, info: dict) -> str:
     windows = "windows" in plan["triple"]
     lines = [f"# {plan['name']}", "", "ONNX Runtime bundle built by onnxruntime-cicd for a bundle request.", "",
@@ -643,15 +714,23 @@ def readme(plan: dict, info: dict) -> str:
     if plan["fetch_restricted"]:
         script = "fetch-restricted.ps1" if windows else "./fetch-restricted.sh"
         lines += ["", "## Files you fetch yourself", "",
-                  "The following files are not in this bundle (their licenses do not allow redistributing them, or the "
-                  "request chose to download them), so run the script once (it needs Python 3) to download them from "
-                  "their vendors and put them into this bundle:", "",
+                  "The files of the vendor SDKs below are not in this bundle (their licenses restrict redistributing "
+                  "them). Run the script once (it needs Python 3) to download the runtimes together with the headers "
+                  "and import libraries from their vendors and put them into this bundle. If you installed the SDKs "
+                  "yourself, skip it, or limit it to some EPs with `--ep` (`--ep <ep>:runtime` leaves out the headers "
+                  "and import libraries):", "",
                   f"    {script}", ""]
         lines += [f"- {plan['components'][c]['name']}: {', '.join(plan['components'][c][p] for p in parts)} "
                   f"({plan['components'][c]['license']})" for c, parts in plan["fetch_components"].items()]
+    sdks = info["fetch_restricted"]["third_party_sdks"]
     if plan["system"]:
         lines += ["", "## Install yourself", ""]
-        lines += [f"- {plan['components'][s]['name']}: {plan['components'][s]['system']}" for s in plan["system"]]
+        lines += [f"- {plan['components'][s]['name']}: {plan['components'][s]['system']}"
+                  + (f" (built with {sdks[s]})" if s in sdks else "") for s in plan["system"]]
+    lines += ["", "## Requirements", ""] + [f"- {r}" for r in plan["requirements"]]
+    if measured := info.get("linux_libraries"):
+        lines.append(f"- The Linux libraries in this bundle need glibc {measured['glibc'] or '(none)'} and libstdc++ "
+                     f"GLIBCXX {measured['glibcxx'] or '(none)'} or newer (measured from their symbol versions)")
     lines += ["", "GPU and NPU drivers are not included.", "", "## CMake", "", "```cmake",
               'find_package(onnxruntime-bundle CONFIG REQUIRED PATHS "<bundle>/lib/cmake")',
               "target_link_libraries(app PRIVATE onnxruntime::onnxruntime)", "onnxruntime_bundle_copy_runtime(app)",
@@ -709,7 +788,7 @@ def cmd_assemble(args: argparse.Namespace) -> int:
     licenses = [{"name": plan["components"][c]["name"], "license": plan["components"][c]["license"]}
                 for c in plan["fetch_components"]]
     fetch_info = {"target_triple": triple, "cuda_major": plan["cuda_major"] or "13", "third_party_sdks": sdks,
-                  "eps": plan["fetch_restricted"], "licenses": licenses}
+                  "amd_gpu_targets": plan["gpu"]["amd_gpu_targets"], "eps": plan["fetch_restricted"], "licenses": licenses}
 
     plugins = []
     for p in plan["plugins"]:
@@ -725,18 +804,11 @@ def cmd_assemble(args: argparse.Namespace) -> int:
             "config": plan["config"], "source": plan["source"], "target_triple": triple, "eps": plan["eps"],
             "packages": [{"package": n, "version": build_infos[n].get("version"),
                           "sources": build_infos[n].get("sources")} for n in packages],
-            "third_party": {"bundled": plan["bundle_runtime"], "fetch_restricted": plan["fetch_restricted"],
-                            "system": plan["system"]},
+            "third_party": {"fetch_restricted": plan["fetch_restricted"], "system": plan["system"]},
             "conflicts": conflicts, "fetch_restricted": fetch_info}
+    if triple.endswith("-linux-gnu"):
+        info["linux_libraries"] = linux_library_needs(stage)
     (stage / "BUNDLE_INFO.json").write_text(json.dumps(info, indent=2), encoding="utf-8")
-
-    # the optional runtimes the request bundles, with the versions the packages were built with
-    if plan["bundle_runtime"]:
-        import fetch_ep_runtime as fetch  # scripts/ is on sys.path (ci/sdk.py)
-        argv = ["--package-dir", str(stage), "--ep", *plan["bundle_runtime"], "--target", triple,
-                "--cuda-major", plan["cuda_major"] or "13", "--cache", str(args.cache), "--yes"]
-        if fetch.main(argv) != 0:
-            raise SystemExit("bundling the third-party runtimes failed")
 
     if plan["fetch_restricted"]:
         tools = stage / "tools"
@@ -786,7 +858,6 @@ def main(argv: list[str]) -> int:
     a.add_argument("--packages", type=Path, required=True, help="directory with <package>/<archive> for every package")
     a.add_argument("--work", type=Path, required=True)
     a.add_argument("--out", type=Path, required=True)
-    a.add_argument("--cache", type=Path, default=ROOT / "packages", help="download cache of the third-party runtimes")
     args = ap.parse_args(argv)
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):

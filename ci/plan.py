@@ -11,12 +11,12 @@ again.
 Environment variables (all optional):
   RUNNER_MAP        JSON mapping default runner labels to custom labels, e.g. {"ubuntu-24.04": "my-large-linux"}
   HEAVY_RUNNER_MAP  same, but only applied to heavy=true entries (long builds such as CUDA and QNN)
-  CUDA_ARCHITECTURES  part of the inputs of the CUDA builds
   GITHUB_TOKEN      lets the plan find the packages of earlier runs with the same inputs
 """
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import os
@@ -30,7 +30,11 @@ import build
 ROOT = Path(__file__).resolve().parent.parent
 REPO = os.environ.get("GITHUB_REPOSITORY") or "IOL0ol1/onnxruntime-cicd"
 DEFAULTS = {"variant": "default", "cuda_major": "13", "experimental": False, "heavy": False, "docker": "", "apt": "",
-            "keep_android_sdk": False, "eps": ""}
+            "keep_android_sdk": False, "eps": "", "cuda_archs": "", "amd_gpu_targets": ""}
+# GPU architecture settings (ci/build.py Job.gpu) -> (entry field, ci/build.py default). A bundle request sets the
+# fields (ci/bundle.py); they are build inputs only of the recipes that compile device code for them.
+GPU_SETTINGS = {"cuda": ("cuda_archs", build.DEFAULT_CUDA_ARCHS),
+                "amd": ("amd_gpu_targets", build.DEFAULT_MIGRAPHX_GPU_TARGETS)}
 # The files a package build depends on besides its entry, submodules and SDKs. Changes elsewhere (the bundle and
 # page code) keep the packages valid.
 BUILD_FILES = ("ci/build.py", "ci/sdk.py", "ci/package.py", "scripts", ".github/actions/build-entry")
@@ -41,7 +45,7 @@ CUDA_DEPENDENT = {"cuda", "cudnn", "tensorrt", "tensorrt-rtx"}
 CORE = "onnxruntime"  # package name of the core libraries
 # core platform -> (recipe, variant) of ci/build.py
 CORE_RECIPES = {"desktop": ("ort", "custom"), "arm64x": ("ort", "arm64x"), "android": ("ort", "android"),
-                "apple": ("ort-apple", "default"), "s390x": ("ort", "s390x")}
+                "apple": ("ort-apple", "default")}
 
 
 def matrix() -> dict:
@@ -99,18 +103,37 @@ def git(*args: str) -> str:
     return subprocess.run(["git", *args], capture_output=True, text=True, cwd=ROOT, check=True).stdout.strip()
 
 
+@functools.lru_cache(maxsize=None)
+def recipe_inputs(recipe: str, variant: str, triple: str, cuda_major: str,
+                  eps: str) -> tuple[frozenset[tuple[str, str, str]], frozenset[str]]:
+    """(required SDKs, GPU architecture settings) of a recipe (ci/build.py recipe_inputs)."""
+    needed, gpu = build.recipe_inputs(recipe, variant, triple, cuda_major, eps)
+    return frozenset(needed), frozenset(gpu)
+
+
 def sdks_of(e: dict) -> set[str]:
-    return {c for c, _, _ in build.required_sdks(e["recipe"], e["variant"], e["triple"], e["cuda_major"], e["eps"])}
+    return {c for c, _, _ in recipe_inputs(e["recipe"], e["variant"], e["triple"], e["cuda_major"], e["eps"])[0]}
+
+
+def gpu_kinds(e: dict) -> set[str]:
+    """The GPU architecture settings ("cuda", "amd") the recipe of an entry compiles device code for."""
+    return set(recipe_inputs(e["recipe"], e["variant"], e["triple"], e["cuda_major"], e["eps"])[1])
+
+
+def gpu_of(e: dict) -> dict[str, str]:
+    """{entry field: value} of the GPU architecture settings of an entry's recipe (the build defaults where unset)."""
+    return {field: e.get(field) or default for kind, (field, default) in GPU_SETTINGS.items() if kind in gpu_kinds(e)}
 
 
 class Inputs:
     """Hash of everything a build entry depends on: the entry itself, the commits of its submodules, the build scripts,
-    the resolved third-party SDK versions, the Docker image digest and the CUDA architectures. Anything that cannot be
-    resolved makes the hash unique, so the entry is built."""
+    the resolved third-party SDK versions, the Docker image digest and the GPU architectures its device code is
+    compiled for. Anything that cannot be resolved makes the hash unique, so the entry is built."""
 
     def __init__(self) -> None:
         self.files = git("rev-parse", *(f"HEAD:{p}" for p in BUILD_FILES)).split()
         self.sdks: dict[tuple, str] = {}
+        self.versions: dict[tuple, str] = {}  # resolved SDK versions (see ci/catalog.py), by the keys of sdks
         self.images: dict[str, str] = {}
 
     def sdk(self, comp: str, plat: str, cuda: str, pin: str) -> str:
@@ -126,6 +149,7 @@ class Inputs:
                     value = (out.stdout.split() or [""])[0] or f"unresolved-{os.urandom(8).hex()}"
                 else:
                     value = resolved.version + "|" + ",".join(f.filename for f in resolved.files)
+                self.versions[key] = resolved.version
             except Exception as e:
                 value = f"unresolved-{os.urandom(8).hex()}"
                 print(f"  {comp} ({plat}): not resolved ({str(e).splitlines()[0][:100]})", file=sys.stderr)
@@ -146,10 +170,10 @@ class Inputs:
         subs = {s: git("rev-parse", f"HEAD:{s}") for s in e["submodules"].split()}
         cuda = e["cuda_major"]
         sdks = sorted((c, p, pin, self.sdk(c, p, cuda if c in CUDA_DEPENDENT else "13", pin))
-                      for c, p, pin in build.required_sdks(e["recipe"], e["variant"], e["triple"], cuda, e["eps"]))
+                      for c, p, pin in recipe_inputs(e["recipe"], e["variant"], e["triple"], cuda, e["eps"])[0])
         recipe = {k: e[k] for k in ("package", "recipe", "variant", "triple", "cuda_major", "eps", "docker", "apt")}
         data = {"entry": recipe, "submodules": subs, "files": self.files, "sdks": sdks, "image": self.image(e["docker"]),
-                "cuda_archs": os.environ.get("CUDA_ARCHITECTURES", "")}
+                "gpu": gpu_of(e)}
         return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()[:16]
 
 
@@ -166,6 +190,8 @@ def build_entry(e: dict, inputs: Inputs) -> dict:
         "package": e["package"], "recipe": e["recipe"], "variant": e["variant"], "triple": e["triple"],
         "eps": e["eps"], "cuda_major": e["cuda_major"], "submodules": e["submodules"], "docker": e["docker"],
         "apt": e["apt"], "keep_android_sdk": bool(e["keep_android_sdk"]),
+        # the GPU architectures of the recipe's device code (empty: it compiles none)
+        **{field: "" for field, _ in GPU_SETTINGS.values()}, **gpu_of(e),
         "runner": (heavy_map.get(runner) if e["heavy"] else None) or runner_map.get(runner) or runner,
         "msvc_arch": msvc_arch(e["triple"], runner),
         # CUDA 12 does not accept the VS 2026 compiler (MSVC 14.5x), and the constexpr <cmath> comparisons of its STL

@@ -39,11 +39,10 @@ ENV_VARS: dict[str, dict[str, str]] = {
     "cann": {"CANN_HOME": ""},
     "android-ndk": {"ANDROID_NDK_HOME": "", "ANDROID_NDK_ROOT": ""},
     "onnxruntime-sdk": {"ORT_HOME": ""},
-    "vulkan-sdk": {"VULKAN_SDK": ""},
     "tim-vx": {"TIM_VX_SRC": ""},
 }
 # directories to add to PATH
-PATH_DIRS = {"cuda": "bin", "vulkan-sdk": "bin"}
+PATH_DIRS = {"cuda": "bin"}
 
 
 def _strip_single_top(tmp: Path, target: Path) -> None:
@@ -85,12 +84,6 @@ def install_cann(run_file: Path, target: Path) -> None:
     run_file.chmod(0o755)
     target.mkdir(parents=True, exist_ok=True)
     subprocess.run([str(run_file), "--install", "--quiet", f"--install-path={target}"], check=True)
-
-
-def install_vulkan_sdk(installer: Path, target: Path) -> None:
-    # silent-install flags of the LunarG installer (Qt Installer Framework), same as the onnxruntime-ep-vulkan CI
-    subprocess.run([str(installer), "--root", str(target), "--accept-licenses", "--default-answer",
-                    "--confirm-command", "install"], check=True)
 
 
 def add_cuda_target_layout(target: Path, platform: str) -> None:
@@ -146,8 +139,6 @@ def setup(name: str, ctx, root: Path, download_dir: Path) -> dict:
             path = out / item.filename
             if path.suffix == ".run":
                 install_cann(path, target)
-            elif path.suffix == ".exe":
-                install_vulkan_sdk(path, target)
             else:
                 extract(path, target)
         marker.write_text(resolved.version)
@@ -159,8 +150,6 @@ def setup(name: str, ctx, root: Path, download_dir: Path) -> dict:
         target = next((d for d in target.iterdir() if (d / "sdk.yaml").exists()), target)
     if name == "cann":  # CANN 9.x installs into <path>/cann, 8.x into <path>/ascend-toolkit/latest
         target = next((c for c in (target / "cann", target / "ascend-toolkit" / "latest") if c.is_dir()), target)
-    if name == "vulkan-sdk" and (target / "x86_64").is_dir():
-        target = target / "x86_64"  # actual SDK root inside the Linux tarball
     return {"component": name, "version": resolved.version, "path": str(target)}
 
 

@@ -71,7 +71,7 @@ def main(argv: list[str]) -> int:
         "third_party_sdks": (json.loads(args.sdk_versions.read_text(encoding="utf-8"))
                              if args.sdk_versions and args.sdk_versions.exists() else {}),
     }
-    info.update(dict(e.split("=", 1) for e in args.extra))
+    info.update({k: v for k, v in (e.split("=", 1) for e in args.extra) if v})  # empty: not set for this build
     if "cuda" not in info["third_party_sdks"]:  # the workflow passes the CUDA settings for every build
         info.pop("cuda_architectures", None)
         info.pop("cuda_major", None)

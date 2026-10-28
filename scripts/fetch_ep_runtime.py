@@ -113,7 +113,8 @@ class Selection:
     install: bool = False                                    # run the vendor installer instead of extracting
     dev: list[DevRule] = field(default_factory=list)        # headers / import libraries, keeping their directory tree
     licenses: list[str] = field(default_factory=list)       # license files besides the ones LICENSE_FILE finds
-    subdir: str = ""                                         # runtime files go to <dest>/<subdir>
+    tree: list[DevRule] = field(default_factory=list)       # runtime files that keep their directory tree
+    beside: list[DevRule] = field(default_factory=list)     # the same, relative to the runtime files rather than <root>
 
 
 def _libs(os_name: str, *pairs: tuple[str, str]) -> list[str]:
@@ -127,22 +128,27 @@ def _dml_arch(platform: str) -> str:
 
 DML_LICENSES = [r"^(LICENSE|LICENSE-CODE|ThirdPartyNotices)\.txt$"]  # at the root of the NuGet package
 OPENVINO_LICENSES = [r"^[^/]+/docs/licensing/[^/]+$", r"/runtime/3rdparty/tbb/TBB-LICENSE$"]
-IREE_COMPILER_LIBS = {"windows": "IREECompiler.dll", "linux": "libIREECompiler.so", "macos": "libIREECompiler.dylib"}
 
-# CUDA library -> redist archive that contains it
+# CUDA library -> redist archive that contains it, and the import libraries of that archive
 CUDA_ARCHIVES = {"cudart": "cuda_cudart", "cublas": "libcublas", "cufft": "libcufft", "curand": "libcurand",
                  "nvrtc": "cuda_nvrtc", "nvjitlink": "libnvjitlink"}
+CUDA_IMPORT_LIBS = {"cudart": "cudart|cuda", "cublas": "cublas|cublasLt", "cufft": "cufft", "curand": "curand",
+                    "nvrtc": "nvrtc", "nvjitlink": "nvJitLink"}
+# The CUDA libraries the runtime of an EP needs (selections_for); its development files come from the same archives
+CUDA_RUNTIME = {"cuda": ("cudart", "cublas", "cufft", "curand", "nvrtc", "nvjitlink"),
+                "tensorrt": ("cudart", "cublas", "nvjitlink"), "nv-tensorrt-rtx": ("cudart",)}
 
 
-def selections_for(ep: str, platform: str, os_name: str, qnn_abi: str) -> list[Selection]:
+def selections_for(ep: str, platform: str, os_name: str, qnn_abi: str,
+                   amd_targets: tuple[str, ...] = ()) -> list[Selection]:
     cuda = lambda *names: Selection("cuda", _libs(os_name, *(CUDA_LIBS[n] for n in names)),
                                     [CUDA_ARCHIVES[n] for n in names])
     if ep == "cuda":
-        return [cuda("cudart", "cublas", "cufft", "curand", "nvrtc", "nvjitlink"), Selection("cudnn", _libs(os_name, CUDNN_LIBS))]
+        return [cuda(*CUDA_RUNTIME[ep]), Selection("cudnn", _libs(os_name, CUDNN_LIBS))]
     if ep == "tensorrt":
-        return [cuda("cudart", "cublas", "nvjitlink"), Selection("tensorrt", _libs(os_name, TENSORRT_LIBS))]
+        return [cuda(*CUDA_RUNTIME[ep]), Selection("tensorrt", _libs(os_name, TENSORRT_LIBS))]
     if ep == "nv-tensorrt-rtx":
-        return [cuda("cudart"), Selection("tensorrt-rtx", _libs(os_name, TENSORRT_RTX_LIBS))]
+        return [cuda(*CUDA_RUNTIME[ep]), Selection("tensorrt-rtx", _libs(os_name, TENSORRT_RTX_LIBS))]
     if ep == "qnn":
         patterns = [rf"/lib/{re.escape(qnn_abi)}/{QAIRT_LIBS}$"]
         skels = QAIRT_SKELS.get(qnn_abi, ())
@@ -164,9 +170,28 @@ def selections_for(ep: str, platform: str, os_name: str, qnn_abi: str) -> list[S
         return [Selection("openvino", patterns, licenses=OPENVINO_LICENSES)]
     if ep == "dml":
         return [Selection("directml", [rf"^bin/{_dml_arch(platform)}-win/DirectML\.dll$"], licenses=DML_LICENSES)]
-    if ep == "iree":  # the EP looks for the compiler in iree/compiler/_mlir_libs/ next to (or above) its library
-        return [Selection("iree-compiler", [rf"^iree/compiler/_mlir_libs/{re.escape(IREE_COMPILER_LIBS[os_name])}$"],
-                          subdir="iree/compiler/_mlir_libs")]
+    if ep in ("migraphx", "amdgpu"):
+        # TheRock's runtime wheels, unpacked into rocm/ with their layout (as pip installs them): rocBLAS and hipBLASLt
+        # find their kernels, comgr its device libraries relative to their own files. On Linux ROCm is a system install.
+        if os_name != "windows":
+            raise SystemExit(f"{ep}: install ROCm on {os_name} yourself")
+        wheels = ["rocm_sdk_core-", "rocm_sdk_libraries-", *(f"rocm_sdk_device_{t}-" for t in amd_targets)]
+        return [Selection("rocm-wheels", archives=wheels,
+                          tree=[DevRule(r"^(?P<rel>_rocm_sdk_(?:core|libraries)/(?:bin|lib|\.kpack)/.+)$", "rocm")])]
+    if ep == "hip":
+        # hip-ep's HIP EP, which the AMDGPU EP's hip-backend loads by name from its own directory. On Windows with the
+        # ROCm runtime it is built with: next to amdgpu-ep.dll, so the process uses that one rather than rocm/; on Linux
+        # the system ROCm. Kernel libraries and the clang resources keep their place relative to the libraries.
+        if os_name == "windows":
+            dlls = (r"hipgpu|amdhip64_7|amd_comgr\d+|hiprtc\d+|hiprtc-builtins\d+|hipblaslt|tensilelite-host|amdmlss|"
+                    r"custom_kernels_[\w-]+")
+            return [Selection("hip-ep", [rf"^bin/(?:{dlls})\.dll$"],
+                              beside=[DevRule(r"^bin/(?P<rel>hipblaslt/library/.+)$", ".")])]
+        return [Selection("hip-ep", [r"^lib/lib(?:hipgpu|custom_kernels_[\w-]+)\.so$"],
+                          beside=[DevRule(r"^lib/(?P<rel>clang/.+)$", ".")])]
+    if ep == "neuropilot":  # the EP loads it by name from the loader search path (next to it, or LD_LIBRARY_PATH)
+        target = "android-arm64-v8a" if os_name == "android" else "linux-aarch64"
+        return [Selection("neuron-op-capability", [rf"-{target}/libneuron_op_capability\.so$"])]
     raise SystemExit(f"unknown EP: {ep}")
 
 
@@ -186,11 +211,14 @@ def _import_libs(platform: str, os_name: str, names: str, subdir: str = "lib", d
 
 
 def dev_selections_for(ep: str, platform: str, os_name: str, cuda_major: str) -> list[Selection]:
-    """The headers and import libraries of an EP's backend SDK, laid out like the bundles' own backend files."""
-    cuda_archives = [*CUDA_ARCHIVES.values(), "cuda_crt", "cccl", "cuda_cccl"] + (["cuda_nvcc"] if cuda_major == "12" else [])
+    """The headers and import libraries of an EP's backend SDK, laid out like the bundles' own backend files. They come
+    from the archives its runtime is downloaded from, plus the CUDA header-only archives (CCCL, CRT)."""
+    libs = CUDA_RUNTIME.get(ep, ())
+    cuda_archives = [CUDA_ARCHIVES[n] for n in libs] + ["cuda_crt", "cccl", "cuda_cccl"] + (
+        ["cuda_nvcc"] if cuda_major == "12" else [])
     cuda = Selection("cuda", archives=cuda_archives,
                      dev=[_headers("include", "include/cuda"),
-                          *_import_libs(platform, os_name, "cudart|cublas|cublasLt|cufft|curand|nvrtc|nvJitLink|cuda")])
+                          *_import_libs(platform, os_name, "|".join(CUDA_IMPORT_LIBS[n] for n in libs))])
     if ep == "cuda":
         return [cuda, Selection("cudnn", dev=[_headers("include", "include/cudnn"),
                                               *_import_libs(platform, os_name, r"cudnn[\w]*")])]
@@ -206,11 +234,16 @@ def dev_selections_for(ep: str, platform: str, os_name: str, cuda_major: str) ->
         return [Selection("openvino", dev=[_headers("runtime/include", "include"),
                                            *_import_libs(platform, os_name, r"openvino[\w]*",
                                                          "runtime/lib/intel64/Release")], licenses=OPENVINO_LICENSES)]
+    if ep == "hip":  # the import libraries of hipgpu and its runtime (Windows; the archives have no headers)
+        if os_name != "windows":
+            return []
+        return [Selection("hip-ep", dev=[DevRule(r"^lib/(?P<rel>(?:hipgpu|HipCInterface|hipblaslt|custom_kernels_[\w-]+)\.lib)$",
+                                                 "lib")])]
     if ep == "dml":
         return [Selection("directml", dev=[DevRule(r"^include/(?P<rel>[^/]+\.h)$", "include"),
                                            DevRule(rf"^bin/{_dml_arch(platform)}-win/(?P<rel>DirectML\.lib)$", "lib")],
                           licenses=DML_LICENSES)]
-    return []  # Vitis AI, CANN and the IREE compiler have no separate development files
+    return []  # Vitis AI, CANN and NeuroPilot have no separate development files
 
 
 EPS = {
@@ -222,7 +255,12 @@ EPS = {
     "cann": "Huawei CANN EP: installs the CANN toolkit (its libraries need the full install and set_env.sh)",
     "openvino": "Intel OpenVINO EP: OpenVINO runtime and device plugins (the files its redist.txt lists)",
     "dml": "DirectML EP (in-tree or the AMD plugin): DirectML.dll from the Microsoft.AI.DirectML NuGet package",
-    "iree": "IREE plugin EP: the IREE compiler library it loads at run time (from the iree-base-compiler wheel)",
+    "neuropilot": "MediaTek NeuroPilot plugin EP: the prebuilt op capability library it loads at run time",
+    "hip": "HIP backend of the AMDGPU plugin EP: hipgpu of ROCm/hip-ep, with its ROCm runtime on Windows",
+    "migraphx": "AMD MIGraphX plugin EP on Windows: the ROCm runtime (TheRock wheels, the device libraries of the GPU "
+                "targets), in rocm/",
+    "amdgpu": "AMD AMDGPU plugin EP on Windows: the ROCm runtime (TheRock wheels, the device libraries of the GPU "
+              "targets), in rocm/",
 }
 
 
@@ -397,8 +435,10 @@ def pins_from_build_info(sdks: dict[str, str]) -> dict[str, str]:
             for part in version.split("_"):
                 pkg, _, ver = part.rpartition("-")
                 pins[pkg] = ver
-        elif comp in ("cuda", "cudnn", "qairt", "cann", "rocm", "openvino", "directml", "iree-compiler"):
+        elif comp in ("cuda", "cudnn", "qairt", "cann", "rocm", "openvino", "directml", "neuron-op-capability", "hip-ep"):
             pins[comp] = version
+        if comp == "rocm":  # the Windows AMD plugin EPs record the version of TheRock's wheels they are built with
+            pins["rocm-wheels"] = version
     return pins
 
 
@@ -421,13 +461,14 @@ def merge_selections(sels: list[Selection]) -> dict[str, Selection]:
         cur = merged.get(sel.component)
         if cur is None:
             merged[sel.component] = Selection(sel.component, list(sel.patterns), list(sel.archives), sel.install,
-                                              list(sel.dev), list(sel.licenses), sel.subdir)
+                                              list(sel.dev), list(sel.licenses), list(sel.tree), list(sel.beside))
             continue
         cur.install = cur.install or sel.install
         cur.patterns += [p for p in sel.patterns if p not in cur.patterns]
         cur.dev += [r for r in sel.dev if r not in cur.dev]
         cur.licenses += [p for p in sel.licenses if p not in cur.licenses]
-        cur.subdir = cur.subdir or sel.subdir
+        cur.tree += [r for r in sel.tree if r not in cur.tree]
+        cur.beside += [r for r in sel.beside if r not in cur.beside]
         cur.archives = cur.archives + [a for a in sel.archives if a not in cur.archives] \
             if cur.archives and sel.archives else []
     return merged
@@ -443,6 +484,8 @@ def main(argv: list[str]) -> int:
                          "runtime+dev")
     ap.add_argument("--target", choices=sorted(TARGETS), help="target triple (default: from BUNDLE_INFO.json or this host)")
     ap.add_argument("--cuda-major", choices=("12", "13"), help="CUDA major version (default: from BUNDLE_INFO.json, else 13)")
+    ap.add_argument("--amd-gpu-targets", nargs="+", metavar="GFX",
+                    help="GPU targets of the ROCm device libraries (default: from BUNDLE_INFO.json)")
     ap.add_argument("--pin", nargs="+", default=[], metavar="NAME=VER", help="override SDK versions, same syntax as download_ep_packages.py")
     ap.add_argument("--dest", type=Path, help="output directory of the runtime files (default: the bundle's bin/ on "
                                               "Windows or lib/ elsewhere, otherwise ./ep-runtime/<target>)")
@@ -488,6 +531,7 @@ def main(argv: list[str]) -> int:
             if input("Accept these licenses and continue? [y/N] ").strip().lower() not in ("y", "yes"):
                 return 1
     cuda_major = args.cuda_major or info.get("cuda_major") or "13"
+    amd_targets = tuple(args.amd_gpu_targets or info.get("amd_gpu_targets") or ())
     pins = pins_from_build_info(info.get("third_party_sdks", {}))
     pins.update(dict(p.split("=", 1) for p in args.pin))
 
@@ -502,7 +546,7 @@ def main(argv: list[str]) -> int:
     licenses = args.licenses_dir.resolve() if args.licenses_dir else root / "third_party_licenses"
 
     merged = merge_selections([sel for ep, parts in eps.items() for sel in
-                               (selections_for(ep, platform, os_name, qnn_abi) if "runtime" in parts else []) +
+                               (selections_for(ep, platform, os_name, qnn_abi, amd_targets) if "runtime" in parts else []) +
                                (dev_selections_for(ep, platform, os_name, cuda_major) if "dev" in parts else [])])
     labels = ", ".join(f"{ep}:{'+'.join(sorted(parts))}" for ep, parts in eps.items())
     print(f"target {target}, EPs: {labels}, CUDA {cuda_major}.x, runtime files: {dest}, development files: {root}")
@@ -512,6 +556,9 @@ def main(argv: list[str]) -> int:
     report["target_triple"] = target
     report["eps"] = sorted(set(report.get("eps", [])) | {f"{ep}:{p}" for ep, parts in eps.items() for p in parts})
     components = report.setdefault("components", {})
+    # a component's resolver may not filter its files by platform (the Vitis AI wheels are win_amd64 only)
+    if unsupported := [c for c in merged if platform not in dl.component(c).platforms]:
+        raise SystemExit(f"no files for {target}: {', '.join(f'{c} ({' / '.join(dl.component(c).platforms)})' for c in unsupported)}")
     for comp_name, sel in merged.items():
         comp = dl.component(comp_name)
         print(f"==> {comp_name}")
@@ -519,8 +566,12 @@ def main(argv: list[str]) -> int:
         out, resolved = dl.fetch(comp, ctx, args.cache.resolve(), dry_run=args.dry_run, file_filter=file_filter)
         files = resolved.files
         if args.dry_run:
-            for p in sel.patterns or ([] if sel.dev else ["(vendor installer)"]):
+            for p in sel.patterns or ([] if sel.dev or sel.tree or sel.beside else ["(vendor installer)"]):
                 print(f"    extract: {p}")
+            for r in sel.tree:
+                print(f"    extract with its tree: {r.pattern} -> {r.dest}/")
+            for r in sel.beside:
+                print(f"    extract with its tree, next to the runtime files: {r.pattern} -> {r.dest}/")
             for r in sel.dev:
                 print(f"    develop: {r.pattern} -> {r.dest}/")
             continue
@@ -532,7 +583,7 @@ def main(argv: list[str]) -> int:
             print(f"    installed to {prefix}; run `source {prefix}/cann/set_env.sh` (8.x: ascend-toolkit/set_env.sh) before use")
         else:
             patterns = [re.compile(p) for p in sel.patterns]
-            dev = [(re.compile(r.pattern), root / r.dest) for r in sel.dev]
+            dev = [(re.compile(r.pattern), root / r.dest) for r in sel.dev + sel.tree] +                 [(re.compile(r.pattern), dest / r.dest) for r in sel.beside]
             license_patterns = [re.compile(p) for p in sel.licenses]
             new: list[str] = []
             for f in files:
@@ -540,8 +591,7 @@ def main(argv: list[str]) -> int:
                     (licenses / comp_name).mkdir(parents=True, exist_ok=True)
                     shutil.copy2(out / f.filename, licenses / comp_name / f.filename)
                     continue
-                new += extract_selected(out / f.filename, patterns, dest / sel.subdir, licenses / comp_name, dev,
-                                        license_patterns)
+                new += extract_selected(out / f.filename, patterns, dest, licenses / comp_name, dev, license_patterns)
             if not new:
                 raise SystemExit(f"no matching files in {comp_name} {resolved.version}")
             entry["files"] = sorted(set(entry.get("files", [])) | set(new))

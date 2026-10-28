@@ -3,10 +3,10 @@
 
 Scope (obsolete / deprecated EPs are ignored):
   - Closed-source SDKs: CUDA, cuDNN, TensorRT, TensorRT-RTX, QAIRT (QNN), DirectML, CANN, Vitis AI runtime
-  - Open-source SDKs that must be installed beforehand: OpenVINO, ROCm, Android NDK, Vulkan SDK,
+  - Open-source SDKs that must be installed beforehand: OpenVINO, ROCm, Android NDK,
     ONNX Runtime prebuilt packages (used by plugin EP builds)
   - Open-source dependencies whose sources must be prepared before building (shallow git clone):
-    TIM-VX, zDNN
+    TIM-VX
 
 Every source is an official direct link or official mirror that requires no account (NVIDIA redist /
 developer.download.nvidia.com, Qualcomm softwarecenter public API, api.nuget.org, Huawei Cloud Ascend artifactory,
@@ -47,8 +47,7 @@ from typing import Callable
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DEST = ROOT / "packages"
 USER_AGENT = "onnxruntime-cicd-downloader/1.0"
-PLATFORMS = ("linux-x86_64", "linux-aarch64", "linux-s390x", "windows-x86_64", "windows-arm64", "windows-arm64x",
-             "macos-arm64")
+PLATFORMS = ("linux-x86_64", "linux-aarch64", "windows-x86_64", "windows-arm64", "windows-arm64x", "macos-arm64")
 LATEST = "latest"
 
 
@@ -388,6 +387,32 @@ def resolve_rocm(ctx: Context, version: str) -> Resolved:
                     note="TheRock multi-arch ROCm SDK; extract and use it as ROCM_PATH")
 
 
+ROCM_WHEELS = "https://repo.amd.com/rocm/whl-multi-arch/"
+
+
+def resolve_rocm_wheels(ctx: Context, version: str) -> Resolved:
+    """TheRock's ROCm runtime as Python wheels (Windows): rocm-sdk-core, rocm-sdk-libraries and one
+    rocm-sdk-device-<gfx> per GPU target with the device libraries of that target; the caller picks the device wheels
+    it needs (fetch-restricted: the GPU targets of the bundle)."""
+    if ctx.platform != "windows-x86_64":
+        _unsupported()
+    devices = sorted(set(re.findall(r'href="(rocm-sdk-device-gfx[0-9a-z]+)/"', http_text(ROCM_WHEELS))))
+    files = []
+    for project in ["rocm-sdk-core", "rocm-sdk-libraries", *devices]:
+        page = urllib.parse.urljoin(ROCM_WHEELS, f"{project}/")
+        for href in html_links(page):
+            url, _, frag = urllib.parse.urljoin(page, href).partition("#")
+            name = urllib.parse.unquote(url.rsplit("/", 1)[-1])
+            if name.endswith("-py3-none-win_amd64.whl"):
+                files.append(FileItem(url, name, frag[7:] if frag.startswith("sha256=") else None))
+    if version == LATEST:
+        version = latest([f.filename.split("-")[1] for f in files if f.filename.startswith("rocm_sdk_core-")])
+    files = [f for f in files if f.filename.split("-")[1] == version]
+    if not any(f.filename.startswith("rocm_sdk_core-") for f in files):
+        _unsupported(f"no ROCm {version} wheels for Windows")
+    return Resolved(version, files, note="unpack the wheels into one directory, keeping their layout (as pip does)")
+
+
 def resolve_android_ndk(ctx: Context, version: str) -> Resolved:
     host = {"linux-x86_64": "linux", "windows-x86_64": "windows", "macos-arm64": "macosx"}.get(ctx.platform) or _unsupported()
     xml = http_text("https://dl.google.com/android/repository/repository2-3.xml")
@@ -424,6 +449,47 @@ def resolve_onnxruntime_sdk(ctx: Context, version: str) -> Resolved:
     _unsupported()
 
 
+NEUROPILOT_REPO = "onnxruntime/onnxruntime-ep-neuropilot"
+
+
+def resolve_neuron_op_capability(ctx: Context, version: str) -> Resolved:
+    """The prebuilt libneuron_op_capability.so of the NeuroPilot plugin EP: the release assets of its repository, one
+    archive (under 1 MB) per target, aarch64 Linux and Android arm64-v8a; the build and fetch-restricted pick theirs."""
+    if version == "default":  # the release of the plugin EP version the submodule builds (its op capability ABI)
+        cmake = read_submodule("eps/official/onnxruntime-ep-neuropilot/CMakeLists.txt")
+        version = re.search(r"project\(ORTNeuronEp VERSION ([\d.]+)", cmake).group(1)
+    try:
+        release = http_json(f"https://api.github.com/repos/{NEUROPILOT_REPO}/releases/"
+                            + ("latest" if version == LATEST else f"tags/v{version}"))
+    except urllib.error.HTTPError:  # the submodule is ahead of the newest release
+        release = http_json(f"https://api.github.com/repos/{NEUROPILOT_REPO}/releases/latest")
+    files = [FileItem(a["browser_download_url"], a["name"], (a.get("digest") or "").removeprefix("sha256:") or None)
+             for a in release["assets"] if a["name"].startswith("libneuron-op-capability-")]
+    if not files:
+        _unsupported(f"{NEUROPILOT_REPO} {release['tag_name']} has no libneuron-op-capability archives")
+    return Resolved(release["tag_name"].lstrip("v"), files,
+                    note="closed source; the archives carry no license terms")
+
+
+HIP_EP_REPO = "ROCm/hip-ep"
+
+
+def resolve_hip_ep(ctx: Context, version: str) -> Resolved:
+    """The prebuilt HIP EP of ROCm/hip-ep (hipgpu, the HIP backend of the AMDGPU plugin EP) with the ROCm runtime it is
+    built with: the release archive of the platform, and the repository's license (the archive has none)."""
+    os_name = {"windows-x86_64": "windows", "linux-x86_64": "linux"}.get(ctx.platform) or _unsupported()
+    release = http_json(f"https://api.github.com/repos/{HIP_EP_REPO}/releases/"
+                        + ("latest" if version == LATEST else f"tags/v{version}"))
+    version = release["tag_name"].lstrip("v")
+    asset = next((a for a in release["assets"] if a["name"] == f"hipep_{version}_{os_name}.zip"), None) \
+        or _unsupported(f"{HIP_EP_REPO} {release['tag_name']} has no {os_name} package")
+    digest = (asset.get("digest") or "").removeprefix("sha256:") or None
+    license_url = f"https://raw.githubusercontent.com/{HIP_EP_REPO}/{release['tag_name']}/LICENSE"
+    return Resolved(version, [FileItem(asset["browser_download_url"], asset["name"], digest),
+                              FileItem(license_url, "LICENSE")],
+                    note="hipgpu with its ROCm runtime (Windows); Linux uses the system ROCm")
+
+
 AMD_INDEX = "https://pypi.amd.com/simple/"
 VITISAI_PACKAGES = ("onnxruntime-vitisai", "voe", "ryzenai-dynamic-dispatch")
 
@@ -447,17 +513,6 @@ def resolve_vitisai(ctx: Context, version: str) -> Resolved:
                     note="onnxruntime-vitisai replaces the onnxruntime package from PyPI; install it last")
 
 
-def resolve_vulkan_sdk(ctx: Context, version: str) -> Resolved:
-    plat, name_tpl = {"linux-x86_64": ("linux", "vulkansdk-linux-x86_64-{v}.tar.xz"),
-                      "windows-x86_64": ("windows", "VulkanSDK-{v}-Installer.exe")}.get(ctx.platform) or _unsupported()
-    if version == LATEST:
-        version = http_json(f"https://vulkan.lunarg.com/sdk/latest/{plat}.json")[plat]
-    name = name_tpl.format(v=version)
-    sha = http_json(f"https://vulkan.lunarg.com/sdk/sha/{version}/{plat}/{name}.json").get("sha")
-    return Resolved(version, [FileItem(f"https://sdk.lunarg.com/sdk/download/{version}/{plat}/{name}", name, sha)],
-                    note="provides glslc (the Vulkan plugin EP compiles its shaders with it)")
-
-
 NUGET = "https://api.nuget.org/v3-flatcontainer"
 
 
@@ -469,32 +524,6 @@ def resolve_directml(ctx: Context, version: str) -> Resolved:
     name = f"microsoft.ai.directml.{version}.nupkg"
     return Resolved(version, [FileItem(f"{NUGET}/microsoft.ai.directml/{version}/{name}", name)],
                     note="NuGet package (a zip): DirectML.dll in bin/<arch>-win/, headers in include/")
-
-
-# platform -> wheel platform tag of iree-base-compiler (its cp312-abi3 wheels serve every Python version)
-IREE_WHEEL_TAGS = {"linux-x86_64": "manylinux_2_27_x86_64", "linux-aarch64": "manylinux_2_27_aarch64",
-                   "windows-x86_64": "win_amd64", "macos-arm64": "macosx_13_0_universal2"}
-
-
-def resolve_iree_compiler(ctx: Context, version: str) -> Resolved:
-    tag = IREE_WHEEL_TAGS.get(ctx.platform) or _unsupported()
-    if version == "default":  # the version the IREE plugin EP is built and tested with
-        reqs = read_submodule("eps/community/onnxruntime-ep-iree/requirements-dev.txt")
-        version = re.search(r"^iree-base-compiler==(\S+)", reqs, re.M).group(1)
-    elif version == LATEST:
-        version = http_json("https://pypi.org/pypi/iree-base-compiler/json")["info"]["version"]
-    try:  # releases are on PyPI, release candidates only on the IREE GitHub releases
-        assets = [(u["filename"], u["url"], u["digests"]["sha256"])
-                  for u in http_json(f"https://pypi.org/pypi/iree-base-compiler/{version}/json")["urls"]]
-    except urllib.error.HTTPError:
-        release = http_json(f"https://api.github.com/repos/iree-org/iree/releases/tags/iree-{version}")
-        assets = [(a["name"], a["browser_download_url"], (a.get("digest") or "").removeprefix("sha256:") or None)
-                  for a in release["assets"]]
-    wheel = next((a for a in assets if re.fullmatch(rf"iree_base_compiler-{re.escape(version)}-cp\d+-abi3-.*{tag}.*\.whl",
-                                                    a[0])), None) or _unsupported(f"no iree-base-compiler {version} wheel")
-    license_url = "https://raw.githubusercontent.com/iree-org/iree/main/LICENSE"  # the wheel has no license text
-    return Resolved(version, [FileItem(wheel[1], wheel[0], wheel[2]), FileItem(license_url, "LICENSE")],
-                    note="the compiler library is iree/compiler/_mlir_libs/*IREECompiler.* in the wheel")
 
 
 def _git_resolver(repo: str, default_ref: Callable[[], str]) -> Callable[[Context, str], Resolved]:
@@ -540,12 +569,16 @@ COMPONENTS: tuple[Component, ...] = (
     # The default version matches onnxruntime/packages.config and the AMD plugin EPs
     Component("directml", "DirectML (in-tree + onnxruntime-ep-amdgpu)", ("windows-x86_64", "windows-arm64", "windows-arm64x"),
               "1.15.4", resolve_directml, "api.nuget.org (Microsoft.AI.DirectML)"),
-    Component("iree-compiler", "IREE plugin EP (the compiler library it loads at run time)", tuple(IREE_WHEEL_TAGS),
-              "default", resolve_iree_compiler, "pypi.org / github.com/iree-org/iree releases (iree-base-compiler)"),
     Component("cann", "Huawei CANN", ("linux-x86_64", "linux-aarch64"), LATEST, resolve_cann,
               "ascend.devcloud.huaweicloud.com artifactory (official Huawei Cloud mirror)"),
     Component("rocm", "AMD MIGraphX / AMDGPU (in-tree + onnxruntime-ep-amdgpu)", ("linux-x86_64", "windows-x86_64"), LATEST,
               resolve_rocm, "repo.amd.com/rocm/tarball-multi-arch (TheRock)"),
+    # The version the Windows AMD plugin EPs are built with is recorded as "rocm" in their BUILD_INFO.json
+    Component("rocm-wheels", "AMD MIGraphX / AMDGPU plugins on Windows (the ROCm runtime)", ("windows-x86_64",), LATEST,
+              resolve_rocm_wheels, "repo.amd.com/rocm/whl-multi-arch (TheRock Python wheels)"),
+    # The AMDGPU package with the HIP backend records the hip-ep release it is paired with (BUILD_INFO.json)
+    Component("hip-ep", "AMDGPU plugin EP with the HIP backend (hipgpu and its runtime)", ("windows-x86_64", "linux-x86_64"),
+              LATEST, resolve_hip_ep, f"github.com/{HIP_EP_REPO}/releases"),
     Component("vitisai", "AMD Vitis AI (Ryzen AI NPU)", ("windows-x86_64",), LATEST, resolve_vitisai,
               "pypi.amd.com/simple (public AMD index)"),
     # The default version matches ORT's android.yml CI
@@ -555,13 +588,12 @@ COMPONENTS: tuple[Component, ...] = (
     Component("onnxruntime-sdk", "all plugin EPs (ORT headers and libraries)",
               ("linux-x86_64", "linux-aarch64", "windows-x86_64", "windows-arm64", "windows-arm64x", "macos-arm64"), LATEST,
               resolve_onnxruntime_sdk, "github.com/microsoft/onnxruntime/releases"),
-    # The default version matches VULKAN_SDK_VERSION in the onnxruntime-ep-vulkan CI (glslc output differs between versions)
-    Component("vulkan-sdk", "Vulkan plugin EP (glslc)", ("linux-x86_64", "windows-x86_64"), "1.3.296.0",
-              resolve_vulkan_sdk, "sdk.lunarg.com (official LunarG)"),
+    # linux-x86_64: the host platform of the Android builds
+    Component("neuron-op-capability", "MediaTek NeuroPilot plugin EP (the op capability library it loads at run time)",
+              ("linux-aarch64", "linux-x86_64"), "default", resolve_neuron_op_capability,
+              f"github.com/{NEUROPILOT_REPO}/releases"),
     Component("tim-vx", "VeriSilicon VSINPU", ("linux-x86_64", "linux-aarch64"), LATEST,
               _git_resolver("VeriSilicon/TIM-VX", _latest_tag("VeriSilicon/TIM-VX")), "github.com/VeriSilicon/TIM-VX"),
-    Component("zdnn", "IBM Telum plugin EP (libzdnn is dlopen'ed at runtime)", ("linux-s390x",), LATEST,
-              _git_resolver("IBM/zDNN", _latest_tag("IBM/zDNN")), "github.com/IBM/zDNN"),
 )
 
 
@@ -681,7 +713,7 @@ def component(name: str) -> Component:
 
 def detect_platform() -> str:
     machine = host_platform.machine().lower()
-    arch = {"amd64": "x86_64", "x86_64": "x86_64", "arm64": "aarch64", "aarch64": "aarch64", "s390x": "s390x"}.get(machine, machine)
+    arch = {"amd64": "x86_64", "x86_64": "x86_64", "arm64": "aarch64", "aarch64": "aarch64"}.get(machine, machine)
     if sys.platform.startswith("win"):
         return "windows-arm64" if arch == "aarch64" else "windows-x86_64"
     if sys.platform == "darwin":

@@ -39,7 +39,6 @@ ROOT = Path(__file__).resolve().parent.parent
 TRIPLES = {
     "x86_64-unknown-linux-gnu": ("linux-x86_64", "linux"),
     "aarch64-unknown-linux-gnu": ("linux-aarch64", "linux"),
-    "s390x-unknown-linux-gnu": ("linux-x86_64", "linux"),          # cross-compiled on an x86_64 host
     "x86_64-pc-windows-msvc": ("windows-x86_64", "windows"),
     "aarch64-pc-windows-msvc": ("windows-arm64", "windows"),
     "arm64ec-pc-windows-msvc": ("windows-arm64x", "windows"),      # ARM64EC (x64-compatible ABI on ARM64)
@@ -82,6 +81,11 @@ DEFAULT_CUDA_ARCHS = "80-real;80-virtual"  # ORT drops a list that has only -vir
 # ROCm (TheRock wheels) used for the Windows MIGraphX source build (same as the AMDMIGraphX windows.yaml CI)
 WINDOWS_ROCM_VERSION = "7.13.0"
 DEFAULT_MIGRAPHX_GPU_TARGETS = "gfx1100;gfx1101;gfx1102;gfx1200;gfx1201"
+# OpenVINO of the OpenVINO plugin EP, which needs a newer one (cmake/openvino.cmake) than ORT's in-tree EP is built with
+OPENVINO_PLUGIN_VERSION = "2026.4.1"
+# Oldest macOS the desktop macOS packages support, as in ORT's official macOS packages (mac-cpu-packing-jobs.yml);
+# without it the binaries require the macOS version of the runner's SDK
+MACOS_DEPLOYMENT_TARGET = "14.0"
 # AMDMIGraphX sources (a submodule on its develop branch, which the AMD plugin EPs follow)
 MIGRAPHX_SRC = ROOT / "deps" / "amdmigraphx"
 
@@ -97,6 +101,7 @@ class Job:
     cuda_major: str
     cuda_archs: str
     dry_run: bool
+    amd_gpu_targets: str = DEFAULT_MIGRAPHX_GPU_TARGETS
     platform: str = ""
     os: str = ""
     sdks: dict[str, Path] = field(default_factory=dict)
@@ -106,6 +111,8 @@ class Job:
     link: dict[str, str] = field(default_factory=dict)
     # (component, platform, pinned version or ""), used by ci/plan.py for the build inputs hash
     needed: set[tuple[str, str, str]] = field(default_factory=set)
+    # the GPU architecture settings the recipe compiles device code for ("cuda", "amd"); also part of the inputs hash
+    gpu: set[str] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         self.platform, self.os = TRIPLES[self.triple]
@@ -124,6 +131,16 @@ class Job:
             print(f"[dry-run] prepare SDKs: {', '.join(names)} (platform {self.platform})")
             return
         self.sdks.update(sdk.prepare(list(names), self.platform, self.sdk_root, self.cuda_major, pins=pins))
+
+    def cuda_architectures(self) -> str:
+        """CMAKE_CUDA_ARCHITECTURES of the CUDA code the recipe compiles."""
+        self.gpu.add("cuda")
+        return self.cuda_archs
+
+    def gpu_targets(self) -> str:
+        """GPU_TARGETS (AMD gfx targets) of the MIGraphX build."""
+        self.gpu.add("amd")
+        return self.amd_gpu_targets
 
 
 # ---------------------------------------------------------------------------
@@ -226,7 +243,7 @@ def set_origin_rpath(job: Job, lib_dir: Path, extra: str = "/opt/rocm/lib") -> N
     patchelf = next(str(c) for c in candidates if c and Path(c).exists())
     for f in sorted(lib_dir.glob("*.so*")):
         if f.is_file() and not f.is_symlink() and f.read_bytes()[:4] == b"\x7fELF":
-            run(job, [patchelf, "--set-rpath", f"$ORIGIN:{extra}", f])
+            run(job, [patchelf, "--set-rpath", f"$ORIGIN:{extra}" if extra else "$ORIGIN", f])
 
 
 def record_directml(job: Job) -> None:
@@ -269,7 +286,7 @@ ORT_SRC = ROOT / "onnxruntime"
 def cuda_flags(job: Job) -> list[str]:
     job.need("cuda", "cudnn")
     flags = ["--use_cuda", "--cuda_home", job.sdks["cuda"], "--cudnn_home", job.sdks["cudnn"], "--nvcc_threads", "1",
-             "--cmake_extra_defines", f"CMAKE_CUDA_ARCHITECTURES={job.cuda_archs}"]
+             "--cmake_extra_defines", f"CMAKE_CUDA_ARCHITECTURES={job.cuda_architectures()}"]
     if job.os == "windows":
         # ORT's build.py passes <cuda_home>/bin/nvcc without the .exe suffix, which CMake rejects as "not a full path
         # to an existing compiler tool"; extra defines come later on the command line and override it
@@ -317,7 +334,18 @@ def qnn_flags(job: Job) -> list[str]:
 
 def migraphx_flags(job: Job) -> list[str]:
     # built inside the rocm/dev-ubuntu container; ROCm and MIGraphX live in /opt/rocm
-    return ["--use_migraphx", "--migraphx_home", os.environ.get("ROCM_PATH", "/opt/rocm")]
+    rocm = Path(os.environ.get("ROCM_PATH", "/opt/rocm"))
+    record_rocm_version(job, rocm)
+    return ["--use_migraphx", "--migraphx_home", rocm]
+
+
+def record_rocm_version(job: Job, rocm: Path, version: str = "") -> None:
+    """Record the ROCm release the build used: the user installs the same one (ci/catalog.py COMPONENTS)."""
+    info = rocm / ".info" / "version"
+    if not version and info.exists():
+        version = info.read_text(encoding="utf-8").strip().split("-")[0]
+    if version:
+        record_sdk_version(job, "rocm", version)
 
 
 def cann_flags(job: Job) -> list[str]:
@@ -333,7 +361,7 @@ def vsinpu_flags(job: Job) -> list[str]:
 
 
 # In-tree EP -> build.py arguments, for the cores of bundle requests (the eps of the core variants: custom, arm64x,
-# android, s390x; the Apple frameworks select coreml / xnnpack in their settings instead). TensorRT includes the CUDA
+# android; the Apple frameworks select coreml / xnnpack in their settings instead). TensorRT includes the CUDA
 # EP: ORT's build.py always builds them together.
 CUSTOM_EPS: dict[str, Callable[[Job], list[str]]] = {
     "xnnpack": lambda job: ["--use_xnnpack"],
@@ -363,17 +391,6 @@ def eps_flags(job: Job) -> list[str]:
         raise SystemExit(f"unknown in-tree EPs {unknown}; known: {', '.join(CUSTOM_EPS)}")
     eps = [ep for ep in job.eps if not (ep == "cuda" and "tensorrt" in job.eps)]  # TensorRT brings the CUDA EP
     return [flag for ep in eps for flag in CUSTOM_EPS[ep](job)]
-
-
-def s390x_toolchain(job: Job) -> Path:
-    """CMake toolchain file of the Ubuntu s390x cross compiler (g++-s390x-linux-gnu)."""
-    toolchain = job.work / "s390x-toolchain.cmake"
-    if not job.dry_run:
-        job.work.mkdir(parents=True, exist_ok=True)
-        toolchain.write_text("set(CMAKE_SYSTEM_NAME Linux)\nset(CMAKE_SYSTEM_PROCESSOR s390x)\n"
-                             "set(CMAKE_C_COMPILER s390x-linux-gnu-gcc)\nset(CMAKE_CXX_COMPILER s390x-linux-gnu-g++)\n"
-                             "set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)\n", encoding="utf-8")
-    return toolchain
 
 
 def allow_onnx_printer_on_tvos(src: Path) -> None:
@@ -407,7 +424,7 @@ def allow_cann_with_cuda(src: Path) -> None:
 def ort_variant(job: Job, src: Path) -> tuple[list[str], Callable[[Job, Path], None] | None]:
     """Return (extra build.py arguments, custom staging function). A None staging function means cmake --install.
 
-    Cores: custom (desktop targets), arm64x, android and s390x take the in-tree EPs of --eps; the wasm variants are
+    Cores: custom (desktop targets), arm64x and android take the in-tree EPs of --eps; the wasm variants are
     the WebAssembly build modes. cuda-plugin and webgpu-plugin build plugin EP packages from the main repository."""
     v = job.variant
     if v == "custom":
@@ -420,8 +437,6 @@ def ort_variant(job: Job, src: Path) -> tuple[list[str], Callable[[Job, Path], N
         sdk_path = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT") or ""
         return ["--android", "--android_sdk_path", sdk_path, "--android_ndk_path", job.sdks["android-ndk"],
                 "--android_abi", ANDROID_ABI[job.triple], *eps_flags(job)], None
-    if v == "s390x":  # cross-compiled on x86_64; ORT's CMake downloads a protoc for the build host itself
-        return ["--cmake_extra_defines", f"CMAKE_TOOLCHAIN_FILE={s390x_toolchain(job)}", *eps_flags(job)], None
     if v == "cuda-plugin":
         flags = cuda_flags(job) + ["--cmake_extra_defines", "onnxruntime_BUILD_CUDA_EP_AS_PLUGIN=ON"]
         if job.os == "windows":
@@ -582,10 +597,6 @@ def build_tim_vx(job: Job) -> Path:
     return install
 
 
-def migraphx_gpu_targets() -> str:
-    return os.environ.get("MIGRAPHX_GPU_TARGETS") or DEFAULT_MIGRAPHX_GPU_TARGETS
-
-
 def build_migraphx_linux(job: Job) -> tuple[Path, Path]:
     """Build MIGraphX (develop, which the AMD EPs follow) with its GPU backend, the same way AMDMIGraphX's ci.yaml does:
     inside its rocm/migraphx-ci-ubuntu image, which has ROCm in /opt/rocm and the dependencies in /usr/local.
@@ -595,16 +606,18 @@ def build_migraphx_linux(job: Job) -> tuple[Path, Path]:
     run(job, ["cmake", "-S", src, "-B", b, "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release",
               f"-DCMAKE_C_COMPILER={rocm / 'llvm/bin/clang'}", f"-DCMAKE_CXX_COMPILER={rocm / 'llvm/bin/clang++'}",
               "-DMIGRAPHX_ENABLE_GPU=On", "-DMIGRAPHX_ENABLE_PYTHON=Off", "-DBUILD_TESTING=Off",
-              f"-DGPU_TARGETS={migraphx_gpu_targets()}", f"-DCMAKE_INSTALL_PREFIX={install}"])
+              f"-DGPU_TARGETS={job.gpu_targets()}", f"-DCMAKE_INSTALL_PREFIX={install}"])
     run(job, ["cmake", "--build", b, "--config", "Release"])
     run(job, ["cmake", "--install", b])
+    record_rocm_version(job, rocm)
     return install, rocm
 
 
-def install_rocm_wheels(job: Job) -> tuple[Path, Path]:
+def install_rocm_wheels(job: Job, devices: bool = True) -> tuple[Path, Path]:
     """Install ROCm from TheRock's Python wheels, as AMDMIGraphX's windows.yaml does: unlike the multi-arch SDK tarball,
-    the device-<gfx> packages also bring the device libraries HIP code needs. Returns (ROCm root, CMake prefix)."""
-    targets = migraphx_gpu_targets().split(";")
+    the device-<gfx> packages also bring the device libraries HIP code needs (devices=False leaves them out, for builds
+    that compile no device code). Returns (ROCm root, CMake prefix)."""
+    targets = job.gpu_targets().split(";") if devices else []
     extras = ",".join(["libraries", "devel", *(f"device-{t}" for t in targets)])
     # The SDK unpacks to several GB: keep it in a virtual environment in the work directory (the runner's large data
     # disk) rather than in the Python installation, whose disk (C:) runs out of space
@@ -615,6 +628,7 @@ def install_rocm_wheels(job: Job) -> tuple[Path, Path]:
               f"rocm[{extras}]=={WINDOWS_ROCM_VERSION}"])
     rocm_sdk = scripts / "rocm-sdk"
     run(job, [rocm_sdk, "init"])
+    record_rocm_version(job, Path(), WINDOWS_ROCM_VERSION)
     if job.dry_run:
         return job.sdk_root / "rocm", job.sdk_root / "rocm" / "lib" / "cmake"
     path = lambda kind: Path(subprocess.run([str(rocm_sdk), "path", kind], capture_output=True, text=True,
@@ -622,22 +636,21 @@ def install_rocm_wheels(job: Job) -> tuple[Path, Path]:
     return path("--root"), path("--cmake")
 
 
-def build_migraphx_windows(job: Job) -> tuple[Path, Path]:
+def build_migraphx_windows(job: Job, deps_only: bool = False) -> tuple[Path, Path]:
     """Build MIGraphX with its GPU backend on Windows, following AMDMIGraphX's .github/workflows/windows.yaml.
 
     ROCm comes from TheRock's Python wheels; MIGraphX's own dependencies (including rocMLIR) are built by rbuild.
-    Returns (MIGraphX install prefix, ROCm root).
+    deps_only stops after the dependencies (the first stage of build_migraphx). Returns (MIGraphX install prefix,
+    ROCm root).
     """
     src = MIGRAPHX_SRC
-    rocm, rocm_cmake = install_rocm_wheels(job)
     install, cget = job.work / "migraphx-install", job.work / "cget"
-    marker, commit = install / ".migraphx-commit", git_commit(src)
-    if not job.dry_run and marker.exists() and marker.read_text(encoding="utf-8").strip() == commit:
-        print(f"MIGraphX {commit[:12]} is already built (build cache): {install}", flush=True)
-        return install, rocm
-    path = os.pathsep.join([str(rocm / "lib" / "llvm" / "bin"), str(rocm / "bin"), os.environ.get("PATH", "")])
-    # rocMLIR has long paths; build the dependencies in a short directory like the upstream CI does
-    short = Path(job.work.anchor) / "b"
+    # the MIGraphX install of the build cache is reused for the same commit and GPU targets
+    marker, built = install / ".migraphx-commit", f"{git_commit(src)} {job.gpu_targets()}"
+    if not job.dry_run and marker.exists() and marker.read_text(encoding="utf-8").strip() == built:
+        print(f"MIGraphX {built} is already built (build cache): {install}", flush=True)
+        # building against it needs ROCm, but not the device libraries: the EP repository compiles no device code
+        return install, (install_rocm_wheels(job, devices=False)[0] if not deps_only else Path())
     run(job, [sys.executable, "-m", "pip", "install", "https://github.com/RadeonOpenCompute/rbuild/archive/master.tar.gz"])
     if not job.dry_run and (cget / "hash").exists():
         # cget may come from the Actions cache (see build_cache). As in AMDMIGraphX's windows.yaml, compare the
@@ -647,17 +660,26 @@ def build_migraphx_windows(job: Job) -> tuple[Path, Path]:
         if (cget / "hash").read_text(encoding="utf-8").strip() != expected:
             print(f"MIGraphX dependency hash changed ({expected}); rebuilding the dependencies", flush=True)
             shutil.rmtree(cget)
+        elif deps_only:
+            print(f"the MIGraphX dependencies {expected} are already built (build cache): {cget}", flush=True)
+            return install, Path()
+    rocm, rocm_cmake = install_rocm_wheels(job, devices=not deps_only)
+    path = os.pathsep.join([str(rocm / "lib" / "llvm" / "bin"), str(rocm / "bin"), os.environ.get("PATH", "")])
+    # rocMLIR has long paths; build the dependencies in a short directory like the upstream CI does
+    short = Path(job.work.anchor) / "b"
     run(job, ["rbuild", "prepare", "-d", cget, "-s", "gh-win-gpu", "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release",
               "-DLLVM_DISABLE_ASSEMBLY_FILES=On", "-DLLVM_ENABLE_DIA_SDK=Off"], cwd=src,
         env={"PATH": path, "CC": "clang-cl", "CXX": "clang-cl", "CXXFLAGS": "/std:c++17", "CGET_BUILD_PATH": str(short)})
+    if deps_only:
+        return install, rocm
     # as on Linux: without BUILD_TESTING=Off the build also compiles MIGraphX's test executables
     run(job, ["rbuild", "build", "-d", cget, "-s", "gh-win-gpu", "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release",
               "-DBUILD_TESTING=Off", "-DMIGRAPHX_ENABLE_PYTHON=Off",
-              f"-DGPU_TARGETS={migraphx_gpu_targets()}", f"-DCMAKE_INSTALL_PREFIX={install}"], cwd=src,
+              f"-DGPU_TARGETS={job.gpu_targets()}", f"-DCMAKE_INSTALL_PREFIX={install}"], cwd=src,
         env={"PATH": path, "CC": "clang", "CXX": "clang++", "CMAKE_PREFIX_PATH": f"{rocm_cmake};{cget}"})
     run(job, ["cmake", "--install", src / "build", "--prefix", install])
     if not job.dry_run:
-        marker.write_text(commit, encoding="utf-8")  # lets a cached install be reused (see build_cache)
+        marker.write_text(built, encoding="utf-8")  # lets a cached install be reused (see build_cache)
     return install, rocm
 
 
@@ -679,6 +701,7 @@ def ort_home(job: Job) -> Path:
     if job.os == "linux" and not (home / "lib64").exists():
         (home / "lib64").symlink_to("lib")
     cmake_dir = home / "lib" / "cmake" / "onnxruntime"
+    version_file = cmake_dir / "onnxruntimeConfigVersion.cmake"
     if not cmake_dir.exists():  # the Windows prebuilt package has no CMake config, so add a minimal imported target
         cmake_dir.mkdir(parents=True)
         lib = "onnxruntime.lib" if job.os == "windows" else "libonnxruntime.dylib" if job.os == "macos" else "libonnxruntime.so"
@@ -690,6 +713,18 @@ def ort_home(job: Job) -> Path:
             "  set_target_properties(onnxruntime::onnxruntime PROPERTIES\n"
             f'    {dll} "${{_root}}/lib/{lib}"\n'
             '    INTERFACE_INCLUDE_DIRECTORIES "${_root}/include;${_root}/include/onnxruntime")\n'
+            "endif()\n", encoding="utf-8")
+    if not version_file.exists() and (home / "VERSION_NUMBER").exists():  # for find_package(onnxruntime <version>)
+        version = (home / "VERSION_NUMBER").read_text(encoding="utf-8").strip()
+        version_file.write_text(
+            f'set(PACKAGE_VERSION "{version}")\n'
+            "if(PACKAGE_FIND_VERSION VERSION_GREATER PACKAGE_VERSION)\n"
+            "  set(PACKAGE_VERSION_COMPATIBLE FALSE)\n"
+            "else()\n"
+            "  set(PACKAGE_VERSION_COMPATIBLE TRUE)\n"
+            "  if(PACKAGE_FIND_VERSION STREQUAL PACKAGE_VERSION)\n"
+            "    set(PACKAGE_VERSION_EXACT TRUE)\n"
+            "  endif()\n"
             "endif()\n", encoding="utf-8")
     return home
 
@@ -704,7 +739,7 @@ def build_ep_tensorrt(job: Job) -> None:
                 (trt / so.name).symlink_to(so)
     nvcc = cuda / "bin" / ("nvcc.exe" if job.os == "windows" else "nvcc")
     run(job, ["cmake", "-G", "Ninja", "-S", src, "-B", b, "-DCMAKE_BUILD_TYPE=Release", f"-DCMAKE_INSTALL_PREFIX={job.stage}",
-              f"-DCMAKE_CUDA_ARCHITECTURES={job.cuda_archs}", f"-DCMAKE_CUDA_COMPILER={nvcc}",
+              f"-DCMAKE_CUDA_ARCHITECTURES={job.cuda_architectures()}", f"-DCMAKE_CUDA_COMPILER={nvcc}",
               f"-DTENSORRT_HOME={trt}", f"-DORT_HOME={ort_home(job)}", f"-DTRT_MAJOR_VERSION={trt_major(job)}"])
     run(job, ["cmake", "--build", b, "--parallel"])
     # not cmake --install: it also installs the protobuf / ONNX / flatbuffers dependencies and the TensorRT DLLs
@@ -744,6 +779,23 @@ def build_ep_nv_tensorrt_rtx(job: Job) -> None:
     stage_shared_libs(job, b, ["onnxruntime_providers_nv_tensorrt_rtx"])
 
 
+def migraphx_staged(recipe: str, variant: str, triple: str) -> bool:
+    """Whether a package build needs the Windows MIGraphX that build_migraphx builds in jobs of its own beforehand."""
+    return recipe == "ep-amdgpu" and variant != "dml" and TRIPLES[triple][1] == "windows"
+
+
+def build_migraphx(job: Job) -> None:
+    """The MIGraphX the Windows AMD plugin EPs are built with, in two stages that bundle.yml runs as jobs of their own
+    before the packages: the dependencies rbuild builds (variant "deps", about 3.5 hours; rocMLIR is an LLVM build),
+    then MIGraphX itself (variant "build", about 2 hours). Each stage fits the 6-hour job limit of a hosted runner,
+    and both AMD packages restore the result from the build cache (build_cache) instead of building it twice."""
+    if job.os != "windows" or job.variant not in ("deps", "build"):
+        raise SystemExit("the migraphx recipe builds the Windows MIGraphX in the stages deps and build")
+    if not job.dry_run:  # a path of the build cache entry (build_cache), also when only the dependencies are built
+        (job.work / "migraphx-install").mkdir(parents=True, exist_ok=True)
+    build_migraphx_windows(job, deps_only=job.variant == "deps")
+
+
 def build_ep_amdgpu(job: Job) -> None:
     src, b = ROOT / "eps/official/onnxruntime-ep-amdgpu", job.work / "build"
     cmd = [sys.executable, src / "tools/ci_build/build.py", "--build_dir", b, "--config", "Release", "--update", "--build",
@@ -754,9 +806,19 @@ def build_ep_amdgpu(job: Job) -> None:
     else:
         migraphx, rocm = build_migraphx_windows(job) if job.os == "windows" else build_migraphx_linux(job)
         cmd += ["--migraphx_home", migraphx, "--hip_path", rocm]
-        if job.variant == "amdgpu":  # AMDGPU EP; implies MIGraphX (and DirectML on Windows), renamed to *-backend
+        if job.variant in ("amdgpu", "amdgpu-hip"):  # AMDGPU EP; implies MIGraphX (and DirectML on Windows)
             cmd += ["--use_amdgpu"]
-            names = ["amdgpu-ep", "migraphx-backend", "hip-backend", "directx-backend"]
+            names = ["amdgpu-ep", "migraphx-backend", "directx-backend"]
+            if job.variant == "amdgpu-hip":
+                # hip-backend, the shim that loads hip-ep's prebuilt HIP EP (hipgpu), which fetch-restricted downloads:
+                # record the hip-ep release the package is paired with
+                names.append("hip-backend")
+                if not job.dry_run:
+                    hip_ep = sdk.dl.component("hip-ep")
+                    record_sdk_version(job, "hip-ep", hip_ep.resolve(sdk.dl.Context(job.platform, job.cuda_major,
+                                                                                     "ubuntu24", {}), hip_ep.default).version)
+            else:  # amdgpu-ep fails to load when it is built with the HIP backend and hipgpu is missing
+                cmd += ["--cmake_extra_defines", "USE_HIP=OFF"]
         else:
             cmd += ["--use_migraphx"]
             names = ["migraphx-ep"]
@@ -766,7 +828,7 @@ def build_ep_amdgpu(job: Job) -> None:
         os.environ.pop("VSINSTALLDIR", None)
     run(job, cmd, cwd=src)
     stage_shared_libs(job, b / "Release", names)
-    if job.os == "windows" and job.variant in ("dml", "amdgpu"):  # the DirectML EP / backend
+    if job.os == "windows" and job.variant in ("dml", "amdgpu", "amdgpu-hip"):  # the DirectML EP / backend
         record_directml(job)
     if job.variant != "dml":  # MIGraphX (MIT) is built from its develop branch here, so bundle it with its license
         if job.os == "windows":
@@ -777,7 +839,7 @@ def build_ep_amdgpu(job: Job) -> None:
             set_origin_rpath(job, job.stage / "lib")
         stage_headers(job, migraphx / "include" / "migraphx", "migraphx")
         stage_license(job, "MIGraphX", MIGRAPHX_SRC, ["LICENSE*"])
-    if job.variant == "amdgpu":  # its HIP backend: the HIP headers, and the import library on Windows (MIT)
+    if job.variant in ("amdgpu", "amdgpu-hip"):  # the HIP headers, and the import library on Windows (MIT)
         stage_headers(job, rocm / "include" / "hip", "hip")
         if job.os == "windows":
             stage_dev_files(job, ["lib/amdhip64.lib"], rocm, job.stage / "lib")
@@ -855,62 +917,64 @@ def build_ep_mlx(job: Job) -> None:
         stage_license(job, name, mlx_build / sub, ["LICENSE*"])
 
 
-def build_ep_iree(job: Job) -> None:
-    src = ROOT / "eps/community/onnxruntime-ep-iree"
-    # The EP loads the IREE compiler library at run time; it is not packaged (a bundle adds this version or its
-    # fetch-restricted script downloads it, see ci/bundle.py)
-    if not job.dry_run:
-        reqs = (src / "requirements-dev.txt").read_text(encoding="utf-8")
-        record_sdk_version(job, "iree-compiler", re.search(r"^iree-base-compiler==(\S+)", reqs, re.M).group(1))
-    if job.os == "windows":
-        # The build tree lives in <source>/build/cmake/default and some IREE object paths exceed MAX_PATH (cl.exe
-        # fails with C1083), so build from a copy in a short directory
-        short = Path(job.work.anchor) / "iree"
-        if not job.dry_run:
-            top_level = lambda d, names: [n for n in names if n in (".git", "build")] if Path(d) == src else []
-            shutil.copytree(src, short, ignore=top_level, dirs_exist_ok=True)
-        src = short
-    run(job, [sys.executable, "-m", "pip", "install", "-r", "requirements-dev.txt"], cwd=src)
-    run(job, [sys.executable, "-m", "pip", "wheel", "./python", "--no-deps", "-w", job.stage / "python"], cwd=src)
-    install = src / "build" / "cmake" / "default" / "python-install"
-    stage_shared_libs(job, install, ["onnxruntime_ep_iree"])
-
-
-def build_ep_telum(job: Job) -> None:
-    src, b = ROOT / "eps/community/onnxruntime-ep-telum", job.work / "build"
-    toolchain = s390x_toolchain(job)
-    headers = ORT_SRC / "include/onnxruntime/core/session"  # only the ORT headers are needed
+def build_ep_openvino(job: Job) -> None:
+    job.need("openvino", pins={"openvino": OPENVINO_PLUGIN_VERSION})  # INTEL_OPENVINO_DIR / OpenVINO_DIR: ci/sdk.py
+    src, b = ROOT / "eps/official/onnxruntime-ep-openvino", job.work / "build"
+    target = "onnxruntime_providers_openvino_plugin"
+    env = {"ONNXRUNTIME_ROOT_DIR": str(ort_home(job))}
     run(job, ["cmake", "-G", "Ninja", "-S", src, "-B", b, "-DCMAKE_BUILD_TYPE=Release",
-              f"-DCMAKE_TOOLCHAIN_FILE={toolchain}", f"-DONNXRUNTIME_INCLUDE_DIR={headers}", "-DTELUM_EP_ENABLE_ZDNN=ON"])
-    run(job, ["cmake", "--build", b, "--parallel"])
-    copy_files(job, ["libtelum_plugin_ep.so"], b, job.stage / "lib")
-
-
-def build_ep_vulkan(job: Job) -> None:
-    job.need("vulkan-sdk")
-    src = ROOT / "eps/community/onnxruntime-ep-vulkan/rust"
-    env = {"VULKAN_SDK": str(job.sdks["vulkan-sdk"]), "CARGO_TARGET_DIR": str(job.work / "target")}
-    run(job, ["cargo", "build", "--release"], cwd=src, env=env)
-    stage_shared_libs(job, job.work / "target" / "release", ["onnxruntime_vulkan_ep"])
-    sdk_root = job.sdks["vulkan-sdk"]
-    for name in ("vulkan", "vk_video"):
-        stage_headers(job, sdk_root / "include" / name, name)
+              "-DOVEP_PLUGIN_BUILD_TESTS=OFF", "-DOVEP_PLUGIN_BUILD_TOOLS=OFF"], env=env)
+    # only the plugin: cmake --install and the default target also stage the OpenVINO runtime (on Windows re-signed
+    # copies with embedded manifests), which fetch-restricted downloads unmodified on the user's machine instead
+    run(job, ["cmake", "--build", b, "--parallel", "--target", target], env=env)
+    stage_shared_libs(job, b, [target])
     if job.os == "windows":
-        stage_dev_files(job, ["Lib/vulkan-1.lib"], sdk_root, job.stage / "lib")
-    stage_license(job, "Vulkan-SDK", sdk_root, ["LICENSE*", "Licenses/*", "share/doc/vulkan/*LICENSE*"])
+        # The plugin DLL declares the openvino_runtime private assembly (SxS), which this manifest next to it describes:
+        # the OpenVINO and TBB DLLs in the same directory
+        manifest = b / "sxs_manifests" / "openvino_runtime_Release.manifest"
+        if job.dry_run:
+            print(f"[dry-run] copy {manifest} -> bin/openvino_runtime.manifest")
+        else:
+            shutil.copy2(manifest, job.stage / "bin" / "openvino_runtime.manifest")
+    else:
+        set_origin_rpath(job, job.stage / "lib", extra="")  # the build-tree run path points into the SDK directory
+
+
+def build_ep_neuropilot(job: Job) -> None:
+    job.need("neuron-op-capability")
+    src, b = ROOT / "eps/official/onnxruntime-ep-neuropilot", job.work / "build"
+    # the prebuilt op capability library of the target (the build links against it; fetch-restricted downloads it)
+    archive = "android-arm64-v8a" if job.os == "android" else "linux-aarch64"
+    prebuilt = job.sdks["neuron-op-capability"]
+    if not job.dry_run:
+        prebuilt = next(p.parent for p in prebuilt.rglob("libneuron_op_capability.so") if p.parent.name.endswith(archive))
+    # only ORT's headers are needed: ORT loads the EP library, which resolves the API at run time
+    args = ["-DCMAKE_BUILD_TYPE=Release", f"-DORT_INCLUDE_DIR={ORT_SRC / 'include/onnxruntime/core/session'}",
+            f"-DNEURON_OP_CAPABILITY_LIB_DIR={prebuilt}", "-DORTNeuronEp_INSTALL=OFF"]
+    if job.os == "android":
+        job.need("android-ndk")
+        args += [f"-DCMAKE_TOOLCHAIN_FILE={src / 'cmake/toolchain-android.cmake'}",
+                 f"-DANDROID_NDK_HOME={job.sdks['android-ndk']}", "-DANDROID_ABI=arm64-v8a"]
+    run(job, ["cmake", "-G", "Ninja", "-S", src, "-B", b, *args])
+    run(job, ["cmake", "--build", b, "--parallel"])
+    lib = copy_files(job, ["**/libonnxruntime_providers_neuropilot.so"], b, job.stage / "lib")
+    if job.os == "android" and not job.dry_run:  # Android builds keep their debug symbols (tens of MB)
+        strip = next((Path(job.sdks["android-ndk"]) / "toolchains/llvm/prebuilt").glob("*/bin/llvm-strip"))
+        run(job, [strip, "--strip-unneeded", *lib])
 
 
 RECIPES: dict[str, Callable[[Job], None]] = {
     "ort": build_ort, "ort-apple": build_ort_apple,
     "ep-tensorrt": build_ep_tensorrt, "ep-nv-tensorrt-rtx": build_ep_nv_tensorrt_rtx, "ep-amdgpu": build_ep_amdgpu,
-    "ep-qnn": build_ep_qnn, "ep-mlx": build_ep_mlx, "ep-iree": build_ep_iree, "ep-telum": build_ep_telum,
-    "ep-vulkan": build_ep_vulkan,
+    "ep-qnn": build_ep_qnn, "ep-mlx": build_ep_mlx, "ep-openvino": build_ep_openvino, "ep-neuropilot": build_ep_neuropilot,
+    "migraphx": build_migraphx,
 }
 
 
-def required_sdks(recipe: str, variant: str, triple: str, cuda_major: str = "13",
-                  eps: str = "") -> set[tuple[str, str, str]]:
-    """Walk through a recipe in dry-run mode and return the required (component, platform, pinned version) tuples."""
+def recipe_inputs(recipe: str, variant: str, triple: str, cuda_major: str = "13",
+                  eps: str = "") -> tuple[set[tuple[str, str, str]], set[str]]:
+    """Walk through a recipe in dry-run mode and return the required (component, platform, pinned version) tuples and
+    the GPU architecture settings it compiles device code for (Job.gpu)."""
     import contextlib
     import io
     job = Job(recipe, variant, triple, Path("work"), Path("stage"), Path("sdk"), cuda_major, DEFAULT_CUDA_ARCHS, True,
@@ -920,7 +984,13 @@ def required_sdks(recipe: str, variant: str, triple: str, cuda_major: str = "13"
             RECIPES[recipe](job)
         except SystemExit:
             pass  # missing outputs are expected in dry-run mode
-    return job.needed
+    return job.needed, job.gpu
+
+
+def required_sdks(recipe: str, variant: str, triple: str, cuda_major: str = "13",
+                  eps: str = "") -> set[tuple[str, str, str]]:
+    """The required (component, platform, pinned version) tuples of a recipe (see recipe_inputs)."""
+    return recipe_inputs(recipe, variant, triple, cuda_major, eps)[0]
 
 
 def watch_memory(interval: int = 30) -> None:
@@ -945,27 +1015,33 @@ def git_commit(path: Path) -> str:
     return out.stdout.strip() or "unknown"
 
 
-def build_cache(job: Job) -> tuple[str, str, list[Path], str] | None:
+def build_cache(job: Job) -> tuple[str, str, list[Path], Path] | None:
     """(key, restore key prefix, paths, marker) of the build state a recipe can reuse from the Actions cache, or None.
 
     Only open-source build results are cached (the repository is public, and caches of a public repository can be
     restored by pull-request workflows). The key hashes everything the cached files depend on, so a version update
-    produces a new key instead of reusing old files; the cache is saved only when the marker file (relative to the
-    first path) exists, i.e. the cached step finished.
+    produces a new key instead of reusing old files; the cache is saved only when the marker file exists, i.e. the
+    cached step finished.
     """
-    if job.recipe == "ep-amdgpu" and job.os == "windows" and job.variant != "dml":
-        # MIGraphX's third-party dependencies (rocMLIR, ...) built by `rbuild prepare`: about 2.5 hours. They depend on
-        # the files rbuild hashes for them, the ROCm (clang) version and the MSVC toolset, as in AMDMIGraphX's own CI.
-        # The MIGraphX install itself is cached with them, keyed by the submodule commit; a new commit restores the
-        # dependencies of the same hash (restore key prefix) and builds only MIGraphX again (build_migraphx_windows).
+    if job.recipe == "migraphx" or migraphx_staged(job.recipe, job.variant, job.triple):
+        # MIGraphX's third-party dependencies (rocMLIR, ...) built by `rbuild prepare`: about 3.5 hours. They depend on
+        # the files rbuild hashes for them, the ROCm (clang) version and the MSVC toolset, as in AMDMIGraphX's own CI,
+        # but not on the GPU targets (rbuild prepare does not get them). The deps stage of build_migraphx saves them
+        # alone; the MIGraphX install is cached with them once it is complete, keyed by the submodule commit and the GPU
+        # targets. Another commit or set of targets restores the dependencies of the same hash (restore key prefix)
+        # and builds only MIGraphX again. Every entry has the same paths: actions/cache restores only entries of the
+        # same paths.
         digest = hashlib.sha256()
         for name in ("requirements.txt", "dev-requirements.txt", "rbuild.ini"):
             path = MIGRAPHX_SRC / name
             digest.update(name.encode() + b"\0" + (path.read_bytes() if path.exists() else b""))
-        digest.update(f"{WINDOWS_ROCM_VERSION}|{os.environ.get('VCToolsVersion', '')}|{migraphx_gpu_targets()}".encode())
+        digest.update(f"{WINDOWS_ROCM_VERSION}|{os.environ.get('VCToolsVersion', '')}".encode())
         prefix = f"migraphx-{job.triple}-{digest.hexdigest()[:20]}-"
-        return (prefix + git_commit(MIGRAPHX_SRC)[:12], prefix, [job.work / "cget", job.work / "migraphx-install"],
-                "hash")
+        targets = hashlib.sha256(job.gpu_targets().encode()).hexdigest()[:8]
+        cget, install = job.work / "cget", job.work / "migraphx-install"
+        if job.recipe == "migraphx" and job.variant == "deps":
+            return f"{prefix}deps", prefix, [cget, install], cget / "hash"
+        return f"{prefix}{git_commit(MIGRAPHX_SRC)[:12]}-{targets}", prefix, [cget, install], install / ".migraphx-commit"
     return None
 
 
@@ -979,8 +1055,10 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--sdk-root", type=Path, required=True, help="directory where third-party SDKs are extracted")
     ap.add_argument("--cuda-major", default="13", choices=("12", "13"))
     ap.add_argument("--eps", default="", help="comma-separated in-tree EPs of --variant custom: " + ", ".join(CUSTOM_EPS))
-    ap.add_argument("--cuda-archs", default=os.environ.get("CUDA_ARCHITECTURES", DEFAULT_CUDA_ARCHS),
+    ap.add_argument("--cuda-archs", default=os.environ.get("CUDA_ARCHITECTURES") or DEFAULT_CUDA_ARCHS,
                     help="CMAKE_CUDA_ARCHITECTURES (defaults to the CUDA_ARCHITECTURES environment variable)")
+    ap.add_argument("--amd-gpu-targets", default=os.environ.get("MIGRAPHX_GPU_TARGETS") or DEFAULT_MIGRAPHX_GPU_TARGETS,
+                    help="GPU_TARGETS of the MIGraphX build (defaults to the MIGRAPHX_GPU_TARGETS environment variable)")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--cache-info", type=Path, metavar="FILE",
                     help="only append key=, restore-keys=, path= and marker= of the recipe's reusable build state "
@@ -991,13 +1069,15 @@ def main(argv: list[str]) -> int:
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8")
     job = Job(args.recipe, args.variant, args.triple, args.work.resolve(), args.stage.resolve(),
-              args.sdk_root.resolve(), args.cuda_major, args.cuda_archs, args.dry_run,
+              args.sdk_root.resolve(), args.cuda_major, args.cuda_archs, args.dry_run, args.amd_gpu_targets,
               eps=[e for e in args.eps.split(",") if e])
+    if job.os == "macos":  # CMake and the other build tools read it (CMAKE_OSX_DEPLOYMENT_TARGET)
+        os.environ.setdefault("MACOSX_DEPLOYMENT_TARGET", MACOS_DEPLOYMENT_TARGET)
     if args.cache_info:
         if cache := build_cache(job):
             key, restore, paths, marker = cache
             with args.cache_info.open("a", encoding="utf-8") as f:
-                f.write(f"key={key}\nrestore-keys={restore}\nmarker={paths[0] / marker}\n")
+                f.write(f"key={key}\nrestore-keys={restore}\nmarker={marker}\n")
                 f.write("path<<EOF_PATHS\n" + "\n".join(str(p) for p in paths) + "\nEOF_PATHS\n")
         return 0
     if Path("/proc/meminfo").exists() and not args.dry_run:

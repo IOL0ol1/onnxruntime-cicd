@@ -6,17 +6,17 @@
 # - ci/bundle.py resolve validates the configuration and plans the packages (ci/plan.py): each one is named after the
 #   hash of its build inputs, and an unexpired artifact with that name from an earlier run is reused; the others are
 #   built by the build matrix and kept for 90 days.
-# - The bundle is uploaded as an artifact (90 days; downloading needs a GitHub login). The packages contain no vendor
-#   runtimes: the bundle adds the optional third-party runtimes the request chose to bundle, and fetch-restricted.(sh|ps1)
-#   in the bundle downloads the others, and the files whose licenses do not allow redistributing them, on the user's
-#   machine.
+# - The Windows AMD packages need MIGraphX, whose first build takes longer than the 6-hour job limit: the
+#   migraphx-deps and migraphx jobs build it first, in two stages that fit it, and the packages reuse it from the build
+#   cache (ci/build.py build_migraphx). The stages skip what the build cache already has.
+# - The bundle is uploaded as an artifact (90 days; downloading needs a GitHub login). Neither the packages nor the
+#   bundle contain vendor SDK files: fetch-restricted.(sh|ps1) in the bundle downloads them on the user's machine.
 # - Editing the issue rebuilds it; a comment starting with /rebuild rebuilds it without reusing earlier artifacts.
 #
 # Optional repository variables (Settings -> Variables):
 #   RUNNER_MAP          JSON that replaces default runners, e.g. {"ubuntu-24.04": "linux-8core"}
 #   HEAVY_RUNNER_MAP    JSON that replaces runners only for long builds such as CUDA / QNN
-#   CUDA_ARCHITECTURES  CMAKE_CUDA_ARCHITECTURES (default 80-real;80-virtual)
-#   MIGRAPHX_GPU_TARGETS  GPU_TARGETS of the Windows MIGraphX source build (default gfx1100;gfx1101;gfx1102;gfx1200;gfx1201)
+# The GPU architectures of the CUDA and MIGraphX code are part of each request (the configurator page).
 
 name: bundle
 
@@ -38,9 +38,6 @@ concurrency:
 env:
   PYTHONUTF8: "1"
   PYTHONIOENCODING: utf-8
-  # ORT drops a list that has only -virtual entries, so keep at least one real architecture
-  CUDA_ARCHITECTURES: ${{ vars.CUDA_ARCHITECTURES || '80-real;80-virtual' }}
-  MIGRAPHX_GPU_TARGETS: ${{ vars.MIGRAPHX_GPU_TARGETS }}
   CMAKE_VERSION: "4.2.3"
   # CMake 4 removed compatibility with cmake_minimum_required(VERSION < 3.5), still used by some ORT dependencies
   CMAKE_POLICY_VERSION_MINIMUM: "3.5"
@@ -63,6 +60,9 @@ jobs:
       existing_url: ${{ steps.resolve.outputs.existing_url }}
       builds: ${{ steps.resolve.outputs.builds }}
       has_builds: ${{ steps.resolve.outputs.has_builds }}
+      migraphx: ${{ steps.resolve.outputs.migraphx }}
+      amd_builds: ${{ steps.resolve.outputs.amd_builds }}
+      has_amd_builds: ${{ steps.resolve.outputs.has_amd_builds }}
       comment_id: ${{ steps.status.outputs.comment-id }}
     steps:
       - uses: actions/checkout@v7
@@ -124,7 +124,7 @@ jobs:
           path: ${{ runner.temp }}/plan/plan.json
           retention-days: 7
 
-  # The packages that no earlier run built with the same inputs
+  # The packages that no earlier run built with the same inputs (the Windows AMD packages: build-amd)
   build:
     needs: resolve
     if: needs.resolve.outputs.ok == 'true' && needs.resolve.outputs.existing_url == '' && needs.resolve.outputs.has_builds == 'true'
@@ -139,56 +139,87 @@ jobs:
       matrix: ${{ fromJSON(needs.resolve.outputs.builds) }}
     env:
       GITHUB_TOKEN: ${{ github.token }}  # authenticated GitHub API requests (the anonymous rate limit is easily hit)
-    defaults:
-      run:
-        shell: bash
     steps:
       - uses: actions/checkout@v7
+      - uses: ./.github/actions/build-package
+        with:
+          entry: ${{ toJSON(matrix) }}
 
+  # MIGraphX for the Windows AMD packages, one per target triple and set of GPU targets: its dependencies (rocMLIR, ...)
+  # and then MIGraphX itself, each in a job that fits the 6-hour limit
+  migraphx-deps:
+    needs: resolve
+    if: needs.resolve.outputs.ok == 'true' && needs.resolve.outputs.existing_url == '' && needs.resolve.outputs.has_amd_builds == 'true'
+    name: MIGraphX dependencies · ${{ matrix.triple }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    cache-mode: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.resolve.outputs.migraphx) }}
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/build-entry
         with:
-          recipe: ${{ matrix.recipe }}
-          variant: ${{ matrix.variant }}
-          eps: ${{ matrix.eps }}
+          recipe: migraphx
+          variant: deps
           triple: ${{ matrix.triple }}
-          cuda-major: ${{ matrix.cuda_major }}
+          amd-gpu-targets: ${{ matrix.amd_gpu_targets }}
           submodules: ${{ matrix.submodules }}
-          docker: ${{ matrix.docker }}
-          apt: ${{ matrix.apt }}
           msvc-arch: ${{ matrix.msvc_arch }}
           msvc-toolset: ${{ matrix.msvc_toolset }}
-          keep-android-sdk: ${{ matrix.keep_android_sdk }}
-          ccache: ${{ matrix.ccache }}
+
+  migraphx:
+    needs: [resolve, migraphx-deps]
+    name: MIGraphX · ${{ matrix.triple }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    cache-mode: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.resolve.outputs.migraphx) }}
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/build-entry
+        with:
+          recipe: migraphx
+          variant: build
+          triple: ${{ matrix.triple }}
+          amd-gpu-targets: ${{ matrix.amd_gpu_targets }}
+          submodules: ${{ matrix.submodules }}
+          msvc-arch: ${{ matrix.msvc_arch }}
+          msvc-toolset: ${{ matrix.msvc_toolset }}
+          ccache: "true"
           ccache-key: ${{ matrix.ccache_key }}
 
-      - name: Package
-        env:
-          PACKAGE: ${{ matrix.package }}
-          TRIPLE: ${{ matrix.triple }}
-          HASH: ${{ matrix.hash }}
-          SUBMODULES: ${{ matrix.submodules }}
-          CUDA_MAJOR: ${{ matrix.cuda_major }}
-          RECIPE: ${{ matrix.recipe }}/${{ matrix.variant }}
-          EPS: ${{ matrix.eps }}
-        run: >-
-          python ci/package.py --stage "$STAGE_DIR" --name "$PACKAGE" --triple "$TRIPLE" --version "$HASH"
-          --source $SUBMODULES --sdk-versions "$SDK_ROOT/sdk-versions.json" --out "$DIST_DIR"
-          --extra "cuda_architectures=${CUDA_ARCHITECTURES}" "cuda_major=$CUDA_MAJOR" "recipe=$RECIPE" "eps=$EPS"
-          "inputs_hash=$HASH"
-
-      - uses: actions/upload-artifact@v7
+  # The Windows AMD packages, which restore MIGraphX from the build cache and build only the EPs
+  build-amd:
+    needs: [resolve, migraphx]
+    name: ${{ matrix.package }} · ${{ matrix.triple }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    cache-mode: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.resolve.outputs.amd_builds) }}
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/build-package
         with:
-          name: ${{ matrix.artifact }}
-          path: ${{ runner.temp }}/dist/*
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 90
+          entry: ${{ toJSON(matrix) }}
 
   assemble:
-    needs: [resolve, build]
+    needs: [resolve, build, build-amd]
     if: >-
       always() && needs.resolve.outputs.ok == 'true' && needs.resolve.outputs.existing_url == '' &&
-      (needs.build.result == 'success' || needs.build.result == 'skipped')
+      (needs.build.result == 'success' || needs.build.result == 'skipped') &&
+      (needs.build-amd.result == 'success' || needs.build-amd.result == 'skipped')
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
@@ -221,7 +252,7 @@ jobs:
           BUNDLE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: >-
           python ci/bundle.py assemble --plan "$RUNNER_TEMP/plan/plan.json" --packages "$RUNNER_TEMP/packages"
-          --work "$RUNNER_TEMP/work" --out "$RUNNER_TEMP/dist" --cache "$RUNNER_TEMP/sdk-cache"
+          --work "$RUNNER_TEMP/work" --out "$RUNNER_TEMP/dist"
 
       - name: Upload the bundle
         id: upload
@@ -255,12 +286,15 @@ jobs:
                                              state: 'closed', state_reason: 'completed'});
 
   report-failure:
-    needs: [resolve, build, assemble]
+    needs: [resolve, build, migraphx-deps, migraphx, build-amd, assemble]
     # a build that hits the 6-hour job limit is "cancelled"; a run that a newer request of the issue cancelled is not
     # reported (cancelled()), so that it does not overwrite the newer run's status
     if: >-
-      !cancelled() && needs.resolve.outputs.ok == 'true' &&
-      (contains(fromJSON('["failure","cancelled"]'), needs.build.result) || needs.assemble.result == 'failure')
+      !cancelled() && needs.resolve.outputs.ok == 'true' && (
+        contains(fromJSON('["failure","cancelled"]'), needs.build.result) ||
+        contains(fromJSON('["failure","cancelled"]'), needs.migraphx-deps.result) ||
+        contains(fromJSON('["failure","cancelled"]'), needs.migraphx.result) ||
+        contains(fromJSON('["failure","cancelled"]'), needs.build-amd.result) || needs.assemble.result == 'failure')
     runs-on: ubuntu-24.04
     steps:
       - uses: peter-evans/create-or-update-comment@v5
@@ -270,6 +304,6 @@ jobs:
           edit-mode: replace
           body: |
             ${{ env.STATUS_MARKER }}
-            ❌ **The bundle build failed** in [run ${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) (${{ needs.build.result == 'cancelled' && 'a package build hit the 6-hour job limit; packages that did build are kept and reused' || needs.build.result == 'failure' && 'building a package; packages that did build are kept and reused' || 'assembling the bundle' }}). Edit the issue to try again.
+            ❌ **The bundle build failed** in [run ${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) (${{ (needs.build.result == 'cancelled' || needs.migraphx-deps.result == 'cancelled' || needs.migraphx.result == 'cancelled' || needs.build-amd.result == 'cancelled') && 'a build hit the 6-hour job limit; what did build is kept and reused' || (needs.build.result == 'failure' || needs.migraphx-deps.result == 'failure' || needs.migraphx.result == 'failure' || needs.build-amd.result == 'failure') && 'building a package; what did build is kept and reused' || 'assembling the bundle' }}). Edit the issue to try again.
 
             ${{ needs.resolve.outputs.summary }}

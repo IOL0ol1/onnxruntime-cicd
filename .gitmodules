@@ -18,21 +18,6 @@
 	url = https://github.com/NVIDIA/TensorRT-RTX-EP-ABI.git
 	shallow = true
 	branch = main
-[submodule "eps/community/onnxruntime-ep-iree"]
-	path = eps/community/onnxruntime-ep-iree
-	url = https://github.com/iree-org/onnxruntime-ep-iree.git
-	shallow = true
-	branch = main
-[submodule "eps/community/onnxruntime-ep-telum"]
-	path = eps/community/onnxruntime-ep-telum
-	url = https://github.com/IBM/onnxruntime-ep-telum.git
-	shallow = true
-	branch = main
-[submodule "eps/community/onnxruntime-ep-vulkan"]
-	path = eps/community/onnxruntime-ep-vulkan
-	url = https://github.com/justinchuby/onnxruntime-ep-vulkan.git
-	shallow = true
-	branch = main
 [submodule "onnxruntime"]
 	path = onnxruntime
 	url = https://github.com/microsoft/onnxruntime.git
@@ -47,4 +32,14 @@
 	path = deps/amdmigraphx
 	url = https://github.com/ROCm/AMDMIGraphX.git
 	branch = develop
+	shallow = true
+[submodule "eps/official/onnxruntime-ep-openvino"]
+	path = eps/official/onnxruntime-ep-openvino
+	url = https://github.com/onnxruntime/onnxruntime-ep-openvino.git
+	branch = main
+	shallow = true
+[submodule "eps/official/onnxruntime-ep-neuropilot"]
+	path = eps/official/onnxruntime-ep-neuropilot
+	url = https://github.com/onnxruntime/onnxruntime-ep-neuropilot.git
+	branch = main
 	shallow = true

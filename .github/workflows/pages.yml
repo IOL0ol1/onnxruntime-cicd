@@ -14,7 +14,14 @@ on:
       - "ci/catalog.py"
       - "ci/plan.py"
       - "ci/build.py"
+      - "ci/sdk.py"
       - "ci/matrix.json"
+      - "scripts/**"
+      # submodule updates change the versions the page lists
+      - ".gitmodules"
+      - "onnxruntime"
+      - "eps/**"
+      - "deps/**"
   workflow_dispatch:
 
 permissions:
@@ -39,8 +46,11 @@ jobs:
         with:
           python-version: "3.12"
 
+      # --versions resolves the third-party SDK versions the page lists (GITHUB_TOKEN: GitHub API requests)
       - name: Generate the catalog
-        run: python ci/catalog.py --out site/catalog.json
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python ci/catalog.py --out site/catalog.json --versions
 
       - uses: actions/configure-pages@v6
 

@@ -140,7 +140,15 @@ table.summary th, table.summary td { border-bottom: 1px solid var(--border); pad
 .choice.core.on { background: var(--accent-soft); border-color: var(--accent); }
 .choice.plugin.on { background: var(--plugin-soft); border-color: var(--plugin); }
 .choice:disabled { opacity: 0.4; cursor: not-allowed; }
+.choice.none { background: transparent; border-style: dashed; color: var(--muted); cursor: default; }
+.choice.none .label { font-weight: 400; }
+.choice.opt.on { background: var(--accent-soft); border-color: var(--accent); }
+.tag.fx { background: var(--accent-soft); color: var(--accent); }
+.seg { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 8px 0 0; }
+.seg-label { font-size: 0.85rem; color: var(--muted); }
 .ep-note { margin: 6px 0 0; font-size: 0.85rem; color: var(--muted); }
+.ep-note.fx { color: var(--warn); }
+table.eps tr.changed > th, table.eps tr.changed > td { background: var(--warn-soft); }
 .modes { display: grid; gap: 4px; }
 .choice:focus-visible, .button:focus-visible, select:focus-visible, input:focus-visible {
   outline: 2px solid var(--accent);
@@ -150,7 +158,9 @@ table.summary th, table.summary td { border-bottom: 1px solid var(--border); pad
 fieldset { border: 1px solid var(--border); border-radius: 8px; margin: 10px 0 0; padding: 8px 12px; }
 legend { color: var(--muted); font-size: 0.9rem; padding: 0 4px; }
 
-.licenses ul { margin: 4px 0; padding-left: 20px; }
+.licenses ul, ul.plain { margin: 4px 0; padding-left: 20px; }
+.muted { color: var(--muted); }
+code { font-size: 0.85em; }
 .ack { margin-top: 12px; font-weight: 600; }
 
 .actions { display: flex; flex-wrap: wrap; gap: 10px; margin: 12px 0; }

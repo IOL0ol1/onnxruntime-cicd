@@ -19,6 +19,12 @@ inputs:
   cuda-major:
     description: CUDA major version
     default: "13"
+  cuda-archs:
+    description: CMAKE_CUDA_ARCHITECTURES of the CUDA code (empty = the ci/build.py default)
+    default: ""
+  amd-gpu-targets:
+    description: GPU_TARGETS of the MIGraphX build (empty = the ci/build.py default)
+    default: ""
   eps:
     description: comma-separated in-tree EPs of the custom variant
     default: ""
@@ -164,6 +170,8 @@ runs:
         VARIANT: ${{ inputs.variant }}
         TRIPLE: ${{ inputs.triple }}
         CUDA_MAJOR: ${{ inputs.cuda-major }}
+        CUDA_ARCHITECTURES: ${{ inputs.cuda-archs }}
+        MIGRAPHX_GPU_TARGETS: ${{ inputs.amd-gpu-targets }}
         EPS: ${{ inputs.eps }}
       run: >-
         python ci/build.py --recipe "$RECIPE" --variant "$VARIANT" --triple "$TRIPLE" --cuda-major "$CUDA_MAJOR"
@@ -186,6 +194,8 @@ runs:
         VARIANT: ${{ inputs.variant }}
         TRIPLE: ${{ inputs.triple }}
         CUDA_MAJOR: ${{ inputs.cuda-major }}
+        CUDA_ARCHITECTURES: ${{ inputs.cuda-archs }}
+        MIGRAPHX_GPU_TARGETS: ${{ inputs.amd-gpu-targets }}
         EPS: ${{ inputs.eps }}
       run: >-
         python ci/build.py --recipe "$RECIPE" --variant "$VARIANT" --triple "$TRIPLE" --cuda-major "$CUDA_MAJOR"
@@ -217,11 +227,13 @@ runs:
         VARIANT: ${{ inputs.variant }}
         TRIPLE: ${{ inputs.triple }}
         CUDA_MAJOR: ${{ inputs.cuda-major }}
+        CUDA_ARCHITECTURES: ${{ inputs.cuda-archs }}
+        MIGRAPHX_GPU_TARGETS: ${{ inputs.amd-gpu-targets }}
         EPS: ${{ inputs.eps }}
       run: |
         docker run --rm \
           -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" -v "$RUNNER_TEMP:$RUNNER_TEMP" -w "$GITHUB_WORKSPACE" \
-          -e CUDA_ARCHITECTURES -e PYTHONUTF8 -e PYTHONIOENCODING -e CMAKE_VERSION -e CMAKE_POLICY_VERSION_MINIMUM \
+          -e CUDA_ARCHITECTURES -e MIGRAPHX_GPU_TARGETS -e PYTHONUTF8 -e PYTHONIOENCODING -e CMAKE_VERSION -e CMAKE_POLICY_VERSION_MINIMUM \
           -e CMAKE_BUILD_PARALLEL_LEVEL -e GITHUB_TOKEN -e PIP_ROOT_USER_ACTION=ignore \
           -e APT_PACKAGES -e RECIPE -e VARIANT -e TRIPLE -e CUDA_MAJOR -e EPS -e WORK_DIR -e STAGE_DIR -e SDK_ROOT \
           "$IMAGE" bash -c '
