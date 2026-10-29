@@ -715,45 +715,28 @@ def ort_home(job: Job) -> Path:
             '    INTERFACE_INCLUDE_DIRECTORIES "${_root}/include;${_root}/include/onnxruntime")\n'
             "endif()\n", encoding="utf-8")
     if not version_file.exists() and (home / "VERSION_NUMBER").exists():  # for find_package(onnxruntime <version>)
-        write_cmake_version(version_file, (home / "VERSION_NUMBER").read_text(encoding="utf-8").strip())
+        version = (home / "VERSION_NUMBER").read_text(encoding="utf-8").strip()
+        version_file.write_text(
+            f'set(PACKAGE_VERSION "{version}")\n'
+            "if(PACKAGE_FIND_VERSION VERSION_GREATER PACKAGE_VERSION)\n"
+            "  set(PACKAGE_VERSION_COMPATIBLE FALSE)\n"
+            "else()\n"
+            "  set(PACKAGE_VERSION_COMPATIBLE TRUE)\n"
+            "  if(PACKAGE_FIND_VERSION STREQUAL PACKAGE_VERSION)\n"
+            "    set(PACKAGE_VERSION_EXACT TRUE)\n"
+            "  endif()\n"
+            "endif()\n", encoding="utf-8")
     return home
 
 
-def ort_source_home(job: Job) -> Path:
-    """ORT's public API headers from the onnxruntime submodule, in the layout of ort_home with a header-only CMake
-    target, for plugin EPs that use API newer than the latest release. Such a plugin resolves the API at run time and
-    checks its version, and the core of a bundle is built from the same submodule."""
-    home = job.work / "ort-headers"
-    if job.dry_run:
-        return home
-    copy_files(job, ["onnxruntime_*.h", "onnxruntime_*.inc"], ORT_SRC / "include/onnxruntime/core/session",
-               home / "include" / "onnxruntime")
-    cmake_dir = home / "lib" / "cmake" / "onnxruntime"
-    cmake_dir.mkdir(parents=True, exist_ok=True)
-    (cmake_dir / "onnxruntimeConfig.cmake").write_text(
-        'get_filename_component(_root "${CMAKE_CURRENT_LIST_DIR}/../../.." ABSOLUTE)\n'
-        "if(NOT TARGET onnxruntime::onnxruntime)\n"
-        "  add_library(onnxruntime::onnxruntime INTERFACE IMPORTED)\n"
-        "  set_target_properties(onnxruntime::onnxruntime PROPERTIES\n"
-        '    INTERFACE_INCLUDE_DIRECTORIES "${_root}/include;${_root}/include/onnxruntime")\n'
-        "endif()\n", encoding="utf-8")
-    write_cmake_version(cmake_dir / "onnxruntimeConfigVersion.cmake",
-                        (ORT_SRC / "VERSION_NUMBER").read_text(encoding="utf-8").strip())
-    return home
-
-
-def write_cmake_version(path: Path, version: str) -> None:
-    """A CMake package version file: compatible with find_package(<name> <version>) of the same or an older version."""
-    path.write_text(
-        f'set(PACKAGE_VERSION "{version}")\n'
-        "if(PACKAGE_FIND_VERSION VERSION_GREATER PACKAGE_VERSION)\n"
-        "  set(PACKAGE_VERSION_COMPATIBLE FALSE)\n"
-        "else()\n"
-        "  set(PACKAGE_VERSION_COMPATIBLE TRUE)\n"
-        "  if(PACKAGE_FIND_VERSION STREQUAL PACKAGE_VERSION)\n"
-        "    set(PACKAGE_VERSION_EXACT TRUE)\n"
-        "  endif()\n"
-        "endif()\n", encoding="utf-8")
+def need_plugin_ort(job: Job, path: str, pattern: str) -> None:
+    """Prepare the ORT release (ort_home) that a plugin's own build names, the first group of pattern in the file path
+    of its submodule: its code follows the experimental API of that release, which later releases change."""
+    try:  # read at the gitlink commit when the submodule is not checked out (the resolve job)
+        m = re.search(pattern, sdk.dl.read_submodule(path))
+    except RuntimeError:
+        m = None
+    job.need("onnxruntime-sdk", pins={"onnxruntime-sdk": m.group(1)} if m else None)
 
 
 def build_ep_tensorrt(job: Job) -> None:
@@ -783,6 +766,7 @@ def trt_major(job: Job) -> str:
 def build_ep_nv_tensorrt_rtx(job: Job) -> None:
     job.need("cuda", "tensorrt-rtx")
     src, b = ROOT / "eps/vendor/nvidia-tensorrt-rtx-ep", job.work / "build"
+    need_plugin_ort(job, "eps/vendor/nvidia-tensorrt-rtx-ep/cmake/onnxruntime.cmake", r'ONNXRUNTIME_VERSION "([\d.]+)"')
     # as in docs/build-guide.md; the unit tests run their executable after linking (gtest_discover_tests), which
     # fails on a runner without an NVIDIA GPU
     args = [f"-DCUDAToolkit_ROOT={job.sdks['cuda']}", f"-DONNXRUNTIME_ROOT={ort_home(job)}",
@@ -943,8 +927,9 @@ def build_ep_openvino(job: Job) -> None:
     job.need("openvino", pins={"openvino": OPENVINO_PLUGIN_VERSION})  # INTEL_OPENVINO_DIR / OpenVINO_DIR: ci/sdk.py
     src, b = ROOT / "eps/official/onnxruntime-ep-openvino", job.work / "build"
     target = "onnxruntime_providers_openvino_plugin"
-    # the headers of ORT main: the plugin uses API that the latest release does not have (Ort::Experimental)
-    env = {"ONNXRUNTIME_ROOT_DIR": str(ort_source_home(job))}
+    need_plugin_ort(job, "eps/official/onnxruntime-ep-openvino/cmake/onnxruntime.cmake",
+                    r"find_package\(onnxruntime ([\d.]+)")
+    env = {"ONNXRUNTIME_ROOT_DIR": str(ort_home(job))}
     run(job, ["cmake", "-G", "Ninja", "-S", src, "-B", b, "-DCMAKE_BUILD_TYPE=Release",
               "-DOVEP_PLUGIN_BUILD_TESTS=OFF", "-DOVEP_PLUGIN_BUILD_TOOLS=OFF"], env=env)
     # only the plugin: cmake --install and the default target also stage the OpenVINO runtime (on Windows re-signed
