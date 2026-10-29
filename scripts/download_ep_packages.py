@@ -553,9 +553,9 @@ COMPONENTS: tuple[Component, ...] = (
     # The default branch matches TensorRT 10.15 used by ORT CI; latest = main branch (TensorRT 11.x)
     Component("tensorrt", "TensorRT (in-tree), onnxruntime-ep-tensorrt", ("linux-x86_64", "linux-aarch64", "windows-x86_64"),
               "release/10.15", resolve_tensorrt, "developer.nvidia.com/downloads (links taken from the NVIDIA/TensorRT README)"),
-    # Default 1.6: cmake/tensorrt_rtx.cmake in TensorRT-RTX-EP-ABI requires >= 1.6 at configure time
+    # Default 1.7: cmake/tensorrt_rtx.cmake in TensorRT-RTX-EP-ABI requires >= 1.7 at configure time
     Component("tensorrt-rtx", "NVIDIA TensorRT RTX (in-tree + plugin)",
-              ("linux-x86_64", "linux-aarch64", "windows-x86_64", "windows-arm64"), "1.6", resolve_tensorrt_rtx,
+              ("linux-x86_64", "linux-aarch64", "windows-x86_64", "windows-arm64"), "1.7", resolve_tensorrt_rtx,
               "direct links on developer.nvidia.com/tensorrt-rtx"),
     Component("qairt", "Qualcomm QNN (in-tree + onnxruntime-qnn)",
               ("linux-x86_64", "linux-aarch64", "windows-x86_64", "windows-arm64", "windows-arm64x"), "default", resolve_qairt,

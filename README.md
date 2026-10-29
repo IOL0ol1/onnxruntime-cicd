@@ -138,7 +138,7 @@ python scripts/download_ep_packages.py --with-optional                          
 | `cuda` | CUDA, TensorRT, TensorRT plugin, TensorRT RTX | Latest 13.x (`--cuda-major 12` switches to 12.x) | NVIDIA redist: `developer.download.nvidia.com/compute/cuda/redist` | sha256 |
 | `cudnn` | CUDA | Latest 9.x | NVIDIA redist: `developer.download.nvidia.com/compute/cudnn/redist` | sha256 |
 | `tensorrt` | TensorRT (in-tree), `onnxruntime-ep-tensorrt` | 10.15 (same as ORT CI); `latest` is 11.x | `developer.nvidia.com/downloads/...`, links taken from the README of each [NVIDIA/TensorRT](https://github.com/NVIDIA/TensorRT) release branch; requests from mainland China are redirected to `developer.download.nvidia.cn` | — |
-| `tensorrt-rtx` | TensorRT RTX (in-tree + plugin) | 1.6 (the plugin's CMake requires ≥ 1.6 at configure time) | `rtx_sdk/secure/...` direct links listed on the [official TensorRT-RTX page](https://developer.nvidia.com/tensorrt-rtx) (verified to work without login) | — |
+| `tensorrt-rtx` | TensorRT RTX (in-tree + plugin) | 1.7 (the plugin's CMake requires ≥ 1.7 at configure time) | `rtx_sdk/secure/...` direct links listed on the [official TensorRT-RTX page](https://developer.nvidia.com/tensorrt-rtx) (verified to work without login) | — |
 | `qairt` | QNN (in-tree + `onnxruntime-qnn`) | 2.51.0.260929 (from `onnxruntime-qnn/qcom/packages.yml`) | Qualcomm public download API `softwarecenter.qualcomm.com/api/download/...` (instead of QPM, which needs a Qualcomm ID) | sha256 |
 | `hexagon-sdk` (optional) | QNN (only needed for custom HTP ops) | 6.5.0.0 (same source) | Same as above | sha256 |
 | `openvino` | OpenVINO (in-tree), `onnxruntime-ep-openvino` | 2026.2.1 (same as ORT's CI); the plugin build pins 2026.4.1, the oldest it accepts | `storage.openvinotoolkit.org` | sha256 |
@@ -157,7 +157,7 @@ Notes:
 
 - **CUDA** is downloaded as per-component redist archives: nvcc, cudart, cublas, cufft, curand, nvrtc, nvjitlink, cccl, and so on. Extract them into one directory and use it as `CUDA_HOME`.
 - **TensorRT**: the README only lists x86_64 packages. For linux-aarch64 the script derives the link from the official naming scheme and checks that the file exists before downloading (ORT CI downloads it the same way).
-- **TensorRT-RTX**: 1.4 and earlier have no aarch64 or Windows ARM64 packages; the default 1.6 covers both.
+- **TensorRT-RTX**: 1.4 and earlier have no aarch64 or Windows ARM64 packages; the default 1.7 covers both.
 - **OpenVINO** downloads the `ubuntu24` package on Linux by default; `--openvino-distro` selects another distro. If the requested distro has no package for the architecture, another distro is used automatically (for example, arm64 currently only has `ubuntu22`).
 - **CANN**: only the toolkit is downloaded. The per-chip Ascend operator packages (`*-ops_*.run`) are in the same directory if needed.
 - **Vitis AI**: the three packages are versioned independently (for example, Ryzen AI 1.7 is voe 1.7.0 / onnxruntime-vitisai 1.23.2), so pin each one with `--pin <package>=<version>`. `onnxruntime-vitisai` installs into the same directory as `onnxruntime` from PyPI, so install it last.
@@ -222,7 +222,7 @@ Every package is built from [`ci/matrix.json`](ci/matrix.json): the core of a bu
 | `onnxruntime-ep-amdgpu-hip` | The same with its HIP backend (`hip-backend`, a shim that loads the prebuilt `hipgpu` of ROCm/hip-ep, which `fetch-restricted` downloads) | `x86_64-unknown-linux-gnu` ⚠, `x86_64-pc-windows-msvc` ⚠ |
 | `onnxruntime-ep-qnn` | Qualcomm QNN plugin EP | `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`, `arm64ec-pc-windows-msvc` ⚠, `arm64x-pc-windows-msvc` ⚠, `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` ⚠, `aarch64-linux-android` ⚠ |
 | `onnxruntime-ep-mlx` | MLX plugin EP (with the MIT-licensed libmlx) | `aarch64-apple-darwin` |
-| `onnxruntime-ep-openvino` | OpenVINO plugin EP, built with OpenVINO 2026.4.1 | `x86_64-unknown-linux-gnu` ⚠, `x86_64-pc-windows-msvc` ⚠ |
+| `onnxruntime-ep-openvino` | OpenVINO plugin EP, built with OpenVINO 2026.4.1 and ORT's headers from the `onnxruntime` submodule (it uses API newer than the latest release) | `x86_64-unknown-linux-gnu` ⚠, `x86_64-pc-windows-msvc` ⚠ |
 | `onnxruntime-ep-neuropilot` | MediaTek NeuroPilot plugin EP, built with ORT's headers from the `onnxruntime` submodule | `aarch64-unknown-linux-gnu` ⚠, `aarch64-linux-android` ⚠ (API level 29) |
 
 ⚠ marks experimental entries (`experimental: true`): known to fail at times, or not verified yet. The OpenVINO plugin DLL declares the OpenVINO runtime as a side-by-side private assembly; its Windows package contains the `openvino_runtime.manifest` that describes it, while `fetch-restricted` puts the unmodified OpenVINO DLLs next to it (the upstream install embeds manifests into re-signed copies instead). `arm64ec-pc-windows-msvc` and `arm64x-pc-windows-msvc` are not official Rust triples; they name the Windows ARM64EC and ARM64X binaries.

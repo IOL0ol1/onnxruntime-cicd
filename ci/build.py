@@ -715,18 +715,45 @@ def ort_home(job: Job) -> Path:
             '    INTERFACE_INCLUDE_DIRECTORIES "${_root}/include;${_root}/include/onnxruntime")\n'
             "endif()\n", encoding="utf-8")
     if not version_file.exists() and (home / "VERSION_NUMBER").exists():  # for find_package(onnxruntime <version>)
-        version = (home / "VERSION_NUMBER").read_text(encoding="utf-8").strip()
-        version_file.write_text(
-            f'set(PACKAGE_VERSION "{version}")\n'
-            "if(PACKAGE_FIND_VERSION VERSION_GREATER PACKAGE_VERSION)\n"
-            "  set(PACKAGE_VERSION_COMPATIBLE FALSE)\n"
-            "else()\n"
-            "  set(PACKAGE_VERSION_COMPATIBLE TRUE)\n"
-            "  if(PACKAGE_FIND_VERSION STREQUAL PACKAGE_VERSION)\n"
-            "    set(PACKAGE_VERSION_EXACT TRUE)\n"
-            "  endif()\n"
-            "endif()\n", encoding="utf-8")
+        write_cmake_version(version_file, (home / "VERSION_NUMBER").read_text(encoding="utf-8").strip())
     return home
+
+
+def ort_source_home(job: Job) -> Path:
+    """ORT's public API headers from the onnxruntime submodule, in the layout of ort_home with a header-only CMake
+    target, for plugin EPs that use API newer than the latest release. Such a plugin resolves the API at run time and
+    checks its version, and the core of a bundle is built from the same submodule."""
+    home = job.work / "ort-headers"
+    if job.dry_run:
+        return home
+    copy_files(job, ["onnxruntime_*.h", "onnxruntime_*.inc"], ORT_SRC / "include/onnxruntime/core/session",
+               home / "include" / "onnxruntime")
+    cmake_dir = home / "lib" / "cmake" / "onnxruntime"
+    cmake_dir.mkdir(parents=True, exist_ok=True)
+    (cmake_dir / "onnxruntimeConfig.cmake").write_text(
+        'get_filename_component(_root "${CMAKE_CURRENT_LIST_DIR}/../../.." ABSOLUTE)\n'
+        "if(NOT TARGET onnxruntime::onnxruntime)\n"
+        "  add_library(onnxruntime::onnxruntime INTERFACE IMPORTED)\n"
+        "  set_target_properties(onnxruntime::onnxruntime PROPERTIES\n"
+        '    INTERFACE_INCLUDE_DIRECTORIES "${_root}/include;${_root}/include/onnxruntime")\n'
+        "endif()\n", encoding="utf-8")
+    write_cmake_version(cmake_dir / "onnxruntimeConfigVersion.cmake",
+                        (ORT_SRC / "VERSION_NUMBER").read_text(encoding="utf-8").strip())
+    return home
+
+
+def write_cmake_version(path: Path, version: str) -> None:
+    """A CMake package version file: compatible with find_package(<name> <version>) of the same or an older version."""
+    path.write_text(
+        f'set(PACKAGE_VERSION "{version}")\n'
+        "if(PACKAGE_FIND_VERSION VERSION_GREATER PACKAGE_VERSION)\n"
+        "  set(PACKAGE_VERSION_COMPATIBLE FALSE)\n"
+        "else()\n"
+        "  set(PACKAGE_VERSION_COMPATIBLE TRUE)\n"
+        "  if(PACKAGE_FIND_VERSION STREQUAL PACKAGE_VERSION)\n"
+        "    set(PACKAGE_VERSION_EXACT TRUE)\n"
+        "  endif()\n"
+        "endif()\n", encoding="utf-8")
 
 
 def build_ep_tensorrt(job: Job) -> None:
@@ -756,26 +783,21 @@ def trt_major(job: Job) -> str:
 def build_ep_nv_tensorrt_rtx(job: Job) -> None:
     job.need("cuda", "tensorrt-rtx")
     src, b = ROOT / "eps/vendor/nvidia-tensorrt-rtx-ep", job.work / "build"
-    args = ["--cuda_home", job.sdks["cuda"], "--onnxruntime_home", ort_home(job),
-            "--trt_rtx_home", job.sdks["tensorrt-rtx"], "--build_dir", b, "--config", "Release"]
+    # as in docs/build-guide.md; the unit tests run their executable after linking (gtest_discover_tests), which
+    # fails on a runner without an NVIDIA GPU
+    args = [f"-DCUDAToolkit_ROOT={job.sdks['cuda']}", f"-DONNXRUNTIME_ROOT={ort_home(job)}",
+            f"-DTRT_RTX_ROOT={job.sdks['tensorrt-rtx']}", f"-DPython3_EXECUTABLE={sys.executable}",
+            "-DBUILD_TESTS=OFF", "-DBUILD_BENCHMARK=OFF"]
     if job.os == "windows":
-        # build.bat hard-codes the VS 2022 generator; run a copy (next to it, since it uses %~dp0) with the
-        # generator of the installed Visual Studio
-        script = src / "build.ci.bat"
-        if not job.dry_run:
-            text = (src / "build.bat").read_text(encoding="utf-8")
-            script.write_text(text.replace('"Visual Studio 17 2022"', f'"{vs_generator()}"'), encoding="utf-8")
-        # Windows ARM64 is cross-compiled on an x64 host, as documented in docs/build-guide.md
-        # --skip_tests: the unit test target runs its executable after linking (gtest_discover_tests), which fails
-        # on a runner without an NVIDIA GPU
-        arch = ["--arm64"] if job.triple.startswith("aarch64") else []
-        run(job, ["cmd", "/c", script, *args, "--skip_tests", *arch], cwd=src)
-    else:
-        # build.sh compiles with a bare `cmake --build --parallel`, i.e. `make -j` without a limit, which runs the
-        # runner out of memory; configure with it and build here, where CMAKE_BUILD_PARALLEL_LEVEL applies
-        run(job, ["bash", src / "build.sh", *args, "--update"], cwd=src)
-        run(job, ["cmake", "-DBUILD_TESTS=OFF", b])  # build.sh has no --skip_tests; see the Windows branch
-        run(job, ["cmake", "--build", b, "--config", "Release"])
+        # the Visual Studio generator; Windows ARM64 is cross-compiled on an x64 host, with a host protoc
+        arm64 = job.triple.startswith("aarch64")
+        args += ["-G", vs_generator(), "-A", "ARM64" if arm64 else "x64"]
+        args += ["-DUSE_PRECOMPILED_HOST_PROTOC=ON"] if arm64 else []
+        run(job, ["cmake", "-S", src, "-B", b, *args])
+        run(job, ["cmake", "--build", b, "--config", "Release", "--parallel"])
+    else:  # Ninja runs CMAKE_BUILD_PARALLEL_LEVEL jobs
+        run(job, ["cmake", "-S", src, "-B", b, "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release", *args])
+        run(job, ["cmake", "--build", b])
     stage_shared_libs(job, b, ["onnxruntime_providers_nv_tensorrt_rtx"])
 
 
@@ -921,7 +943,8 @@ def build_ep_openvino(job: Job) -> None:
     job.need("openvino", pins={"openvino": OPENVINO_PLUGIN_VERSION})  # INTEL_OPENVINO_DIR / OpenVINO_DIR: ci/sdk.py
     src, b = ROOT / "eps/official/onnxruntime-ep-openvino", job.work / "build"
     target = "onnxruntime_providers_openvino_plugin"
-    env = {"ONNXRUNTIME_ROOT_DIR": str(ort_home(job))}
+    # the headers of ORT main: the plugin uses API that the latest release does not have (Ort::Experimental)
+    env = {"ONNXRUNTIME_ROOT_DIR": str(ort_source_home(job))}
     run(job, ["cmake", "-G", "Ninja", "-S", src, "-B", b, "-DCMAKE_BUILD_TYPE=Release",
               "-DOVEP_PLUGIN_BUILD_TESTS=OFF", "-DOVEP_PLUGIN_BUILD_TOOLS=OFF"], env=env)
     # only the plugin: cmake --install and the default target also stage the OpenVINO runtime (on Windows re-signed
