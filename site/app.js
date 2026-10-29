@@ -133,16 +133,21 @@ function gpuKinds(sel, cat) {
 
 const bySm = (a, b) => Number(a) - Number(b);
 
+// The SM version of the PTX of a selection: the newest selected one that ORT compiles generically, since some of the
+// arch-specific kernels it compiles for sm_90 and newer (its FP4 kernels) do not build as generic PTX (ci/catalog.py
+// cuda_ptx_arch); null when every selected version is arch-specific
+const ptxArch = (archs, exact) => archs.filter((a) => !exact.includes(a)).sort(bySm).pop() || null;
+
 // How a GPU of SM version sm runs the CUDA kernels of a selection: its own ("native"), those of an older SM version of
-// the same major version ("compat"; not for the arch-specific kernels ORT compiles for sm_90 and newer), the PTX of the
-// newest one, which the driver compiles when a session starts ("ptx"), or not at all ("none")
+// the same major version ("compat"; not for the arch-specific kernels ORT compiles for sm_90 and newer), the PTX
+// (ptxArch), which the driver compiles when a session starts ("ptx"), or not at all ("none")
 function cudaCoverage(sm, archs, ptx, exact) {
   if (archs.includes(sm)) return { kind: "native" };
   const major = (a) => Math.floor(Number(a) / 10);
   const older = archs.filter((a) => !exact.includes(a) && major(a) === major(sm) && Number(a) < Number(sm)).sort(bySm);
   if (older.length) return { kind: "compat", from: older[older.length - 1] };
-  const newest = [...archs].sort(bySm).pop();
-  if (ptx && newest && Number(newest) < Number(sm)) return { kind: "ptx", from: newest };
+  const from = ptx ? ptxArch(archs, exact) : null;
+  if (from && Number(from) < Number(sm)) return { kind: "ptx", from };
   return { kind: "none" };
 }
 
@@ -353,7 +358,8 @@ function requirements(sel, cat, plugins, cudaMajor, kinds) {
   for (const p of plugins) out.push(...p.requirements);
   if (cudaMajor) {
     const g = cat.gpu.cuda;
-    out.push(kinds.has("cuda") && sel.cudaPtx ? `${g.drivers[cudaMajor]}; ${g.ptx_note}` : g.drivers[cudaMajor]);
+    const ptx = kinds.has("cuda") && sel.cudaPtx && ptxArch(sel.cudaArchs, g.exact);
+    out.push(ptx ? `${g.drivers[cudaMajor]}; ${g.ptx_note}` : g.drivers[cudaMajor]);
   }
   return [...new Set(out)];
 }
@@ -402,7 +408,7 @@ function config(sel, cat) {
     link: Object.fromEntries(coreEps(sel, cat).filter((ep) => (info.core_eps[ep] || {}).link)
       .map((ep) => [ep, linkOf(sel, info.core_eps[ep], ep)])),
     cuda_archs: s.kinds.has("cuda") ? [...sel.cudaArchs].sort(bySm) : null,
-    cuda_ptx: s.kinds.has("cuda") ? sel.cudaPtx : null,
+    cuda_ptx: s.kinds.has("cuda") ? sel.cudaPtx && !!ptxArch(sel.cudaArchs, cat.gpu.cuda.exact) : null,
     amd_gpu_targets: s.kinds.has("amd") ? amdTargetsFor(cat, info).filter((t) => sel.amdTargets.includes(t)) : null,
   };
 }
@@ -637,6 +643,7 @@ if (typeof document !== "undefined") {
         ptx: (c) => ({ text: `PTX of sm_${c.from}, compiled when a session starts`, warn: true }),
         none: () => ({ text: "not supported", warn: true }),
       };
+      const ptx = ptxArch(sel.cudaArchs, g.exact);
       parts.push(h("fieldset", {},
         h("legend", {}, "NVIDIA CUDA"),
         version,
@@ -644,7 +651,8 @@ if (typeof document !== "undefined") {
         s.kinds.has("cuda") ? [
           h("p", { class: "hint" }, "The CUDA code is compiled for the selected SM versions. A GPU runs the kernels of its ",
             "own SM version or of an older one of the same major version (not the arch-specific kernels of sm_90 and ",
-            "newer); with PTX, newer GPUs compile the kernels of the newest selected version when a session starts. Every ",
+            "newer); with PTX, newer GPUs compile the kernels of the newest selected version below sm_90 when a session ",
+            "starts (some arch-specific kernels of sm_90 and newer, such as ORT's FP4 kernels, have no generic PTX). Every ",
             "architecture lengthens the CUDA builds and enlarges the libraries: many of them can push a first build past ",
             "the 6-hour job limit of GitHub-hosted runners. At least one stays selected."),
           Object.entries(g.archs).map(([sm, gpus]) => {
@@ -656,8 +664,9 @@ if (typeof document !== "undefined") {
               h("span", {}, h("code", {}, `sm_${sm}`), ` ${gpus} `, h("span", { class: `tag${st.warn ? " warn" : ""}` }, st.text)));
           }),
           h("label", { class: "check" },
-            h("input", { type: "checkbox", checked: sel.cudaPtx, onchange: (e) => update({ ...cloneSel(sel), cudaPtx: e.target.checked }) }),
-            " PTX of the newest selected architecture, for newer GPUs (larger libraries)")]
+            h("input", { type: "checkbox", checked: sel.cudaPtx && !!ptx, disabled: !ptx,
+                         onchange: (e) => update({ ...cloneSel(sel), cudaPtx: e.target.checked }) }),
+            ptx ? ` PTX of sm_${ptx}, for newer GPUs (larger libraries)` : " PTX: needs a selected version below sm_90")]
           : h("p", { class: "hint" }, "No selected package compiles CUDA code for this target, so there are no GPU ",
             "architectures to choose.")));
     }

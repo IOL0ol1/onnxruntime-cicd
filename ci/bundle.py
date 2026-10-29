@@ -81,7 +81,9 @@ def gpu_settings(config: dict, cat: dict, platform: dict, parts: list[dict]) -> 
         if bad := [str(a) for a in archs if a not in cuda["archs"]]:
             raise RequestError(f"unknown CUDA architectures {', '.join(bad)} (known: {', '.join(cuda['archs'])})")
         ptx = config.get("cuda_ptx")
-        out.update(cuda_archs=sorted(set(archs), key=int), cuda_ptx=cuda["default"]["ptx"] if ptx is None else bool(ptx))
+        ptx = cuda["default"]["ptx"] if ptx is None else bool(ptx)
+        # without a selected SM version below the arch-specific ones there is no PTX to build (catalog.cuda_ptx_arch)
+        out.update(cuda_archs=sorted(set(archs), key=int), cuda_ptx=ptx and catalog.cuda_ptx_arch(archs) is not None)
     if "amd" in kinds:
         targets = config.get("amd_gpu_targets")
         if targets is None:
@@ -266,7 +268,7 @@ def summary(plan: dict) -> str:
     gpu = plan["gpu"]
     if gpu["cuda_archs"]:
         lines.append(f"**CUDA GPU architectures:** {', '.join('sm_' + a for a in gpu['cuda_archs'])}"
-                     f"{' + PTX of sm_' + gpu['cuda_archs'][-1] if gpu['cuda_ptx'] else ''}  ")
+                     f"{' + PTX of sm_' + catalog.cuda_ptx_arch(gpu['cuda_archs']) if gpu['cuda_ptx'] else ''}  ")
     if gpu["amd_gpu_targets"]:
         lines.append(f"**AMD GPU targets:** {', '.join(gpu['amd_gpu_targets'])}  ")
     lines += ["", "| Package | Contents | Build |", "|---|---|---|"]

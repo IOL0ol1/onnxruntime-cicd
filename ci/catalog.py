@@ -451,10 +451,17 @@ def source() -> dict:
     return {"type": "commit", "id": sha[:12], "url": f"https://github.com/{plan.REPO}/commit/{sha}", "created_at": date}
 
 
+def cuda_ptx_arch(archs: list[str]) -> str | None:
+    """The SM version of the PTX of a selection: the newest selected one that ORT compiles generically. For the versions
+    in CUDA_EXACT_SMS it compiles arch-specific kernels, some of which (its FP4 kernels) do not build as generic PTX."""
+    generic = [a for a in archs if a not in CUDA_EXACT_SMS]
+    return max(generic, key=int) if generic else None
+
+
 def cuda_archs_value(archs: list[str], ptx: bool) -> str:
-    """CMAKE_CUDA_ARCHITECTURES of a selection: the real kernels of every SM version, and the PTX of the newest."""
-    archs = sorted(archs, key=int)
-    return ";".join([f"{a}-real" for a in archs] + ([f"{archs[-1]}-virtual"] if ptx and archs else []))
+    """CMAKE_CUDA_ARCHITECTURES of a selection: the real kernels of every SM version, and the PTX (cuda_ptx_arch)."""
+    virtual = cuda_ptx_arch(archs) if ptx else None
+    return ";".join([f"{a}-real" for a in sorted(archs, key=int)] + ([f"{virtual}-virtual"] if virtual else []))
 
 
 def gpu_options() -> dict:
