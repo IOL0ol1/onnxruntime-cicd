@@ -98,7 +98,7 @@ Sources live in `onnxruntime/onnxruntime/core/providers/<directory>`.
 | VeriSilicon VSINPU | `vsinpu` | Community-maintained, low activity | VeriSilicon's own fork is archived |
 | Rockchip RKNPU | `rknpu` | Obsolete | Targets early RK NPUs (depends on rknpu_ddk) and only receives security fixes; newer Rockchip platforms use the RKNN Toolkit |
 | SNPE | `snpe` | Obsolete | Superseded by the QNN EP; last code change in 2025-03 |
-| ACL | `acl` | **Deprecated** (2026-09, #32564) | Build flag marked `[DEPRECATED]`; will be removed in a future release |
+| ACL | `acl` | **Removed** (2026-11, #33851) | Deprecated in 2026-09 (#32564), then removed from the ORT main repository |
 
 > `winml`, `shared_library` and `shared` are infrastructure / API layers, not EPs.
 
@@ -113,7 +113,7 @@ The submodules are not self-contained. External dependencies fall into three gro
 3. **Out of scope**
    - General toolchains: compilers, CMake, Rust, JDK, and Xcode (needed by CoreML).
    - Hardware drivers: NVIDIA, Intel NPU, AMD NPU, Qualcomm, and so on.
-   - Obsolete or deprecated EPs: ACL, SNPE, RKNPU.
+   - Obsolete or removed EPs: ACL, SNPE, RKNPU.
 
 ### Download script
 
