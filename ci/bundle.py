@@ -28,6 +28,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import sysconfig
 import tarfile
 import tempfile
 import zipfile
@@ -700,6 +701,92 @@ def linux_library_needs(stage: Path) -> dict[str, str | None]:
     return {k: ".".join(map(str, v)) or None for k, v in newest.items()}
 
 
+def patchelf_binary() -> str | None:
+    """The patchelf command, installing the PyPI package that ships the binary if it is not there yet (ci/build.py
+    installs it the same way in the build jobs)."""
+    candidates = [shutil.which("patchelf"), Path(sysconfig.get_path("scripts")) / "patchelf",
+                  Path(sysconfig.get_path("scripts", f"{os.name}_user")) / "patchelf"]
+    if not any(c and Path(c).exists() for c in candidates):
+        # PIP_BREAK_SYSTEM_PACKAGES: the Ubuntu images mark their Python as externally managed
+        subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "patchelf"],
+                       env={**os.environ, "PIP_BREAK_SYSTEM_PACKAGES": "1"}, check=False)
+    return next((str(c) for c in candidates if c and Path(c).exists()), None)
+
+
+def add_origin_rpath(libs: list[Path]) -> None:
+    """Let a plugin library find the vendor libraries that end up next to it in the bundle (CUDA, TensorRT for RTX,
+    ROCm, ...): the run path it is built with points into the CI work directory, which does not exist on the user's
+    machine, so registering the plugin fails with a missing library before any of its code runs. The TensorRT for RTX
+    plugin was packaged with /home/runner/work/_temp/sdk/... only, and could not find libcudart.so.13 even though the
+    bundle ships it in the same directory.
+
+    Windows resolves DLLs from the directory of the library itself, and does not have a run path; macOS uses
+    @loader_path in Mach-O, which is not ELF. Entries other than $ORIGIN are kept: the AMD plugins also look in
+    /opt/rocm/lib."""
+    targets = []
+    for f in libs:
+        if f.is_symlink() or not f.is_file():
+            continue
+        with f.open("rb") as fh:
+            if fh.read(4) == b"\x7fELF":
+                targets.append(f)
+    if not targets:
+        return
+    patchelf = patchelf_binary()
+    if not patchelf:
+        print("::warning::patchelf is not available: the plugin libraries keep the run path of their build tree",
+              flush=True)
+        return
+    for f in targets:
+        # a library without a run path exits with an error and no output
+        result = subprocess.run([patchelf, "--print-rpath", str(f)], capture_output=True, text=True)
+        current = result.stdout.strip() if result.returncode == 0 else ""
+        if "$ORIGIN" in current.split(":"):
+            continue
+        rpath = f"$ORIGIN:{current}" if current else "$ORIGIN"
+        subprocess.run([patchelf, "--set-rpath", rpath, str(f)], check=True)
+        print(f"    {f.name}: run path \"{current}\" -> \"{rpath}\"", flush=True)
+
+
+PT_GNU_STACK = 0x6474E551
+PF_X = 0x1
+
+
+def clear_execstack(libs: list[Path]) -> None:
+    """Mark the stack of a plugin library as not executable (what patchelf --clear-execstack does; the patchelf on PyPI
+    is 0.17, which does not have it). The WebGPU plugin is linked with an executable stack (PT_GNU_STACK RWE), most
+    likely from an assembly object without a .note.GNU-stack section: glibc 2.41 and later refuse to dlopen such a
+    library ("cannot enable executable stack as shared object requires"), so the plugin did not register on a current
+    distribution, and older glibc made the stack of the whole process executable when loading it. The plugin does not
+    use an executable stack: with the flag cleared it runs the depth models on NVIDIA and AMD GPUs with the same results
+    as before. Only the flag in the program header changes."""
+    for f in libs:
+        if f.is_symlink() or not f.is_file():
+            continue
+        with f.open("r+b") as fh:
+            ident = fh.read(16)
+            if ident[:4] != b"\x7fELF":
+                continue
+            bits64, order = ident[4] == 2, "<" if ident[5] == 1 else ">"
+            # e_phoff, e_phentsize / e_phnum; p_flags is the 2nd field of Elf64_Phdr and the 7th of Elf32_Phdr
+            fh.seek(0x20 if bits64 else 0x1C)
+            phoff, = struct.unpack(order + ("Q" if bits64 else "I"), fh.read(8 if bits64 else 4))
+            fh.seek(0x36 if bits64 else 0x2A)
+            phentsize, phnum = struct.unpack(order + "HH", fh.read(4))
+            flags_at = 4 if bits64 else 24
+            for i in range(phnum):
+                fh.seek(phoff + i * phentsize)
+                if struct.unpack(order + "I", fh.read(4))[0] != PT_GNU_STACK:
+                    continue
+                fh.seek(phoff + i * phentsize + flags_at)
+                flags, = struct.unpack(order + "I", fh.read(4))
+                if flags & PF_X:
+                    fh.seek(phoff + i * phentsize + flags_at)
+                    fh.write(struct.pack(order + "I", flags & ~PF_X))
+                    print(f"    {f.name}: executable stack cleared", flush=True)
+                break
+
+
 def readme(plan: dict, info: dict) -> str:
     windows = "windows" in plan["triple"]
     lines = [f"# {plan['name']}", "", "ONNX Runtime bundle built by onnxruntime-cicd for a bundle request.", "",
@@ -800,6 +887,10 @@ def cmd_assemble(args: argparse.Namespace) -> int:
         plugins.append({"registration_name": p["package"], "package": p["package"], "eps": list(p["eps"]),
                         "library": lib.relative_to(stage).as_posix() if lib else None})
     (stage / "plugins.json").write_text(json.dumps({"plugins": plugins}, indent=2), encoding="utf-8")
+    if triple.endswith("-linux-gnu"):
+        plugin_libs = [stage / p["library"] for p in plugins if p["library"]]
+        add_origin_rpath(plugin_libs)
+        clear_execstack(plugin_libs)
 
     info = {"name": plan["name"], "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "request": {"issue": os.environ.get("BUNDLE_ISSUE_URL"), "run": os.environ.get("BUNDLE_RUN_URL")},
