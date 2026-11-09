@@ -1,0 +1,58 @@
+# Builds one package of a bundle request (an entry of the build matrix of ci/bundle.py resolve, see ci/plan.py
+# build_entry) with the build-entry steps, packs it with ci/package.py and uploads it as the entry's artifact. The
+# repository must be checked out first.
+
+name: Build package
+description: Build one bundle package, pack it and upload it as an artifact
+
+inputs:
+  entry:
+    description: the build matrix entry (JSON)
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - uses: ./.github/actions/build-entry
+      with:
+        recipe: ${{ fromJSON(inputs.entry).recipe }}
+        variant: ${{ fromJSON(inputs.entry).variant }}
+        eps: ${{ fromJSON(inputs.entry).eps }}
+        triple: ${{ fromJSON(inputs.entry).triple }}
+        cuda-major: ${{ fromJSON(inputs.entry).cuda_major }}
+        cuda-archs: ${{ fromJSON(inputs.entry).cuda_archs }}
+        amd-gpu-targets: ${{ fromJSON(inputs.entry).amd_gpu_targets }}
+        submodules: ${{ fromJSON(inputs.entry).submodules }}
+        docker: ${{ fromJSON(inputs.entry).docker }}
+        apt: ${{ fromJSON(inputs.entry).apt }}
+        msvc-arch: ${{ fromJSON(inputs.entry).msvc_arch }}
+        msvc-toolset: ${{ fromJSON(inputs.entry).msvc_toolset }}
+        keep-android-sdk: ${{ fromJSON(inputs.entry).keep_android_sdk }}
+        ccache: ${{ fromJSON(inputs.entry).ccache }}
+        ccache-key: ${{ fromJSON(inputs.entry).ccache_key }}
+
+    - name: Package
+      shell: bash
+      env:
+        PACKAGE: ${{ fromJSON(inputs.entry).package }}
+        TRIPLE: ${{ fromJSON(inputs.entry).triple }}
+        HASH: ${{ fromJSON(inputs.entry).hash }}
+        SUBMODULES: ${{ fromJSON(inputs.entry).submodules }}
+        CUDA_MAJOR: ${{ fromJSON(inputs.entry).cuda_major }}
+        CUDA_ARCHS: ${{ fromJSON(inputs.entry).cuda_archs }}
+        AMD_GPU_TARGETS: ${{ fromJSON(inputs.entry).amd_gpu_targets }}
+        RECIPE: ${{ fromJSON(inputs.entry).recipe }}/${{ fromJSON(inputs.entry).variant }}
+        EPS: ${{ fromJSON(inputs.entry).eps }}
+      run: >-
+        python ci/package.py --stage "$STAGE_DIR" --name "$PACKAGE" --triple "$TRIPLE" --version "$HASH"
+        --source $SUBMODULES --sdk-versions "$SDK_ROOT/sdk-versions.json" --out "$DIST_DIR"
+        --extra "cuda_architectures=$CUDA_ARCHS" "amd_gpu_targets=$AMD_GPU_TARGETS" "cuda_major=$CUDA_MAJOR"
+        "recipe=$RECIPE" "eps=$EPS" "inputs_hash=$HASH"
+
+    - uses: actions/upload-artifact@v7
+      with:
+        name: ${{ fromJSON(inputs.entry).artifact }}
+        path: ${{ runner.temp }}/dist/*
+        if-no-files-found: error
+        compression-level: 0
+        retention-days: 90
